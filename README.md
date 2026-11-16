@@ -3,7 +3,7 @@
 > [!NOTE]
 > **LLM-generated code.** Most of this project, including code and documentation, was written by an AI model (Claude, by Anthropic) working with a human maintainer. It has been tested on real hardware but not audited line by line, so review it before relying on it.
 
-*Weylus, but for Wayland.* Use an Android tablet as a **low-latency pen display** for your Linux desktop.
+*Weylus, but for Way(land).* Use an Android tablet as a **low-latency pen display** for your Linux desktop.
 It's Wayland-first, uses a native Android client and runs over USB.
 
 Waylus mirrors one of your monitors to the tablet using hardware H.264 encode and decode. It sends the tablet's pen and fingers back as real Linux input devices:
