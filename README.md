@@ -112,6 +112,7 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] Portal / PipeWire capture → NVENC → MediaCodec video
 - [x] Built-in latency statistics
 - [ ] Latency tuning to below 50 ms glass-to-glass, then measure against Weylus
+- [ ] Full tilt direction on devices whose Android input config drops `AXIS_ORIENTATION` (e.g. NXTPAPER 14), via a raw evdev helper running as the adb shell user
 - [ ] VAAPI encoder fallback (AMD / Intel)
 - [ ] DMA-BUF zero-copy capture (PipeWire dmabuf → GPU encoder)
 - [ ] AOA transport (no adb needed)

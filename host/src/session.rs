@@ -177,6 +177,7 @@ fn session(
         let msg = proto::read_msg(&mut reader, &mut buf)?;
         match msg {
             DeviceMsg::Pen(s) => {
+                tracing::trace!("pen {s:?}");
                 pen.handle(&s)?;
                 stats.pen(&s);
             }

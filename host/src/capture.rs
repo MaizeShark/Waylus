@@ -171,11 +171,17 @@ struct UserData {
     importer: Option<Importer>,
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
-    min_interval_ns: u64,
-    last_ns: u64,
+    /// Frame pacing: target interval and the earliest time the next frame is due.
+    interval_ns: u64,
+    next_due_ns: u64,
     logged_type: bool,
     read_ns: u64,
     reads: u64,
+    /// process() calls / frames with a buffer / frames passed on, for diagnostics.
+    stat_calls: u64,
+    stat_bufs: u64,
+    stat_out: u64,
+    stat_t: u64,
 }
 
 fn map_format(f: spa::param::video::VideoFormat) -> Option<PixFmt> {
@@ -256,14 +262,17 @@ fn format_pod(formats: &[spa::param::video::VideoFormat], modifiers: Option<&[u6
             },
         ))),
     ));
+    // Compositors throttle by minimum frame interval (niri does), which turns a 75 Hz
+    // output into 37.5 fps when we ask for 60. Ask for 2x and pace precisely ourselves.
+    let source_max = max_fps.saturating_mul(2).max(1);
     props.push(Property::new(
         FP::VideoMaxFramerate.as_raw(),
         Value::Choice(ChoiceValue::Fraction(Choice(
             ChoiceFlags::empty(),
             ChoiceEnum::Range {
-                default: Fraction { num: max_fps, denom: 1 },
+                default: Fraction { num: source_max, denom: 1 },
                 min: Fraction { num: 1, denom: 1 },
-                max: Fraction { num: max_fps, denom: 1 },
+                max: Fraction { num: source_max, denom: 1 },
             },
         ))),
     ));
@@ -347,12 +356,15 @@ fn run_pipewire(
         importer,
         frames,
         recycle,
-        // Allow slight jitter so a 60 Hz source is not decimated.
-        min_interval_ns: if max_fps > 0 { 1_000_000_000 / max_fps as u64 * 9 / 10 } else { 0 },
-        last_ns: 0,
+        interval_ns: if max_fps > 0 { 1_000_000_000 / max_fps as u64 } else { 0 },
+        next_due_ns: 0,
         logged_type: false,
         read_ns: 0,
         reads: 0,
+        stat_calls: 0,
+        stat_bufs: 0,
+        stat_out: 0,
+        stat_t: 0,
     };
 
     let ml = mainloop.clone();
@@ -406,13 +418,32 @@ fn run_pipewire(
         .process(|stream, ud| {
             // Drain to the newest buffer; older ones are stale.
             let mut newest = None;
+            let mut n = 0;
             while let Some(b) = stream.dequeue_buffer() {
                 newest = Some(b);
+                n += 1;
+            }
+            ud.stat_calls += 1;
+            ud.stat_bufs += n;
+            let t = now_ns();
+            if t - ud.stat_t > 5_000_000_000 {
+                if ud.stat_t != 0 {
+                    let secs = (t - ud.stat_t) as f64 / 1e9;
+                    debug!(
+                        "pipewire: {:.1} process/s, {:.1} buffers/s, {:.1} frames/s passed on",
+                        ud.stat_calls as f64 / secs,
+                        ud.stat_bufs as f64 / secs,
+                        ud.stat_out as f64 / secs
+                    );
+                }
+                (ud.stat_calls, ud.stat_bufs, ud.stat_out, ud.stat_t) = (0, 0, 0, t);
             }
             let Some(mut buffer) = newest else { return };
             let Some(fmt) = ud.format else { return };
             let now = now_ns();
-            if now.saturating_sub(ud.last_ns) < ud.min_interval_ns {
+            // Pacing that keeps the average rate at max_fps: a 75 Hz source passes 60 of
+            // every 75 frames instead of every other one. Half an interval of slack absorbs jitter.
+            if now + ud.interval_ns / 2 < ud.next_due_ns {
                 return;
             }
             let width = ud.info.size().width;
@@ -467,7 +498,8 @@ fn run_pipewire(
                 buf.extend_from_slice(&src[offset..offset + need]);
                 (stride, fmt)
             };
-            ud.last_ns = now;
+            ud.next_due_ns = (ud.next_due_ns + ud.interval_ns).max(now.saturating_sub(ud.interval_ns / 2));
+            ud.stat_out += 1;
             ud.frames.put(Frame { width, height, stride, format, capture_ns: now, data: buf });
         })
         .register()?;
