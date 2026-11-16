@@ -60,7 +60,7 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 - capture → sent (GPU blit/scale + CUDA copy + NVENC): p50 ~2.5 / p95 ~4 ms
 - sent → received (USB via adb): p50 ~2 / p95 ~3.5 ms
 - waiting for the decoder: ~0.5 ms
-- hardware decode on the MT8781: 15–19 ms, the largest stage (varies with the tablet's clocks/thermals)
+- hardware decode on the MT8781: ~19 ms with the pen idle, **~11.5 ms while drawing**. MediaTek's decoder speed follows the CPU clock, and Android only raises the clocks while there is touch/pen input (the same effect is discussed in [moonlight-android#1241](https://github.com/moonlight-stream/moonlight-android/issues/1241)). With the pen in use, capture→shown is p50 ~17 ms
 - decoded → shown: ~1.5 ms
 
 Back-pressure (`--max-in-flight`, default 2) keeps a slow decoder from building a queue: the host waits and then encodes the newest frame instead of a backlog.
@@ -137,7 +137,7 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] Built-in latency statistics
 - [x] Reproducible latency comparison against Weylus (`tools/latency`)
 - [x] Per-stage latency stats, back-pressure, and a fix for 30–40 ms transfer stalls (messages are now written in one piece; split writes hit Nagle + delayed ACK in adbd's socket on the tablet)
-- [ ] Hardware decode (15–19 ms at 1080p on the MT8781) is now the largest stage; beyond fewer pixels or opt-in vendor tweaks there is little left to win generically
+- [ ] Hardware decode is the largest stage: on the MT8781 it is CPU-clock-bound (19 ms idle, 11.5 ms while drawing thanks to Android's input boost, 9 ms with all cores clocked up). An opt-in boost for pen-idle viewing is possible, at a battery cost
 - [x] Raw stylus input over adb (full tilt on devices whose Android config drops it, e.g. NXTPAPER 14)
 - [ ] VAAPI encoder fallback (AMD / Intel)
 - [x] Zero-copy GPU path (DMA-BUF → GL → CUDA → NVENC) and GPU downscaling to fit the tablet
