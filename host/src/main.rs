@@ -6,6 +6,7 @@ mod capture;
 mod cuda;
 mod dmabuf;
 mod encode;
+mod gnome;
 mod input;
 mod kde;
 mod niri;
@@ -116,12 +117,16 @@ fn main() -> Result<()> {
     } else if let Some(size) = virtual_size {
         let fps = args.fps;
         lazy = Some(Box::new(move |hello: &proto::Hello| {
-            let size = size.unwrap_or_else(|| {
-                let fps = fps.unwrap_or(hello.refresh_hz.round().max(1.0) as u32);
-                session::stream_size((hello.surface_w as u32, hello.surface_h as u32), hello, fps)
-            });
+            let fps = fps.unwrap_or(hello.refresh_hz.round().max(1.0) as u32);
+            let size = size
+                .unwrap_or_else(|| session::stream_size((hello.surface_w as u32, hello.surface_h as u32), hello, fps));
             info!("creating a {}x{} virtual monitor", size.0, size.1);
-            let cap = capture::start(source_max_fps, true, Some(size))?;
+            if gnome::is_gnome() {
+                gnome::remember_connectors();
+            }
+            // Virtual monitors take their refresh rate from what we ask for (Mutter made
+            // a 240 Hz one with the mirroring headroom), so ask for the tablet's rate.
+            let cap = capture::start(fps, true, Some(size))?;
             std::thread::sleep(std::time::Duration::from_millis(500));
             if !cap.running.load(std::sync::atomic::Ordering::SeqCst) {
                 bail!("virtual monitor capture failed to start (see warnings above)");

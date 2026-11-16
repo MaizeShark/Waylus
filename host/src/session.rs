@@ -193,6 +193,16 @@ fn session(
             None => warn!("KDE: couldn't tell which output is shown; map the Waylus pen/touch in System Settings"),
         }
     }
+    if crate::gnome::is_gnome() {
+        let pos = capture.and_then(|c| c.geometry.position);
+        let virtual_size = if capture.is_some() && pos.is_none() { capture.and_then(wait_source_size) } else { None };
+        let named = opts.output_name.clone();
+        crate::gnome::map_devices_with(move || match (pos, virtual_size) {
+            (Some(p), _) => crate::gnome::output_at(p),
+            (None, Some(sz)) => crate::gnome::virtual_output(sz),
+            _ => named.clone(),
+        });
+    }
 
     let writer: Writer = Arc::new(Mutex::new(stream.try_clone()?));
     let stop = Arc::new(AtomicBool::new(false));
