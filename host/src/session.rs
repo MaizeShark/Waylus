@@ -1,0 +1,421 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Connection handling: one TCP connection per tablet session (tunnelled over
+//! USB by `adb reverse`). Video flows host→tablet, input and stats flow back.
+
+use std::{
+    io::{BufReader, Write},
+    net::{Shutdown, TcpListener, TcpStream},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
+use tracing::{debug, info, warn};
+
+use crate::{
+    capture::{Capture, Frame},
+    encode::{Encoder, EncoderOpts, Packet},
+    input::{AreaMm, Pen, Touch},
+    proto::{self, DeviceMsg, Hello, codec, now_ns, video_flags},
+};
+
+/// Approximate pixel density of the tablet panel (NXTPAPER 14: 2400 px over ~302 mm).
+/// Only used for the axis resolution libinput reports; mapping is resolution-independent.
+const TABLET_PX_PER_MM: f32 = 7.95;
+
+pub struct Opts {
+    pub port: u16,
+    pub enc: EncoderOpts,
+    /// Size reported to the tablet in input-only mode (aspect ratio of the output).
+    pub output_size: (u32, u32),
+}
+
+type Writer = Arc<Mutex<TcpStream>>;
+/// Capture timestamps of refresh frames, so they can be excluded from latency stats.
+type RefreshIds = Arc<Mutex<std::collections::VecDeque<u64>>>;
+
+const REFRESH_INTERVAL_MS: u64 = 100;
+const REFRESH_FRAMES: u32 = 3;
+
+fn send(w: &Writer, f: impl FnOnce(&mut TcpStream) -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut g = w.lock().unwrap();
+    f(&mut g)
+}
+
+pub fn serve(opts: Opts, capture: Option<Capture>) -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", opts.port)).with_context(|| format!("bind port {}", opts.port))?;
+    info!("waiting for the tablet on 127.0.0.1:{} (adb reverse)", opts.port);
+    let mut inputs: Option<(Pen, Touch)> = None;
+    let mut last_frame: Option<Frame> = None;
+    for conn in listener.incoming() {
+        let stream = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("accept: {e}");
+                continue;
+            }
+        };
+        info!("tablet connected");
+        match session(&opts, capture.as_ref(), stream, &mut inputs, &mut last_frame) {
+            Ok(()) => info!("tablet disconnected"),
+            Err(e) => warn!("session ended: {e:#}"),
+        }
+        if let Some((pen, touch)) = inputs.as_mut() {
+            let _ = pen.reset();
+            let _ = touch.reset();
+        }
+        if capture.as_ref().is_some_and(|c| !c.running.load(Ordering::SeqCst)) {
+            bail!("screen capture stopped");
+        }
+    }
+    Ok(())
+}
+
+/// Largest rectangle with the video's aspect ratio that fits the surface.
+fn fit(video: (u32, u32), surface: (u32, u32)) -> (f32, f32) {
+    let (vw, vh) = (video.0 as f32, video.1 as f32);
+    let (sw, sh) = (surface.0 as f32, surface.1 as f32);
+    let s = (sw / vw).min(sh / vh);
+    (vw * s, vh * s)
+}
+
+fn session(
+    opts: &Opts,
+    capture: Option<&Capture>,
+    stream: TcpStream,
+    inputs: &mut Option<(Pen, Touch)>,
+    last_frame: &mut Option<Frame>,
+) -> Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut reader = BufReader::with_capacity(64 * 1024, stream.try_clone()?);
+    let mut buf = Vec::new();
+    let hello = match proto::read_msg(&mut reader, &mut buf).context("waiting for hello")? {
+        DeviceMsg::Hello(h) => h,
+        m => bail!("expected hello, got {m:?}"),
+    };
+    info!(
+        "client v{} surface {}x{}, decoder {} (max {}x{}, {} MB/frame, {} MB/s)",
+        hello.version,
+        hello.surface_w,
+        hello.surface_h,
+        hello.decoder,
+        hello.max_w,
+        hello.max_h,
+        hello.max_mb_per_frame,
+        hello.max_mb_per_sec
+    );
+    if hello.version != proto::PROTO_VERSION {
+        bail!("protocol mismatch: host {} client {}", proto::PROTO_VERSION, hello.version);
+    }
+    stream.set_read_timeout(None)?;
+
+    let video_size = match (capture, last_frame.as_ref()) {
+        (Some(_), Some(f)) => (f.width, f.height),
+        _ => opts.output_size,
+    };
+    if inputs.is_none() {
+        let (w, h) = fit(video_size, (hello.surface_w as u32, hello.surface_h as u32));
+        let area = AreaMm { width: w / TABLET_PX_PER_MM, height: h / TABLET_PX_PER_MM };
+        info!("creating virtual pen + touchscreen ({:.0}x{:.0} mm)", area.width, area.height);
+        *inputs = Some((Pen::new(area)?, Touch::new(area)?));
+    }
+    let (pen, touch) = inputs.as_mut().unwrap();
+
+    let writer: Writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let stop = Arc::new(AtomicBool::new(false));
+    let keyframe = Arc::new(AtomicBool::new(false));
+    let refresh_ids: RefreshIds = Default::default();
+
+    if capture.is_none() {
+        send(&writer, |w| {
+            proto::write_config(w, codec::NONE, opts.output_size.0 as u16, opts.output_size.1 as u16)
+        })?;
+    }
+
+    let video = capture.map(|cap| {
+        let (writer, stop, keyframe) = (writer.clone(), stop.clone(), keyframe.clone());
+        let frames = cap.frames.clone();
+        let recycle = cap.recycle.clone();
+        let capture_running = cap.running.clone();
+        let refresh_ids = refresh_ids.clone();
+        let enc_opts = opts.enc.clone();
+        let hello = hello.clone();
+        let first = last_frame.take();
+        thread::Builder::new()
+            .name("video".into())
+            .spawn(move || {
+                let r = video_loop(&enc_opts, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids);
+                stop.store(true, Ordering::SeqCst);
+                let _ = writer.lock().unwrap().shutdown(Shutdown::Both);
+                r
+            })
+            .expect("spawn video thread")
+    });
+
+    let pinger = {
+        let (writer, stop) = (writer.clone(), stop.clone());
+        thread::Builder::new().name("ping".into()).spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                if send(&writer, |w| proto::write_ping(w, now_ns())).is_err() {
+                    break;
+                }
+                n += 1;
+                // Burst at start for a quick clock estimate, then 2 Hz.
+                thread::sleep(Duration::from_millis(if n < 10 { 50 } else { 500 }));
+            }
+        })?
+    };
+
+    let mut stats = Stats::default();
+    let res: Result<()> = (|| loop {
+        let msg = proto::read_msg(&mut reader, &mut buf)?;
+        match msg {
+            DeviceMsg::Pen(s) => {
+                pen.handle(&s)?;
+                stats.pen(&s);
+            }
+            DeviceMsg::Touch { points, .. } => touch.handle(&points)?,
+            DeviceMsg::Pong { host_ns, dev_ns } => stats.pong(host_ns, dev_ns),
+            DeviceMsg::FrameShown { capture_ns, recv_ns, render_ns } => {
+                let mut ids = refresh_ids.lock().unwrap();
+                if let Some(i) = ids.iter().position(|&x| x == capture_ns) {
+                    ids.remove(i);
+                } else {
+                    stats.frame(capture_ns, recv_ns, render_ns);
+                }
+                while ids.len() > 64 {
+                    ids.pop_front();
+                }
+            }
+            DeviceMsg::RequestKeyframe => {
+                debug!("tablet requested keyframe");
+                keyframe.store(true, Ordering::SeqCst);
+            }
+            DeviceMsg::Hello(_) => warn!("duplicate hello"),
+            DeviceMsg::Unknown(t) => debug!("ignoring message type {t}"),
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        stats.maybe_report();
+    })();
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = pinger.join();
+    if let Some(v) = video {
+        match v.join() {
+            Ok(Ok(f)) => *last_frame = f,
+            Ok(Err(e)) => warn!("video: {e:#}"),
+            Err(_) => warn!("video thread panicked"),
+        }
+    }
+    match res {
+        Err(e) if is_disconnect(&e) => Ok(()),
+        r => r,
+    }
+}
+
+fn is_disconnect(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn video_loop(
+    opts: &EncoderOpts,
+    hello: &Hello,
+    frames: &crate::slot::LatestSlot<Frame>,
+    recycle: &crossbeam_channel::Sender<Vec<u8>>,
+    first: Option<Frame>,
+    writer: &Writer,
+    stop: &AtomicBool,
+    keyframe: &AtomicBool,
+    capture_running: &AtomicBool,
+    refresh_ids: &RefreshIds,
+) -> Result<Option<Frame>> {
+    let mut enc: Option<Encoder> = None;
+    let mut packets: Vec<Packet> = Vec::new();
+    let mut last: Option<Frame> = None;
+    let mut pending = first;
+    // Static screens produce no new frames; re-encode the last one a few times so the
+    // quality converges (rate control can spend bits on residuals instead of new content).
+    let mut refreshes_left = 0u32;
+    let mut window = Instant::now();
+    let (mut n, mut bytes, mut enc_ns, mut sent_lag_ns, mut pkts, mut empty) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+
+    while !stop.load(Ordering::Relaxed) {
+        let frame = match pending.take() {
+            Some(f) => f,
+            None => match frames.take_timeout(Duration::from_millis(REFRESH_INTERVAL_MS)) {
+                Some(f) => f,
+                None if !capture_running.load(Ordering::Relaxed) => bail!("screen capture stopped"),
+                None => {
+                    if let (Some(e), Some(f)) = (enc.as_mut(), last.as_ref())
+                        && refreshes_left > 0
+                    {
+                        refreshes_left -= 1;
+                        let ns = now_ns();
+                        refresh_ids.lock().unwrap().push_back(ns);
+                        packets.clear();
+                        e.encode(f, ns, &mut packets)?;
+                        for p in &packets {
+                            let flags = if p.key { video_flags::KEY } else { 0 };
+                            send(writer, |w| {
+                                proto::write_video(w, p.capture_ns, flags, &p.data)?;
+                                w.flush()
+                            })?;
+                        }
+                    }
+                    continue;
+                }
+            },
+        };
+        refreshes_left = REFRESH_FRAMES;
+        if enc.as_ref().is_none_or(|e| !e.matches(&frame)) {
+            let mb = frame.width.div_ceil(16) * frame.height.div_ceil(16);
+            if hello.max_mb_per_frame > 0 && mb > hello.max_mb_per_frame {
+                warn!(
+                    "{}x{} ({mb} macroblocks) exceeds the tablet decoder limit of {}; decoding may fail",
+                    frame.width, frame.height, hello.max_mb_per_frame
+                );
+            }
+            let e = Encoder::new(opts, frame.width, frame.height, frame.format)?;
+            send(writer, |w| proto::write_config(w, codec::H264, frame.width as u16, frame.height as u16))?;
+            if let Some(x) = e.extradata() {
+                send(writer, |w| proto::write_video(w, 0, video_flags::CONFIG, &x))?;
+            }
+            enc = Some(e);
+        }
+        let took = now_ns();
+        let frame_capture_ns = frame.capture_ns;
+        let e = enc.as_mut().unwrap();
+        if keyframe.swap(false, Ordering::SeqCst) {
+            e.request_keyframe();
+        }
+        let t0 = now_ns();
+        packets.clear();
+        e.encode(&frame, frame.capture_ns, &mut packets)?;
+        let t1 = now_ns();
+        enc_ns += t1 - t0;
+        if packets.is_empty() {
+            empty += 1;
+        }
+        for p in &packets {
+            let flags = if p.key { video_flags::KEY } else { 0 };
+            bytes += p.data.len() as u64;
+            send(writer, |w| {
+                proto::write_video(w, p.capture_ns, flags, &p.data)?;
+                w.flush()
+            })?;
+            sent_lag_ns += now_ns().saturating_sub(p.capture_ns);
+            tracing::trace!(
+                "frame: slot wait {:.2} ms, encode {:.2} ms, write {:.2} ms",
+                (took - frame_capture_ns) as f64 / 1e6,
+                (t1 - t0) as f64 / 1e6,
+                (now_ns() - t1) as f64 / 1e6
+            );
+            pkts += 1;
+        }
+        n += 1;
+        if let Some(old) = last.replace(frame) {
+            let _ = recycle.try_send(old.data);
+        }
+        if window.elapsed() >= Duration::from_secs(5) {
+            let secs = window.elapsed().as_secs_f64();
+            info!(
+                "video: {:.1} fps, {:.1} Mbit/s, encode {:.2} ms/frame, capture→sent {:.2} ms, {} frames without output",
+                n as f64 / secs,
+                bytes as f64 * 8.0 / secs / 1e6,
+                enc_ns as f64 / n.max(1) as f64 / 1e6,
+                sent_lag_ns as f64 / pkts.max(1) as f64 / 1e6,
+                empty
+            );
+            window = Instant::now();
+            (n, bytes, enc_ns, sent_lag_ns, pkts, empty) = (0, 0, 0, 0, 0, 0);
+        }
+    }
+    Ok(last)
+}
+
+#[derive(Default)]
+struct Stats {
+    /// device_clock - host_clock, from the ping with the smallest RTT.
+    offset: Option<i64>,
+    best_rtt: u64,
+    pongs: u32,
+    frame_lat: Vec<f64>,
+    net_lat: Vec<f64>,
+    pen_lat: Vec<f64>,
+    last_report: Option<Instant>,
+}
+
+impl Stats {
+    fn pong(&mut self, host_ns: u64, dev_ns: u64) {
+        let now = now_ns();
+        let rtt = now.saturating_sub(host_ns);
+        self.pongs += 1;
+        // Prefer low-RTT samples, but let the estimate age so drift is tracked.
+        if self.offset.is_none() || rtt <= self.best_rtt || self.pongs.is_multiple_of(32) {
+            self.best_rtt = rtt;
+            self.offset = Some(dev_ns as i64 - (host_ns + rtt / 2) as i64);
+        }
+    }
+
+    fn to_host(&self, dev_ns: u64) -> Option<i64> {
+        self.offset.map(|o| dev_ns as i64 - o)
+    }
+
+    fn frame(&mut self, capture_ns: u64, recv_ns: u64, render_ns: u64) {
+        if let (Some(r), Some(v)) = (self.to_host(render_ns), self.to_host(recv_ns)) {
+            self.frame_lat.push((r - capture_ns as i64) as f64 / 1e6);
+            self.net_lat.push((v - capture_ns as i64) as f64 / 1e6);
+        }
+    }
+
+    fn pen(&mut self, s: &proto::PenSample) {
+        if let Some(t) = self.to_host(s.t_ns) {
+            self.pen_lat.push((now_ns() as i64 - t) as f64 / 1e6);
+        }
+    }
+
+    fn maybe_report(&mut self) {
+        let due = self.last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+        if !due {
+            return;
+        }
+        self.last_report = Some(Instant::now());
+        let fmt = |v: &mut Vec<f64>| -> String {
+            if v.is_empty() {
+                return "-".into();
+            }
+            v.sort_by(|a, b| a.total_cmp(b));
+            let p = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+            let s = format!("p50 {:.1} / p95 {:.1} ms (n={})", p(0.5), p(0.95), v.len());
+            v.clear();
+            s
+        };
+        if !self.frame_lat.is_empty() || !self.pen_lat.is_empty() {
+            info!(
+                "latency: capture→shown {} | capture→received {} | pen→host {} | rtt {:.2} ms",
+                fmt(&mut self.frame_lat),
+                fmt(&mut self.net_lat),
+                fmt(&mut self.pen_lat),
+                self.best_rtt as f64 / 1e6
+            );
+        }
+    }
+}

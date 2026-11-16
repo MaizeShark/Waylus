@@ -1,0 +1,26 @@
+[package]
+name = "waylus"
+description = "Use an Android tablet as a low-latency pen display on Wayland over USB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+ctrlc = "3"
+clap = { version = "4.6", features = ["derive"] }
+crossbeam-channel = "0.5"
+evdev = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ffmpeg-next = "9.1"
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "screencast"] }
+pipewire = { version = "0.10", features = ["v0_3_65"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+libc = "0.2"
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.18"
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

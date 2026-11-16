@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Wire protocol shared with the Android client (`android/app/src/main/java/dev/waylus/Proto.kt`).
+//!
+//! Every message is framed as `[u8 type][u32 len][payload]`, little-endian.
+//! Device timestamps are Android `System.nanoTime()` (CLOCK_MONOTONIC on the
+//! tablet), host timestamps are CLOCK_MONOTONIC on the host.
+
+use std::io::{self, Read, Write};
+
+pub const PROTO_VERSION: u16 = 1;
+pub const DEFAULT_PORT: u16 = 27183;
+/// Upper bound for a single message, protects against garbage on the wire.
+const MAX_LEN: u32 = 16 * 1024 * 1024;
+
+pub mod ty {
+    pub const HELLO: u8 = 1;
+    pub const CONFIG: u8 = 2;
+    pub const VIDEO: u8 = 3;
+    pub const PEN: u8 = 4;
+    pub const TOUCH: u8 = 5;
+    pub const PING: u8 = 6;
+    pub const PONG: u8 = 7;
+    pub const FRAME_SHOWN: u8 = 8;
+    pub const REQUEST_KEYFRAME: u8 = 9;
+}
+
+pub mod video_flags {
+    pub const KEY: u8 = 1;
+    pub const CONFIG: u8 = 2;
+}
+
+#[allow(dead_code)]
+pub mod pen_state {
+    pub const OUT: u8 = 0;
+    pub const HOVER: u8 = 1;
+    pub const CONTACT: u8 = 2;
+}
+
+pub mod pen_buttons {
+    pub const PRIMARY: u8 = 1;
+    pub const SECONDARY: u8 = 2;
+    /// The tool is an eraser (TOOL_TYPE_ERASER or inverted pen).
+    pub const ERASER: u8 = 4;
+}
+
+#[derive(Debug, Clone)]
+pub struct Hello {
+    pub version: u16,
+    /// Size of the drawable surface in pixels (landscape).
+    pub surface_w: u16,
+    pub surface_h: u16,
+    /// Decoder limits.
+    pub max_w: u16,
+    pub max_h: u16,
+    pub max_mb_per_frame: u32,
+    pub max_mb_per_sec: u32,
+    pub decoder: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PenSample {
+    pub t_ns: u64,
+    pub state: u8,
+    pub buttons: u8,
+    /// 0..=65535 across the video rectangle.
+    pub x: u16,
+    pub y: u16,
+    /// 0..=65535
+    pub pressure: u16,
+    /// Centidegrees, -9000..=9000.
+    pub tilt_x: i16,
+    pub tilt_y: i16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TouchPoint {
+    pub id: u8,
+    pub x: u16,
+    pub y: u16,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeviceMsg {
+    Hello(Hello),
+    Pen(PenSample),
+    /// Full list of current contacts; missing ids are lifted.
+    Touch {
+        #[allow(dead_code)]
+        t_ns: u64,
+        points: Vec<TouchPoint>,
+    },
+    Pong { host_ns: u64, dev_ns: u64 },
+    FrameShown { capture_ns: u64, recv_ns: u64, render_ns: u64 },
+    RequestKeyframe,
+    Unknown(u8),
+}
+
+struct Cur<'a>(&'a [u8]);
+impl Cur<'_> {
+    fn take<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        if self.0.len() < N {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short message"));
+        }
+        let (a, b) = self.0.split_at(N);
+        self.0 = b;
+        Ok(a.try_into().unwrap())
+    }
+    fn u8(&mut self) -> io::Result<u8> {
+        Ok(self.take::<1>()?[0])
+    }
+    fn u16(&mut self) -> io::Result<u16> {
+        Ok(u16::from_le_bytes(self.take()?))
+    }
+    fn i16(&mut self) -> io::Result<i16> {
+        Ok(i16::from_le_bytes(self.take()?))
+    }
+    fn u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(self.take()?))
+    }
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(self.take()?))
+    }
+}
+
+/// Reads one framed message. Reuses `buf` for the payload.
+pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
+    let mut hdr = [0u8; 5];
+    r.read_exact(&mut hdr)?;
+    let ty = hdr[0];
+    let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap());
+    if len > MAX_LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("message too large: {len}")));
+    }
+    buf.resize(len as usize, 0);
+    r.read_exact(buf)?;
+    let mut c = Cur(buf);
+    Ok(match ty {
+        ty::HELLO => {
+            let version = c.u16()?;
+            let surface_w = c.u16()?;
+            let surface_h = c.u16()?;
+            let max_w = c.u16()?;
+            let max_h = c.u16()?;
+            let max_mb_per_frame = c.u32()?;
+            let max_mb_per_sec = c.u32()?;
+            let n = c.u8()? as usize;
+            let name = c.0.get(..n).unwrap_or(c.0);
+            DeviceMsg::Hello(Hello {
+                version,
+                surface_w,
+                surface_h,
+                max_w,
+                max_h,
+                max_mb_per_frame,
+                max_mb_per_sec,
+                decoder: String::from_utf8_lossy(name).into_owned(),
+            })
+        }
+        ty::PEN => DeviceMsg::Pen(PenSample {
+            t_ns: c.u64()?,
+            state: c.u8()?,
+            buttons: c.u8()?,
+            x: c.u16()?,
+            y: c.u16()?,
+            pressure: c.u16()?,
+            tilt_x: c.i16()?,
+            tilt_y: c.i16()?,
+        }),
+        ty::TOUCH => {
+            let t_ns = c.u64()?;
+            let n = c.u8()? as usize;
+            let mut points = Vec::with_capacity(n);
+            for _ in 0..n {
+                points.push(TouchPoint { id: c.u8()?, x: c.u16()?, y: c.u16()? });
+            }
+            DeviceMsg::Touch { t_ns, points }
+        }
+        ty::PONG => DeviceMsg::Pong { host_ns: c.u64()?, dev_ns: c.u64()? },
+        ty::FRAME_SHOWN => DeviceMsg::FrameShown {
+            capture_ns: c.u64()?,
+            recv_ns: c.u64()?,
+            render_ns: c.u64()?,
+        },
+        ty::REQUEST_KEYFRAME => DeviceMsg::RequestKeyframe,
+        other => DeviceMsg::Unknown(other),
+    })
+}
+
+fn header(w: &mut impl Write, ty: u8, len: usize) -> io::Result<()> {
+    let mut hdr = [0u8; 5];
+    hdr[0] = ty;
+    hdr[1..5].copy_from_slice(&(len as u32).to_le_bytes());
+    w.write_all(&hdr)
+}
+
+pub mod codec {
+    pub const H264: u8 = 0;
+    /// Input-only session: no video, width/height only give the aspect ratio.
+    pub const NONE: u8 = 255;
+}
+
+pub fn write_config(w: &mut impl Write, codec: u8, width: u16, height: u16) -> io::Result<()> {
+    header(w, ty::CONFIG, 5)?;
+    let mut p = [0u8; 5];
+    p[0] = codec;
+    p[1..3].copy_from_slice(&width.to_le_bytes());
+    p[3..5].copy_from_slice(&height.to_le_bytes());
+    w.write_all(&p)
+}
+
+pub fn write_video(w: &mut impl Write, capture_ns: u64, flags: u8, data: &[u8]) -> io::Result<()> {
+    header(w, ty::VIDEO, 9 + data.len())?;
+    let mut p = [0u8; 9];
+    p[..8].copy_from_slice(&capture_ns.to_le_bytes());
+    p[8] = flags;
+    w.write_all(&p)?;
+    w.write_all(data)
+}
+
+pub fn write_ping(w: &mut impl Write, host_ns: u64) -> io::Result<()> {
+    header(w, ty::PING, 8)?;
+    w.write_all(&host_ns.to_le_bytes())
+}
+
+/// CLOCK_MONOTONIC in nanoseconds.
+pub fn now_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}

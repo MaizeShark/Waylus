@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package dev.waylus
+
+import android.app.Activity
+import android.content.Context
+import android.graphics.Color
+import android.graphics.RectF
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.util.Log
+import android.view.Gravity
+import android.view.InputDevice
+import android.view.MotionEvent
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
+import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.TextView
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
+    private lateinit var root: Root
+    private lateinit var surfaceView: SurfaceView
+    private lateinit var frame: View
+    private lateinit var status: TextView
+    private lateinit var conn: Connection
+    private lateinit var decoder: VideoDecoder
+    private lateinit var input: InputCapture
+    private val decoderInfo by lazy { VideoDecoder.pick() }
+
+    /** Where the video is drawn, in root-view coordinates. Read from the UI thread only. */
+    private val videoRect = RectF()
+    private var videoW = 16
+    private var videoH = 9
+    @Volatile private var firstFrameShown = false
+
+    /** Full-screen container that receives all pointer events, unbatched. */
+    inner class Root(ctx: Context) : FrameLayout(ctx) {
+        override fun onTouchEvent(e: MotionEvent) = input.onEvent(e) || super.onTouchEvent(e)
+        override fun onGenericMotionEvent(e: MotionEvent) = input.onEvent(e) || super.onGenericMotionEvent(e)
+        override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+            super.onLayout(changed, l, t, r, b)
+            if (changed) post { relayout() }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        val port = intent.getIntExtra("port", Proto.DEFAULT_PORT)
+
+        root = Root(this).apply { setBackgroundColor(Color.BLACK) }
+        surfaceView = SurfaceView(this)
+        surfaceView.holder.addCallback(this)
+        root.addView(surfaceView, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
+        frame = View(this).apply {
+            background = GradientDrawable().apply { setStroke(2, 0xFF3A3A3A.toInt()) }
+        }
+        root.addView(frame, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
+        status = TextView(this).apply {
+            setTextColor(0xFFB0B0B0.toInt())
+            textSize = 18f
+            gravity = Gravity.CENTER
+        }
+        root.addView(status, FrameLayout.LayoutParams(-1, -1))
+        setContentView(root)
+        setStatus("Waylus\nwaiting for host…\n\nrun `waylus` on your computer")
+
+        // Deliver every pen/touch sample as it arrives instead of batching to vsync.
+        root.requestUnbufferedDispatch(InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN)
+
+        conn = Connection(port, this)
+        decoder = VideoDecoder(
+            decoderInfo,
+            onShown = { c, r, n ->
+                conn.send(Proto.frameShown(c, r, n))
+                if (!firstFrameShown) {
+                    firstFrameShown = true
+                    runOnUiThread { status.visibility = View.GONE; frame.visibility = View.GONE }
+                }
+            },
+            onNeedKeyframe = { conn.send(Proto.requestKeyframe()) },
+        )
+        input = InputCapture(conn::send) { videoRect }
+        Log.i(TAG, "decoder: $decoderInfo, port $port")
+        conn.start()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            window.insetsController?.let {
+                it.hide(WindowInsets.Type.systemBars())
+                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            input.reset()
+        }
+    }
+
+    override fun onDestroy() {
+        conn.stop()
+        decoder.shutdown()
+        super.onDestroy()
+    }
+
+    private fun setStatus(text: String) {
+        status.text = text
+        status.visibility = View.VISIBLE
+    }
+
+    private fun relayout() {
+        val sw = root.width.toFloat()
+        val sh = root.height.toFloat()
+        if (sw <= 0 || sh <= 0) return
+        val s = minOf(sw / videoW, sh / videoH)
+        val w = videoW * s
+        val h = videoH * s
+        videoRect.set((sw - w) / 2, (sh - h) / 2, (sw + w) / 2, (sh + h) / 2)
+        for (v in listOf(surfaceView, frame)) {
+            v.layoutParams = FrameLayout.LayoutParams(w.toInt(), h.toInt(), Gravity.CENTER)
+        }
+    }
+
+    // --- Connection.Listener (network thread) ---
+
+    override fun onConnected(): ByteArray {
+        val bounds = windowManager.currentWindowMetrics.bounds
+        val w = maxOf(bounds.width(), bounds.height())
+        val h = minOf(bounds.width(), bounds.height())
+        val d = decoderInfo
+        runOnUiThread { setStatus("Waylus\nconnected") }
+        return Proto.hello(w, h, d.maxW, d.maxH, d.mbPerFrame, d.mbPerSec, d.name + if (d.lowLatency) " (low-latency)" else "")
+    }
+
+    override fun onDisconnected() {
+        firstFrameShown = false
+        decoder.configure(0, 0)
+        runOnUiThread {
+            input.reset()
+            frame.visibility = View.VISIBLE
+            setStatus("Waylus\nwaiting for host…")
+        }
+    }
+
+    override fun onConfig(codec: Int, width: Int, height: Int) {
+        runOnUiThread {
+            videoW = width.coerceAtLeast(1)
+            videoH = height.coerceAtLeast(1)
+            relayout()
+            if (codec == Proto.CODEC_NONE) {
+                frame.visibility = View.VISIBLE
+                setStatus("Waylus — input only\n${width}×$height")
+            }
+        }
+        if (codec == Proto.CODEC_H264) {
+            firstFrameShown = false
+            decoder.configure(width, height)
+        }
+    }
+
+    override fun onVideo(captureNs: Long, flags: Int, data: ByteArray, offset: Int, recvNs: Long) {
+        decoder.submit(captureNs, flags, data, offset, recvNs)
+    }
+
+    // --- SurfaceHolder.Callback ---
+
+    override fun surfaceCreated(holder: SurfaceHolder) {}
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        decoder.setSurface(holder.surface)
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        // The codec must let go of the surface before this returns.
+        val done = CountDownLatch(1)
+        decoder.setSurface(null)
+        decoder.post { done.countDown() }
+        done.await(500, TimeUnit.MILLISECONDS)
+    }
+
+    companion object { private const val TAG = "waylus" }
+}
