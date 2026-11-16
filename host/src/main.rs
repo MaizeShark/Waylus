@@ -30,9 +30,12 @@ struct Args {
     /// FFmpeg encoder to use.
     #[arg(long, default_value = "h264_nvenc")]
     encoder: String,
-    /// Video bitrate in Mbit/s.
-    #[arg(long, default_value_t = 20.0)]
-    bitrate: f64,
+    /// Video bitrate in Mbit/s (default: 20 at 1080p, scaled with resolution).
+    #[arg(long)]
+    bitrate: Option<f64>,
+    /// Show the monitor picker again instead of reusing the remembered monitor.
+    #[arg(long)]
+    choose: bool,
     /// Frame rate (default: the tablet's display refresh rate, within decoder limits).
     #[arg(long)]
     fps: Option<u32>,
@@ -83,7 +86,7 @@ fn main() -> Result<()> {
         None
     } else {
         // Ask the compositor for more than we need; we pace to the tablet's rate per session.
-        let cap = capture::start(args.fps.map_or(240, |f| f * 2))?;
+        let cap = capture::start(args.fps.map_or(240, |f| f * 2), args.choose)?;
         // Give PipeWire a moment to negotiate so format errors surface before the tablet connects.
         std::thread::sleep(std::time::Duration::from_millis(500));
         if !cap.running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -118,7 +121,7 @@ fn main() -> Result<()> {
             port: args.port,
             enc: encode::EncoderOpts {
                 encoder: args.encoder.clone(),
-                bitrate: (args.bitrate * 1e6) as usize,
+                bitrate: args.bitrate.map(|b| (b * 1e6) as usize),
                 fps: args.fps.unwrap_or(60),
             },
             fps: args.fps,

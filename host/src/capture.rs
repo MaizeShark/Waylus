@@ -60,6 +60,10 @@ pub struct Capture {
     /// Target frame interval for pacing (0 = pass every frame). Set per session
     /// from the tablet's refresh rate.
     pub pace_ns: Arc<AtomicU64>,
+    /// Captured size as `w << 32 | h` (0 until negotiated).
+    pub source_size: Arc<AtomicU64>,
+    /// Size to scale frames to, `w << 32 | h` (0 = native). Only the DMA-BUF path scales.
+    pub target_size: Arc<AtomicU64>,
     /// Recycled frame buffers, sent back by the encoder.
     pub recycle: crossbeam_channel::Sender<Vec<u8>>,
     pub geometry: StreamGeometry,
@@ -78,12 +82,15 @@ fn token_path() -> PathBuf {
 /// Blocks until the user picked a monitor (first run) or the restore token was accepted.
 /// `source_max_fps` is the highest rate we ask the compositor for; pacing to the
 /// tablet's rate happens on our side (see [`Capture::pace_ns`]).
-pub fn start(source_max_fps: u32) -> Result<Capture> {
+pub fn start(source_max_fps: u32, choose_again: bool) -> Result<Capture> {
     let (geo_tx, geo_rx) = crossbeam_channel::bounded::<Result<(StreamGeometry, u32, std::os::fd::OwnedFd)>>(1);
     let frames = Arc::new(LatestSlot::new());
     let running = Arc::new(AtomicBool::new(true));
     let pace_ns = Arc::new(AtomicU64::new(0));
     let pace2 = pace_ns.clone();
+    let source_size = Arc::new(AtomicU64::new(0));
+    let target_size = Arc::new(AtomicU64::new(0));
+    let sizes = (source_size.clone(), target_size.clone());
     let (recycle_tx, recycle_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let frames2 = frames.clone();
@@ -98,7 +105,7 @@ pub fn start(source_max_fps: u32) -> Result<Capture> {
                 return;
             }
         };
-        let portal = rt.block_on(open_portal());
+        let portal = rt.block_on(open_portal(choose_again));
         let (proxy, session, geometry, node, fd) = match portal {
             Ok(v) => v,
             Err(e) => {
@@ -108,7 +115,7 @@ pub fn start(source_max_fps: u32) -> Result<Capture> {
         };
         let _keep = (proxy, session);
         let _ = geo_tx.send(Ok((geometry, node, fd.try_clone().expect("dup fd"))));
-        if let Err(e) = run_pipewire(fd, node, source_max_fps, pace2, frames2, recycle_rx, running2.clone()) {
+        if let Err(e) = run_pipewire(fd, node, source_max_fps, pace2, sizes, frames2, recycle_rx, running2.clone()) {
             warn!("capture stopped: {e:#}");
         }
         running2.store(false, Ordering::SeqCst);
@@ -116,10 +123,10 @@ pub fn start(source_max_fps: u32) -> Result<Capture> {
 
     let (geometry, node, _fd) = geo_rx.recv().context("capture thread died")??;
     info!("screencast node {node}, geometry {geometry:?}");
-    Ok(Capture { frames, pace_ns, recycle: recycle_tx, geometry, running })
+    Ok(Capture { frames, pace_ns, source_size, target_size, recycle: recycle_tx, geometry, running })
 }
 
-async fn open_portal() -> Result<(
+async fn open_portal(choose_again: bool) -> Result<(
     Screencast,
     ashpd::desktop::Session<Screencast>,
     StreamGeometry,
@@ -129,7 +136,7 @@ async fn open_portal() -> Result<(
     let proxy = Screencast::new().await.context("ScreenCast portal unavailable")?;
     let session = proxy.create_session(Default::default()).await?;
     let token_file = token_path();
-    let token = std::fs::read_to_string(&token_file).ok().map(|s| s.trim().to_owned());
+    let token = if choose_again { None } else { std::fs::read_to_string(&token_file).ok().map(|s| s.trim().to_owned()) };
     let cursor = if proxy.available_cursor_modes().await?.contains(CursorMode::EMBEDDED) {
         CursorMode::EMBEDDED
     } else {
@@ -178,6 +185,8 @@ struct UserData {
     importer: Option<Importer>,
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
+    source_size: Arc<AtomicU64>,
+    target_size: Arc<AtomicU64>,
     /// Frame pacing: target interval (shared, 0 = off) and the earliest time the next frame is due.
     pace_ns: Arc<AtomicU64>,
     next_due_ns: u64,
@@ -316,6 +325,7 @@ fn run_pipewire(
     node: u32,
     max_fps: u32,
     pace_ns: Arc<AtomicU64>,
+    (source_size, target_size): (Arc<AtomicU64>, Arc<AtomicU64>),
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
     running: Arc<AtomicBool>,
@@ -365,6 +375,8 @@ fn run_pipewire(
         frames,
         recycle,
         pace_ns,
+        source_size,
+        target_size,
         next_due_ns: 0,
         logged_type: false,
         read_ns: 0,
@@ -394,6 +406,8 @@ fn run_pipewire(
                 return;
             }
             ud.format = map_format(ud.info.format());
+            let sz = ud.info.size();
+            ud.source_size.store((sz.width as u64) << 32 | sz.height as u64, Ordering::SeqCst);
             ud.dmabuf = ud.info.flags().contains(spa::param::video::VideoFlags::MODIFIER);
             if let Some(imp) = ud.importer.as_mut() {
                 imp.clear();
@@ -466,7 +480,9 @@ fn run_pipewire(
                 ud.logged_type = true;
             }
             let mut buf = ud.recycle.try_recv().unwrap_or_default();
-            let (stride, format) = if datas[0].type_() == spa::buffer::DataType::DmaBuf {
+            let (fw, fh, stride, format) = if datas[0].type_() == spa::buffer::DataType::DmaBuf {
+                let t = ud.target_size.load(Ordering::Relaxed);
+                let (ow, oh) = if t == 0 { (width, height) } else { ((t >> 32) as u32, t as u32) };
                 let Some(imp) = ud.importer.as_mut() else { return };
                 if datas[0].chunk().size() == 0 && datas[0].chunk().flags().contains(spa::buffer::ChunkFlags::CORRUPTED) {
                     return;
@@ -476,7 +492,7 @@ fn run_pipewire(
                     .map(|d| Plane { fd: d.fd() as RawFd, offset: d.chunk().offset(), stride: d.chunk().stride() as u32 })
                     .collect();
                 let t0 = now_ns();
-                if let Err(e) = imp.read(width, height, drm_fourcc(fmt), ud.info.modifier(), &planes, &mut buf) {
+                if let Err(e) = imp.read(width, height, ow, oh, drm_fourcc(fmt), ud.info.modifier(), &planes, &mut buf) {
                     warn!("dmabuf read failed: {e:#}");
                     return;
                 }
@@ -487,7 +503,7 @@ fn run_pipewire(
                     debug!("dmabuf readback {:.2} ms avg", ud.read_ns as f64 / ud.reads as f64 / 1e6);
                 }
                 // glReadPixels(GL_BGRA) always yields B,G,R,A byte order.
-                (width as usize * 4, if fmt == PixFmt::Bgra || fmt == PixFmt::Rgba { PixFmt::Bgra } else { PixFmt::Bgrx })
+                (ow, oh, ow as usize * 4, if fmt == PixFmt::Bgra || fmt == PixFmt::Rgba { PixFmt::Bgra } else { PixFmt::Bgrx })
             } else {
                 let d = &mut datas[0];
                 let (offset, size, stride) = {
@@ -505,11 +521,11 @@ fn run_pipewire(
                 }
                 buf.clear();
                 buf.extend_from_slice(&src[offset..offset + need]);
-                (stride, fmt)
+                (width, height, stride, fmt)
             };
             ud.next_due_ns = (ud.next_due_ns + interval).max(now.saturating_sub(interval / 2));
             ud.stat_out += 1;
-            ud.frames.put(Frame { width, height, stride, format, capture_ns: now, data: buf });
+            ud.frames.put(Frame { width: fw, height: fh, stride, format, capture_ns: now, data: buf });
         })
         .register()?;
 

@@ -15,7 +15,8 @@ use crate::capture::{Frame, PixFmt};
 #[derive(Debug, Clone)]
 pub struct EncoderOpts {
     pub encoder: String,
-    pub bitrate: usize,
+    /// Bits per second; None = scale with resolution (20 Mbit/s at 1080p).
+    pub bitrate: Option<usize>,
     pub fps: u32,
 }
 
@@ -50,6 +51,10 @@ impl Encoder {
         ff::init().context("ffmpeg init")?;
         let codec = ff::encoder::find_by_name(&opts.encoder)
             .ok_or_else(|| anyhow!("encoder {} not found in this ffmpeg build", opts.encoder))?;
+        let bitrate = opts.bitrate.unwrap_or_else(|| {
+            let scaled = 20e6 * (width * height) as f64 / (1920.0 * 1080.0);
+            scaled.clamp(8e6, 60e6) as usize
+        });
         let mut ctx = codec::context::Context::new_with_codec(codec);
         ctx.set_flags(codec::Flags::GLOBAL_HEADER | codec::Flags::LOW_DELAY);
         let mut enc = ctx.encoder().video()?;
@@ -58,8 +63,8 @@ impl Encoder {
         enc.set_format(pixel(format));
         enc.set_time_base((1, 1_000_000));
         enc.set_frame_rate(Some((opts.fps as i32, 1)));
-        enc.set_bit_rate(opts.bitrate);
-        enc.set_max_bit_rate(opts.bitrate);
+        enc.set_bit_rate(bitrate);
+        enc.set_max_bit_rate(bitrate);
         enc.set_max_b_frames(0);
         enc.set_gop(i32::MAX as u32);
         enc.set_colorspace(ff::color::Space::BT709);
@@ -69,7 +74,7 @@ impl Encoder {
         unsafe {
             // A few frames of VBV: lets keyframes reach usable quality while keeping the
             // worst-case frame small (~170 KB at 20 Mbit/s, ~5 ms over USB 2.0).
-            (*enc.as_mut_ptr()).rc_buffer_size = (opts.bitrate / opts.fps.max(1) as usize * 4) as i32;
+            (*enc.as_mut_ptr()).rc_buffer_size = (bitrate / opts.fps.max(1) as usize * 4) as i32;
         }
 
         let mut dict = ff::Dictionary::new();
@@ -84,7 +89,7 @@ impl Encoder {
             dict.set("profile", "high");
         }
         let enc = enc.open_as_with(codec, dict).with_context(|| format!("open {}", opts.encoder))?;
-        info!("encoder {} {}x{} {:?} {} kbit/s", opts.encoder, width, height, format, opts.bitrate / 1000);
+        info!("encoder {} {}x{} {:?} {} kbit/s", opts.encoder, width, height, format, bitrate / 1000);
         let frame = frame::Video::new(pixel(format), width, height);
         Ok(Self {
             enc,

@@ -185,8 +185,11 @@ class VideoDecoder(
             val maxW = v.supportedWidths.upper
             val maxHForW = runCatching { v.getSupportedHeightsFor(maxW).upper }.getOrDefault(v.supportedHeights.upper)
             val mbFrame = (maxW / 16) * (maxHForW / 16)
+            // Macroblock throughput: the best of what the codec claims at 1080p and at its
+            // largest size (rounded, so 60.0 fps * 14400 MB doesn't become 863999).
             val fps1080 = runCatching { v.getSupportedFrameRatesFor(1920, 1080).upper }.getOrDefault(60.0)
-            val mbSec = (fps1080 * 120 * 68).toInt()
+            val fpsMax = runCatching { v.getSupportedFrameRatesFor(maxW, maxHForW).upper }.getOrDefault(0.0)
+            val mbSec = maxOf(Math.round(fps1080 * 120 * 68), Math.round(fpsMax * mbFrame)).toInt()
             val ll = caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
             return Info(best.name, maxW, maxHForW, mbFrame, mbSec, ll)
         }

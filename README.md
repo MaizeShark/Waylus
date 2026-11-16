@@ -109,8 +109,9 @@ input {
 ```
 
 Useful flags:
-- `--bitrate <Mbit/s>` (default 20)
-- `--fps` (default 60)
+- `--choose`: show the monitor picker again (switch the mirrored monitor)
+- `--bitrate <Mbit/s>` (default: 20 at 1080p, scaled with resolution)
+- `--fps` (default: the tablet's refresh rate)
 - `--encoder h264_nvenc`
 - `--serial <adb serial>`
 - `--keep-app`

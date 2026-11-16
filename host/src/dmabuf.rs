@@ -178,8 +178,20 @@ impl Importer {
         }
     }
 
-    /// Copies the DMA-BUF into `out` as tightly packed BGRA (BGRx) rows.
-    pub fn read(&mut self, w: u32, h: u32, format: u32, modifier: u64, planes: &[Plane], out: &mut Vec<u8>) -> Result<()> {
+    /// Copies the `w`x`h` DMA-BUF into `out` as tightly packed BGRA (BGRx) rows,
+    /// scaled to `ow`x`oh` on the GPU (bilinear) when that differs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read(
+        &mut self,
+        w: u32,
+        h: u32,
+        ow: u32,
+        oh: u32,
+        format: u32,
+        modifier: u64,
+        planes: &[Plane],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let p0 = planes.first().ok_or_else(|| anyhow!("no planes"))?;
         let key = (p0.fd, p0.offset, p0.stride, w << 16 | h);
         if !self.cache.contains_key(&key) {
@@ -187,23 +199,28 @@ impl Importer {
             self.cache.insert(key, imp);
         }
         let src_fbo = self.cache[&key].fbo;
-        out.resize(w as usize * h as usize * 4, 0);
+        out.resize(ow as usize * oh as usize * 4, 0);
         unsafe {
             let gl = &self.gl;
-            if self.staging.is_none_or(|s| (s.2, s.3) != (w, h)) {
+            if self.staging.is_none_or(|s| (s.2, s.3) != (ow, oh)) {
+                if let Some((tex, fbo, _, _)) = self.staging.take() {
+                    gl.delete_framebuffer(fbo);
+                    gl.delete_texture(tex);
+                }
                 let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, w as i32, h as i32);
+                gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, ow as i32, oh as i32);
                 let fbo = gl.create_framebuffer().map_err(|e| anyhow!(e))?;
                 gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
                 gl.framebuffer_texture_2d(glow::DRAW_FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
-                self.staging = Some((tex, fbo, w, h));
+                self.staging = Some((tex, fbo, ow, oh));
             }
             let (_, dst_fbo, _, _) = self.staging.unwrap();
             let t0 = std::time::Instant::now();
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(src_fbo));
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(dst_fbo));
-            gl.blit_framebuffer(0, 0, w as i32, h as i32, 0, 0, w as i32, h as i32, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+            let filter = if (ow, oh) == (w, h) { glow::NEAREST } else { glow::LINEAR };
+            gl.blit_framebuffer(0, 0, w as i32, h as i32, 0, 0, ow as i32, oh as i32, glow::COLOR_BUFFER_BIT, filter);
             gl.finish();
             let t1 = std::time::Instant::now();
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(dst_fbo));
@@ -211,8 +228,8 @@ impl Importer {
             gl.read_pixels(
                 0,
                 0,
-                w as i32,
-                h as i32,
+                ow as i32,
+                oh as i32,
                 glow::BGRA,
                 glow::UNSIGNED_BYTE,
                 glow::PixelPackData::Slice(Some(out.as_mut_slice())),

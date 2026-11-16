@@ -77,6 +77,39 @@ pub fn serve(opts: Opts, capture: Option<Capture>) -> Result<()> {
     Ok(())
 }
 
+fn wait_source_size(cap: &Capture) -> Option<(u32, u32)> {
+    for _ in 0..40 {
+        let v = cap.source_size.load(Ordering::SeqCst);
+        if v != 0 {
+            return Some(((v >> 32) as u32, v as u32));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+/// Stream size for a `src`-sized capture: never larger than the area the video
+/// covers on the tablet, within the decoder's size and macroblock-rate limits
+/// at `fps`, never upscaled, aspect ratio kept.
+fn stream_size(src: (u32, u32), h: &Hello, fps: u32) -> (u32, u32) {
+    let (sw, sh) = (src.0 as f64, src.1 as f64);
+    let (rw, rh) = fit(src, (h.surface_w as u32, h.surface_h as u32));
+    let mut s = (rw as f64 / sw).min(rh as f64 / sh).min(1.0);
+    if h.max_w > 0 && h.max_h > 0 {
+        s = s.min(h.max_w as f64 / sw).min(h.max_h as f64 / sh);
+    }
+    loop {
+        let (w, hh) = if s >= 1.0 { src } else { (((sw * s).round() as u32) & !1, ((sh * s).round() as u32) & !1) };
+        let mb = w.div_ceil(16) * hh.div_ceil(16);
+        let fits_frame = h.max_mb_per_frame == 0 || mb <= h.max_mb_per_frame;
+        let fits_rate = h.max_mb_per_sec == 0 || mb as u64 * fps as u64 <= h.max_mb_per_sec as u64;
+        if (fits_frame && fits_rate) || s < 0.1 {
+            return (w.max(2), hh.max(2));
+        }
+        s = s.min(1.0) * 0.98;
+    }
+}
+
 /// Largest rectangle with the video's aspect ratio that fits the surface.
 fn fit(video: (u32, u32), surface: (u32, u32)) -> (f32, f32) {
     let (vw, vh) = (video.0 as f32, video.1 as f32);
@@ -149,8 +182,25 @@ fn session(
         let mut enc_opts = opts.enc.clone();
         enc_opts.fps = opts.fps.unwrap_or(if hello.refresh_hz >= 1.0 { hello.refresh_hz.round() as u32 } else { 60 });
         let pace = cap.pace_ns.clone();
+        let mut stream_dims = None;
+        if let Some(src) = wait_source_size(cap) {
+            let (w, h) = stream_size(src, &hello, enc_opts.fps);
+            cap.target_size.store(if (w, h) == src { 0 } else { (w as u64) << 32 | h as u64 }, Ordering::SeqCst);
+            if (w, h) != src {
+                info!("scaling {}x{} → {w}x{h} to fit the tablet's screen/decoder", src.0, src.1);
+            }
+            stream_dims = Some((w, h));
+        }
+        // Frames captured before the target size was set (or kept from a previous
+        // session) may have the wrong size; they would start a throwaway encoder.
+        let wrong_size = |f: &Frame| stream_dims.is_some_and(|d| (f.width, f.height) != d);
+        if let Some(f) = cap.frames.take_timeout(Duration::ZERO)
+            && !wrong_size(&f)
+        {
+            cap.frames.put(f);
+        }
         let hello = hello.clone();
-        let first = last_frame.take();
+        let first = last_frame.take().filter(|f| !wrong_size(f));
         thread::Builder::new()
             .name("video".into())
             .spawn(move || {
@@ -434,5 +484,40 @@ impl Stats {
                 self.best_rtt as f64 / 1e6
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nxtpaper() -> Hello {
+        Hello {
+            version: 2,
+            surface_w: 2400,
+            surface_h: 1600,
+            max_w: 2560,
+            max_h: 1440,
+            max_mb_per_frame: 14400,
+            max_mb_per_sec: 864000,
+            refresh_hz: 60.0,
+            decoder: "c2.mtk.avc.decoder".into(),
+        }
+    }
+
+    #[test]
+    fn stream_sizes() {
+        let t = nxtpaper();
+        // 1080p fits as is (smaller than the 2400x1350 video area).
+        assert_eq!(stream_size((1920, 1080), &t, 60), (1920, 1080));
+        // 1440p and 4K shrink to the area the video covers on the tablet.
+        assert_eq!(stream_size((2560, 1440), &t, 60), (2400, 1350));
+        assert_eq!(stream_size((3840, 2160), &t, 60), (2400, 1350));
+        // A 120 Hz tablet with the same decoder must trade resolution for rate.
+        let (w, h) = stream_size((3840, 2160), &t, 120);
+        assert!(w.div_ceil(16) * h.div_ceil(16) * 120 <= 864000, "{w}x{h}");
+        // Lenovo TB125FU: 2000x1200 screen, 4K decoder.
+        let l = Hello { surface_w: 2000, surface_h: 1200, max_w: 3840, max_h: 2160, max_mb_per_frame: 32400, max_mb_per_sec: 983040, ..nxtpaper() };
+        assert_eq!(stream_size((3840, 2160), &l, 60), (2000, 1124));
     }
 }
