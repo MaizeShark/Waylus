@@ -62,6 +62,13 @@ struct Args {
     /// Leave the app running on the tablet on exit.
     #[arg(long)]
     keep_app: bool,
+    /// Opt-in, device-specific decoder tweaks, comma separated: mtk-vpp-off, mtk-cpu-boost
+    /// (MediaTek). Off by default; not used for the published comparisons.
+    #[arg(long, value_delimiter = ',')]
+    vendor_tweaks: Vec<String>,
+    /// Back-pressure: max frames sent but not yet shown on the tablet (0 = off).
+    #[arg(long, default_value_t = 2)]
+    max_in_flight: usize,
     /// Don't read the stylus device directly over adb; use Android's pen events.
     #[arg(long)]
     no_raw_pen: bool,
@@ -174,6 +181,12 @@ fn main() -> Result<()> {
                 fps: args.fps.unwrap_or(60),
             },
             fps: args.fps,
+            max_in_flight: args.max_in_flight,
+            vendor_tweaks: args.vendor_tweaks.iter().try_fold(0u8, |acc, t| match t.as_str() {
+                "mtk-vpp-off" => Ok(acc | proto::tweaks::MTK_VPP_OFF),
+                "mtk-cpu-boost" => Ok(acc | proto::tweaks::MTK_CPU_BOOST),
+                other => Err(anyhow::anyhow!("unknown vendor tweak {other:?}")),
+            })?,
             output_name: args.output.clone(),
             raw_pen: _raw_pen.as_ref().map(|_| pen_sink.clone()),
             output_size,

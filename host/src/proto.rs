@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const PROTO_VERSION: u16 = 3;
+pub const PROTO_VERSION: u16 = 4;
 pub const DEFAULT_PORT: u16 = 27183;
 /// Upper bound for a single message, protects against garbage on the wire.
 const MAX_LEN: u32 = 16 * 1024 * 1024;
@@ -108,7 +108,8 @@ pub enum DeviceMsg {
         points: Vec<TouchPoint>,
     },
     Pong { host_ns: u64, dev_ns: u64 },
-    FrameShown { capture_ns: u64, recv_ns: u64, render_ns: u64 },
+    /// Device timestamps of one frame: received, rendered, queued into the decoder, decoded.
+    FrameShown { capture_ns: u64, recv_ns: u64, render_ns: u64, queued_ns: u64, decoded_ns: u64 },
     RequestKeyframe,
     Layout(Layout),
     Unknown(u8),
@@ -201,6 +202,8 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             capture_ns: c.u64()?,
             recv_ns: c.u64()?,
             render_ns: c.u64()?,
+            queued_ns: c.u64().unwrap_or(0),
+            decoded_ns: c.u64().unwrap_or(0),
         },
         ty::REQUEST_KEYFRAME => DeviceMsg::RequestKeyframe,
         ty::LAYOUT => DeviceMsg::Layout(Layout {
@@ -216,11 +219,18 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
     })
 }
 
-fn header(w: &mut impl Write, ty: u8, len: usize) -> io::Result<()> {
-    let mut hdr = [0u8; 5];
-    hdr[0] = ty;
-    hdr[1..5].copy_from_slice(&(len as u32).to_le_bytes());
-    w.write_all(&hdr)
+/// Writes one framed message with a single `write_all`. Splitting a message into
+/// several writes made adbd forward it as several small socket writes on the
+/// tablet, where Nagle + delayed ACK held a frame back for up to ~40 ms.
+fn message(w: &mut impl Write, ty: u8, parts: &[&[u8]]) -> io::Result<()> {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    let mut buf = Vec::with_capacity(5 + len);
+    buf.push(ty);
+    buf.extend_from_slice(&(len as u32).to_le_bytes());
+    for p in parts {
+        buf.extend_from_slice(p);
+    }
+    w.write_all(&buf)
 }
 
 pub mod codec {
@@ -229,27 +239,30 @@ pub mod codec {
     pub const NONE: u8 = 255;
 }
 
-pub fn write_config(w: &mut impl Write, codec: u8, width: u16, height: u16) -> io::Result<()> {
-    header(w, ty::CONFIG, 5)?;
-    let mut p = [0u8; 5];
+/// Opt-in, device-specific decoder tweaks (Config flags). Not used for comparisons.
+pub mod tweaks {
+    pub const MTK_VPP_OFF: u8 = 1;
+    pub const MTK_CPU_BOOST: u8 = 2;
+}
+
+pub fn write_config(w: &mut impl Write, codec: u8, width: u16, height: u16, flags: u8) -> io::Result<()> {
+    let mut p = [0u8; 6];
     p[0] = codec;
     p[1..3].copy_from_slice(&width.to_le_bytes());
     p[3..5].copy_from_slice(&height.to_le_bytes());
-    w.write_all(&p)
+    p[5] = flags;
+    message(w, ty::CONFIG, &[&p])
 }
 
 pub fn write_video(w: &mut impl Write, capture_ns: u64, flags: u8, data: &[u8]) -> io::Result<()> {
-    header(w, ty::VIDEO, 9 + data.len())?;
     let mut p = [0u8; 9];
     p[..8].copy_from_slice(&capture_ns.to_le_bytes());
     p[8] = flags;
-    w.write_all(&p)?;
-    w.write_all(data)
+    message(w, ty::VIDEO, &[&p, data])
 }
 
 pub fn write_ping(w: &mut impl Write, host_ns: u64) -> io::Result<()> {
-    header(w, ty::PING, 8)?;
-    w.write_all(&host_ns.to_le_bytes())
+    message(w, ty::PING, &[&host_ns.to_le_bytes()])
 }
 
 /// CLOCK_MONOTONIC in nanoseconds.

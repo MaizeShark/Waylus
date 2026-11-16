@@ -7,7 +7,7 @@ import java.nio.ByteOrder
 
 /** Wire protocol, mirrors host/src/proto.rs. Frames: [u8 type][u32 len LE][payload]. */
 object Proto {
-    const val VERSION = 3
+    const val VERSION = 4
     const val DEFAULT_PORT = 27183
 
     const val HELLO = 1
@@ -26,6 +26,10 @@ object Proto {
 
     const val CODEC_H264 = 0
     const val CODEC_NONE = 255
+
+    /** Opt-in, device-specific decoder tweaks (Config flags). Not for comparisons. */
+    const val TWEAK_MTK_VPP_OFF = 1
+    const val TWEAK_MTK_CPU_BOOST = 2
 
     const val PEN_OUT = 0
     const val PEN_HOVER = 1
@@ -81,9 +85,11 @@ object Proto {
         return b.array()
     }
 
-    fun frameShown(captureNs: Long, recvNs: Long, renderNs: Long): ByteArray {
-        val b = msg(FRAME_SHOWN, 24)
+    /** Timeline of one frame on the tablet: received, queued into the decoder, decoded, shown. */
+    fun frameShown(captureNs: Long, recvNs: Long, renderNs: Long, queuedNs: Long, decodedNs: Long): ByteArray {
+        val b = msg(FRAME_SHOWN, 40)
         b.putLong(captureNs); b.putLong(recvNs); b.putLong(renderNs)
+        b.putLong(queuedNs); b.putLong(decodedNs)
         return b.array()
     }
 

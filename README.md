@@ -56,10 +56,14 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 - 40–60 samples per run. Each tool was measured with the other one stopped.
 - To reproduce: open `tools/latency/barcode.html` fullscreen on the mirrored monitor, start the mirroring tool, then run `python3 -I tools/latency/probe.py --label <name>` (needs Pillow and the Waylus APK installed).
 
-³ Waylus logs these every 5 s. It syncs the clocks with ping/pong. "Shown" is the decoder's render callback, so it excludes scan-out. Breakdown with zero-copy at 2400×1350:
-- capture → sent (GPU blit/scale + CUDA copy + NVENC): ~3 ms
-- USB: ~3–5 ms
-- Decode + present: 15–25 ms (higher under full-screen motion)
+³ Waylus logs these every 5 s, split into stages. It syncs the clocks with ping/pong. "Shown" is the decoder's render callback, so it excludes scan-out. Typical breakdown at 1080p with the whole screen changing every frame (barcode page), capture→shown p50 ~21 / p95 ~25 ms:
+- capture → sent (GPU blit/scale + CUDA copy + NVENC): p50 ~2.5 / p95 ~4 ms
+- sent → received (USB via adb): p50 ~2 / p95 ~3.5 ms
+- waiting for the decoder: ~0.5 ms
+- hardware decode on the MT8781: 15–19 ms, the largest stage (varies with the tablet's clocks/thermals)
+- decoded → shown: ~1.5 ms
+
+Back-pressure (`--max-in-flight`, default 2) keeps a slow decoder from building a queue: the host waits and then encodes the newest frame instead of a backlog.
 
 The Weylus comparison above was measured before zero-copy; Waylus has gained ~3 ms (1080p) to ~10 ms (1440p) since.
 
@@ -117,6 +121,8 @@ Useful flags:
 - `--serial <adb serial>`
 - `--virtual[=WxH]`: create a virtual monitor instead of mirroring (GNOME / KDE). The size defaults to the tablet's screen within its decoder limits
 - `--no-raw-pen`: use Android's pen events instead of reading the stylus device over adb
+- `--max-in-flight <n>`: back-pressure, max frames sent but not yet shown (default 2, 0 = off)
+- `--vendor-tweaks mtk-cpu-boost,mtk-vpp-off`: **opt-in, device-specific** MediaTek decoder settings. `mtk-cpu-boost` saved ~1.9 ms of decode on the MT8781; `mtk-vpp-off` made no measurable difference. Never used for the published comparison numbers
 - `--keep-app`
 - `--no-adb`
 
@@ -130,7 +136,8 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] Portal / PipeWire capture → NVENC → MediaCodec video
 - [x] Built-in latency statistics
 - [x] Reproducible latency comparison against Weylus (`tools/latency`)
-- [ ] Faster decode under full-screen motion (received → shown grows from ~12 to ~25 ms)
+- [x] Per-stage latency stats, back-pressure, and a fix for 30–40 ms transfer stalls (messages are now written in one piece; split writes hit Nagle + delayed ACK in adbd's socket on the tablet)
+- [ ] Hardware decode (15–19 ms at 1080p on the MT8781) is now the largest stage; beyond fewer pixels or opt-in vendor tweaks there is little left to win generically
 - [x] Raw stylus input over adb (full tilt on devices whose Android config drops it, e.g. NXTPAPER 14)
 - [ ] VAAPI encoder fallback (AMD / Intel)
 - [x] Zero-copy GPU path (DMA-BUF → GL → CUDA → NVENC) and GPU downscaling to fit the tablet

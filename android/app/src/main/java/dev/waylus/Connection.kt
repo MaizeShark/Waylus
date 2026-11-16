@@ -19,7 +19,8 @@ class Connection(private val port: Int, private val listener: Listener) {
         /** Called on the network thread right after connecting; return the hello message. */
         fun onConnected(): ByteArray
         fun onDisconnected()
-        fun onConfig(codec: Int, width: Int, height: Int)
+        /** flags: Proto.TWEAK_* bits, opt-in vendor-specific decoder tweaks. */
+        fun onConfig(codec: Int, width: Int, height: Int, flags: Int)
         fun onVideo(captureNs: Long, flags: Int, data: ByteArray, offset: Int, recvNs: Long)
     }
 
@@ -44,6 +45,9 @@ class Connection(private val port: Int, private val listener: Listener) {
     }
 
     private fun loop() {
+        // Video frames arrive here; at normal priority the thread can sit on a slow
+        // core or wait behind other work, which showed up as 30-40 ms transfer spikes.
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
         while (running) {
             try {
                 val s = Socket()
@@ -75,6 +79,7 @@ class Connection(private val port: Int, private val listener: Listener) {
         Log.i(TAG, "connected to host")
 
         val writer = Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             try {
                 while (connected && running) {
                     val m = out.poll(200, TimeUnit.MILLISECONDS) ?: continue
@@ -104,7 +109,8 @@ class Connection(private val port: Int, private val listener: Listener) {
                         val codec = b.get().toInt() and 0xff
                         val w = b.getShort().toInt() and 0xffff
                         val h = b.getShort().toInt() and 0xffff
-                        listener.onConfig(codec, w, h)
+                        val flags = if (b.hasRemaining()) b.get().toInt() and 0xff else 0
+                        listener.onConfig(codec, w, h, flags)
                     }
                     Proto.VIDEO -> {
                         val b = Proto.le(m.payload)

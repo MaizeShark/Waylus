@@ -80,8 +80,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         conn = Connection(port, this)
         decoder = VideoDecoder(
             decoderInfo,
-            onShown = { c, r, n ->
-                conn.send(Proto.frameShown(c, r, n))
+            onShown = { c, r, n, q, d ->
+                conn.send(Proto.frameShown(c, r, n, q, d))
                 if (!firstFrameShown) {
                     firstFrameShown = true
                     runOnUiThread { status.visibility = View.GONE; frame.visibility = View.GONE }
@@ -178,7 +178,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         }
     }
 
-    override fun onConfig(codec: Int, width: Int, height: Int) {
+    override fun onConfig(codec: Int, width: Int, height: Int, flags: Int) {
         runOnUiThread {
             videoW = width.coerceAtLeast(1)
             videoH = height.coerceAtLeast(1)
@@ -190,7 +190,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         }
         if (codec == Proto.CODEC_H264) {
             firstFrameShown = false
-            decoder.configure(width, height)
+            decoder.configure(width, height, flags)
         }
     }
 

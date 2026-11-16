@@ -32,6 +32,10 @@ pub struct Opts {
     pub enc: EncoderOpts,
     /// Forced frame rate; None = follow the tablet's refresh rate.
     pub fps: Option<u32>,
+    /// Back-pressure: max frames sent but not yet shown on the tablet (0 = off).
+    pub max_in_flight: usize,
+    /// proto::tweaks bits: opt-in vendor-specific decoder settings.
+    pub vendor_tweaks: u8,
     /// Output (connector) name given with --output, for input mapping in --no-video mode.
     pub output_name: Option<String>,
     /// Raw stylus stream (rawpen.rs); when set, the app's pen messages are ignored.
@@ -45,6 +49,55 @@ type Writer = Arc<Mutex<TcpStream>>;
 type RefreshIds = Arc<Mutex<std::collections::VecDeque<u64>>>;
 
 const REFRESH_INTERVAL_MS: u64 = 100;
+
+/// Frames sent to the tablet but not yet reported shown (capture timestamps, oldest
+/// first). Used for back-pressure: encoding the next frame waits until the decoder has
+/// caught up, so a slow decoder costs frame rate instead of piling up latency.
+#[derive(Default)]
+struct InFlight {
+    /// (capture_ns, sent_ns) of frames not yet reported shown.
+    sent: Mutex<std::collections::VecDeque<(u64, u64)>>,
+    cv: std::sync::Condvar,
+}
+
+impl InFlight {
+    fn sent(&self, capture_ns: u64) {
+        self.sent.lock().unwrap().push_back((capture_ns, now_ns()));
+    }
+
+    /// Frame `capture_ns` was shown; anything older was shown or dropped by the tablet.
+    /// Returns when that frame was sent.
+    fn shown(&self, capture_ns: u64) -> Option<u64> {
+        let mut q = self.sent.lock().unwrap();
+        let mut sent_at = None;
+        while let Some(&(c, t)) = q.front() {
+            if c > capture_ns {
+                break;
+            }
+            if c == capture_ns {
+                sent_at = Some(t);
+            }
+            q.pop_front();
+        }
+        self.cv.notify_all();
+        sent_at
+    }
+
+    /// Blocks while `max` or more frames are in flight. Returns the time spent
+    /// waiting. Gives up after 250 ms (a lost report must not stall the stream).
+    fn wait_below(&self, max: usize, stop: &AtomicBool) -> Duration {
+        let start = Instant::now();
+        let mut q = self.sent.lock().unwrap();
+        while q.len() >= max && !stop.load(Ordering::Relaxed) {
+            if start.elapsed() > Duration::from_millis(250) {
+                q.clear();
+                break;
+            }
+            q = self.cv.wait_timeout(q, Duration::from_millis(20)).unwrap().0;
+        }
+        start.elapsed()
+    }
+}
 const REFRESH_FRAMES: u32 = 3;
 
 fn send(w: &Writer, f: impl FnOnce(&mut TcpStream) -> std::io::Result<()>) -> std::io::Result<()> {
@@ -208,10 +261,11 @@ fn session(
     let stop = Arc::new(AtomicBool::new(false));
     let keyframe = Arc::new(AtomicBool::new(false));
     let refresh_ids: RefreshIds = Default::default();
+    let in_flight: Arc<InFlight> = Default::default();
 
     if capture.is_none() {
         send(&writer, |w| {
-            proto::write_config(w, codec::NONE, opts.output_size.0 as u16, opts.output_size.1 as u16)
+            proto::write_config(w, codec::NONE, opts.output_size.0 as u16, opts.output_size.1 as u16, 0)
         })?;
     }
 
@@ -221,6 +275,9 @@ fn session(
         let recycle = cap.recycle.clone();
         let capture_running = cap.running.clone();
         let refresh_ids = refresh_ids.clone();
+        let in_flight = in_flight.clone();
+        let max_in_flight = opts.max_in_flight;
+        let vendor_tweaks = opts.vendor_tweaks;
         let mut enc_opts = opts.enc.clone();
         enc_opts.fps = opts.fps.unwrap_or(if hello.refresh_hz >= 1.0 { hello.refresh_hz.round() as u32 } else { 60 });
         let pace = cap.pace_ns.clone();
@@ -246,7 +303,7 @@ fn session(
         thread::Builder::new()
             .name("video".into())
             .spawn(move || {
-                let r = video_loop(&mut enc_opts, &pace, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids);
+                let r = video_loop(&mut enc_opts, &pace, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids, &in_flight, max_in_flight, vendor_tweaks);
                 stop.store(true, Ordering::SeqCst);
                 let _ = writer.lock().unwrap().shutdown(Shutdown::Both);
                 r
@@ -301,7 +358,11 @@ fn session(
             }
             DeviceMsg::Touch { points, .. } => touch.handle(&points)?,
             DeviceMsg::Pong { host_ns, dev_ns } => stats.pong(host_ns, dev_ns),
-            DeviceMsg::FrameShown { capture_ns, recv_ns, render_ns } => {
+            DeviceMsg::FrameShown { capture_ns, recv_ns, render_ns, queued_ns, decoded_ns } => {
+                if let Some(sent) = in_flight.shown(capture_ns) {
+                    stats.sent(capture_ns, sent, recv_ns);
+                }
+                stats.tablet(recv_ns, queued_ns, decoded_ns, render_ns);
                 let mut ids = refresh_ids.lock().unwrap();
                 if let Some(i) = ids.iter().position(|&x| x == capture_ns) {
                     ids.remove(i);
@@ -366,6 +427,9 @@ fn video_loop(
     keyframe: &AtomicBool,
     capture_running: &AtomicBool,
     refresh_ids: &RefreshIds,
+    in_flight: &InFlight,
+    max_in_flight: usize,
+    vendor_tweaks: u8,
 ) -> Result<Option<Frame>> {
     let mut enc: Option<Encoder> = None;
     let mut packets: Vec<Packet> = Vec::new();
@@ -376,8 +440,14 @@ fn video_loop(
     let mut refreshes_left = 0u32;
     let mut window = Instant::now();
     let (mut n, mut bytes, mut enc_ns, mut sent_lag_ns, mut pkts, mut empty) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut held = Duration::ZERO;
 
     while !stop.load(Ordering::Relaxed) {
+        // Back-pressure: wait for the tablet to catch up *before* picking a frame, so
+        // the one we encode next is the newest capture rather than a stale backlog.
+        if max_in_flight > 0 {
+            held += in_flight.wait_below(max_in_flight, stop);
+        }
         let frame = match pending.take() {
             Some(f) => f,
             None => match frames.take_timeout(Duration::from_millis(REFRESH_INTERVAL_MS)) {
@@ -398,6 +468,7 @@ fn video_loop(
                                 proto::write_video(w, p.capture_ns, flags, &p.data)?;
                                 w.flush()
                             })?;
+                            in_flight.sent(p.capture_ns);
                         }
                     }
                     continue;
@@ -425,7 +496,7 @@ fn video_loop(
             info!("streaming at {} fps", opts.fps);
             let hw = frame.gpu.as_ref().map(crate::cuda::frames_ctx_of).transpose()?;
             let e = Encoder::new(opts, frame.width, frame.height, frame.format, hw)?;
-            send(writer, |w| proto::write_config(w, codec::H264, frame.width as u16, frame.height as u16))?;
+            send(writer, |w| proto::write_config(w, codec::H264, frame.width as u16, frame.height as u16, vendor_tweaks))?;
             if let Some(x) = e.extradata() {
                 send(writer, |w| proto::write_video(w, 0, video_flags::CONFIG, &x))?;
             }
@@ -452,6 +523,8 @@ fn video_loop(
                 proto::write_video(w, p.capture_ns, flags, &p.data)?;
                 w.flush()
             })?;
+            in_flight.sent(p.capture_ns);
+            tracing::trace!("sent frame {} bytes={} at {}", p.capture_ns, p.data.len(), now_ns());
             sent_lag_ns += now_ns().saturating_sub(p.capture_ns);
             tracing::trace!(
                 "frame: slot wait {:.2} ms, encode {:.2} ms, write {:.2} ms",
@@ -468,14 +541,16 @@ fn video_loop(
         if window.elapsed() >= Duration::from_secs(5) {
             let secs = window.elapsed().as_secs_f64();
             info!(
-                "video: {:.1} fps, {:.1} Mbit/s, encode {:.2} ms/frame, capture→sent {:.2} ms, {} frames without output",
+                "video: {:.1} fps, {:.1} Mbit/s, encode {:.2} ms/frame, capture→sent {:.2} ms, {} frames without output, held back {:.0} ms/s for the tablet",
                 n as f64 / secs,
                 bytes as f64 * 8.0 / secs / 1e6,
                 enc_ns as f64 / n.max(1) as f64 / 1e6,
                 sent_lag_ns as f64 / pkts.max(1) as f64 / 1e6,
-                empty
+                empty,
+                held.as_secs_f64() * 1e3 / secs
             );
             window = Instant::now();
+            held = Duration::ZERO;
             (n, bytes, enc_ns, sent_lag_ns, pkts, empty) = (0, 0, 0, 0, 0, 0);
         }
     }
@@ -491,6 +566,13 @@ struct Stats {
     frame_lat: Vec<f64>,
     net_lat: Vec<f64>,
     pen_lat: Vec<f64>,
+    /// Host: capture → sent; link: sent → received (needs the clock offset).
+    h_send: Vec<f64>,
+    link: Vec<f64>,
+    /// On the tablet: received → queued into decoder → decoded → shown.
+    t_queue: Vec<f64>,
+    t_decode: Vec<f64>,
+    t_display: Vec<f64>,
     last_report: Option<Instant>,
 }
 
@@ -515,6 +597,25 @@ impl Stats {
             self.frame_lat.push((r - capture_ns as i64) as f64 / 1e6);
             self.net_lat.push((v - capture_ns as i64) as f64 / 1e6);
         }
+    }
+
+    fn sent(&mut self, capture_ns: u64, sent_ns: u64, recv_dev_ns: u64) {
+        self.h_send.push(sent_ns.saturating_sub(capture_ns) as f64 / 1e6);
+        if let Some(r) = self.to_host(recv_dev_ns) {
+            self.link.push((r - sent_ns as i64) as f64 / 1e6);
+            tracing::trace!("link frame {capture_ns} {:.2} ms", (r - sent_ns as i64) as f64 / 1e6);
+        }
+    }
+
+    /// Stage durations on the tablet (all device clock, no offset needed).
+    fn tablet(&mut self, recv: u64, queued: u64, decoded: u64, render: u64) {
+        if queued == 0 || decoded == 0 || render < decoded || decoded < queued || queued < recv {
+            return;
+        }
+        let ms = |a: u64, b: u64| (b - a) as f64 / 1e6;
+        self.t_queue.push(ms(recv, queued));
+        self.t_decode.push(ms(queued, decoded));
+        self.t_display.push(ms(decoded, render));
     }
 
     fn pen(&mut self, s: &proto::PenSample) {
@@ -546,6 +647,17 @@ impl Stats {
                 fmt(&mut self.net_lat),
                 fmt(&mut self.pen_lat),
                 self.best_rtt as f64 / 1e6
+            );
+        }
+        if !self.h_send.is_empty() {
+            info!("stages: capture→sent {} | sent→received {}", fmt(&mut self.h_send), fmt(&mut self.link));
+        }
+        if !self.t_decode.is_empty() {
+            info!(
+                "tablet: wait for decoder {} | decode {} | decoded→shown {}",
+                fmt(&mut self.t_queue),
+                fmt(&mut self.t_decode),
+                fmt(&mut self.t_display)
             );
         }
     }
