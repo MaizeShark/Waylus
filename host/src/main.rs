@@ -7,6 +7,7 @@ mod cuda;
 mod dmabuf;
 mod encode;
 mod input;
+mod kde;
 mod niri;
 mod proto;
 mod rawpen;
@@ -168,6 +169,7 @@ fn main() -> Result<()> {
                 fps: args.fps.unwrap_or(60),
             },
             fps: args.fps,
+            output_name: args.output.clone(),
             raw_pen: _raw_pen.as_ref().map(|_| pen_sink.clone()),
             output_size,
         },

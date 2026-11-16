@@ -32,7 +32,7 @@ Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet t
 | Video decode | In the browser | Android `MediaCodec` hardware decoder straight to a `SurfaceView` |
 | Pen input | Browser PointerEvents: pressure and tilt | The tablet's raw stylus evdev device, read over adb: full sensor resolution, pressure, both tilt axes, hover, buttons, eraser. Falls back to unbuffered `MotionEvent`s |
 | Touch | Multitouch | Multitouch, with palm rejection while the pen is near |
-| Virtual / extra monitor | Yes on X11 (Intel VirtualHeads / xrandr) | `--virtual` via the ScreenCast portal on GNOME / KDE. niri doesn't implement it; an HDMI/DP dummy plug works there |
+| Virtual / extra monitor | Yes on X11 (Intel VirtualHeads / xrandr) | `--virtual`: a real extra monitor at the tablet's aspect ratio via the ScreenCast portal (tested on KDE Plasma; GNOME untested). niri doesn't implement it; an HDMI/DP dummy plug works there |
 | Platforms for the tablet | Anything with a browser (iPad, Android, …) | Android 11+ |
 | Licence | AGPL-3.0-or-later | GPL-3.0-or-later |
 
@@ -66,7 +66,7 @@ The Weylus comparison above was measured before zero-copy; Waylus has gained ~3 
 ## Requirements
 
 **Host**
-- Linux with a Wayland compositor that implements the ScreenCast portal. Tested on niri with xdg-desktop-portal-gnome. GNOME, KDE and Hyprland should work.
+- Linux with a Wayland compositor that implements the ScreenCast portal. Tested on niri (xdg-desktop-portal-gnome) and KDE Plasma 6.8. GNOME and Hyprland should work.
 - PipeWire, FFmpeg ≥ 9 with `h264_nvenc` (an NVIDIA GPU), and `adb`.
 - Write access to `/dev/uinput`, for example:
   ```sh
@@ -100,7 +100,7 @@ waylus --no-video -o DP-2   # input only: use the tablet as a plain graphics tab
 
 The monitor you pick is remembered via a portal restore token stored in `~/.local/state/waylus/`.
 
-Map the pen and touchscreen to the mirrored output in your compositor. For niri, Waylus prints this snippet on startup:
+The pen and touchscreen must be mapped to the output shown on the tablet. **On KDE Plasma Waylus does this automatically** (through KWin's input-device D-Bus settings), for both mirrored and virtual monitors. Elsewhere, map them in your compositor's settings. For niri, Waylus prints this snippet on startup:
 
 ```kdl
 input {
@@ -135,7 +135,8 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [ ] VAAPI encoder fallback (AMD / Intel)
 - [x] Zero-copy GPU path (DMA-BUF → GL → CUDA → NVENC) and GPU downscaling to fit the tablet
 - [ ] AOA transport (no adb needed)
-- [ ] Virtual monitor: implemented for GNOME / KDE (`--virtual`), still untested there; niri lacks `RecordVirtual`
+- [x] Virtual monitor on KDE Plasma (`--virtual`), with automatic pen/touch mapping
+- [ ] Virtual monitor on GNOME (implemented, untested); niri lacks `RecordVirtual`
 
 ## Licence
 

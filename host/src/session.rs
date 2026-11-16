@@ -32,6 +32,8 @@ pub struct Opts {
     pub enc: EncoderOpts,
     /// Forced frame rate; None = follow the tablet's refresh rate.
     pub fps: Option<u32>,
+    /// Output (connector) name given with --output, for input mapping in --no-video mode.
+    pub output_name: Option<String>,
     /// Raw stylus stream (rawpen.rs); when set, the app's pen messages are ignored.
     pub raw_pen: Option<crate::rawpen::Sink>,
     /// Size reported to the tablet in input-only mode (aspect ratio of the output).
@@ -177,6 +179,20 @@ fn session(
         *inputs = Some((Arc::new(Mutex::new(Pen::new(area)?)), Touch::new(area)?));
     }
     let (pen, touch) = inputs.as_mut().unwrap();
+    if crate::kde::is_kde() {
+        let target = match capture {
+            Some(cap) => match cap.geometry.position {
+                Some(p) => crate::kde::output_at(p, cap.geometry.size),
+                // Virtual monitors have no position yet; find KWin's output by size.
+                None => wait_source_size(cap).and_then(crate::kde::virtual_output),
+            },
+            None => opts.output_name.clone(),
+        };
+        match target {
+            Some(t) => crate::kde::map_devices(t),
+            None => warn!("KDE: couldn't tell which output is shown; map the Waylus pen/touch in System Settings"),
+        }
+    }
 
     let writer: Writer = Arc::new(Mutex::new(stream.try_clone()?));
     let stop = Arc::new(AtomicBool::new(false));
