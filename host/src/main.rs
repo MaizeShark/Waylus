@@ -33,9 +33,9 @@ struct Args {
     /// Video bitrate in Mbit/s.
     #[arg(long, default_value_t = 20.0)]
     bitrate: f64,
-    /// Maximum frame rate.
-    #[arg(long, default_value_t = 60)]
-    fps: u32,
+    /// Frame rate (default: the tablet's display refresh rate, within decoder limits).
+    #[arg(long)]
+    fps: Option<u32>,
     /// TCP port tunnelled through adb.
     #[arg(long, default_value_t = proto::DEFAULT_PORT)]
     port: u16,
@@ -70,16 +70,9 @@ fn main() -> Result<()> {
             None => bail!("client APK not found; build it with `cd android && ./gradlew assembleDebug` or pass --apk"),
         }
         adb.reverse(args.port)?;
-        let (adb2, port, keep) = (adb.clone(), args.port, args.keep_app);
-        ctrlc::set_handler(move || {
-            adb2.remove_reverse(port);
-            if !keep {
-                adb2.stop_app();
-            }
-            std::process::exit(0);
-        })
-        .context("install Ctrl-C handler")?;
     }
+
+    install_exit_handler(adb.clone(), args.port, args.keep_app)?;
 
     let mut output = args.output.as_deref().and_then(niri::by_name);
     if args.output.is_some() && output.is_none() && niri::is_niri() {
@@ -89,7 +82,8 @@ fn main() -> Result<()> {
     let capture = if args.no_video {
         None
     } else {
-        let cap = capture::start(args.fps)?;
+        // Ask the compositor for more than we need; we pace to the tablet's rate per session.
+        let cap = capture::start(args.fps.map_or(240, |f| f * 2))?;
         // Give PipeWire a moment to negotiate so format errors surface before the tablet connects.
         std::thread::sleep(std::time::Duration::from_millis(500));
         if !cap.running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -125,10 +119,37 @@ fn main() -> Result<()> {
             enc: encode::EncoderOpts {
                 encoder: args.encoder.clone(),
                 bitrate: (args.bitrate * 1e6) as usize,
-                fps: args.fps,
+                fps: args.fps.unwrap_or(60),
             },
+            fps: args.fps,
             output_size,
         },
         capture,
     )
+}
+
+/// Ctrl-C: undo the adb setup, then leave with `_exit`. A normal `exit` runs
+/// CUDA/NVENC teardown while the encoder thread is still active, which can
+/// hang. A second Ctrl-C, or a stuck cleanup, exits immediately.
+fn install_exit_handler(adb: Option<adb::Adb>, port: u16, keep_app: bool) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STOPPING: AtomicBool = AtomicBool::new(false);
+    ctrlc::set_handler(move || {
+        if STOPPING.swap(true, Ordering::SeqCst) {
+            unsafe { libc::_exit(130) };
+        }
+        eprintln!("\nstopping…");
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            unsafe { libc::_exit(1) };
+        });
+        if let Some(adb) = &adb {
+            adb.remove_reverse(port);
+            if !keep_app {
+                adb.stop_app();
+            }
+        }
+        unsafe { libc::_exit(0) };
+    })
+    .context("install Ctrl-C handler")
 }

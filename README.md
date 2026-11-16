@@ -38,17 +38,29 @@ Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet t
 
 ### Latency
 
-Measured on the same machine (RTX 4060, niri, 1920×1080 output) and the same tablet (TCL NXTPAPER 14, MT8781, USB 2.0).
+Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz) and one tablet (TCL NXTPAPER 14, MT8781, 60 Hz), over the same USB 2.0 cable for both tools. Weylus ran over an `adb reverse` tunnel rather than Wi-Fi, which favours it.
 
-| Metric | Weylus (Wi-Fi) | Waylus (USB) |
+| Metric | Weylus ¹ | Waylus |
 |---|---|---|
-| Pen event → host input device | TBD | **p50 2.2 ms / p95 3.0 ms** ¹ |
-| Screen capture → frame shown on tablet | TBD | **p50 24 ms / p95 27–34 ms** ¹ |
-| Glass-to-glass (240 fps camera) | TBD | TBD |
+| Host page frame → presented on tablet ² | p50 **166 ms** / p95 **229 ms** | p50 **94–106 ms** / p95 **108–118 ms** |
+| Capture → frame shown (built-in stats) ³ | – | p50 24 ms (desktop) to 40 ms (full-screen motion) |
+| Pen event → host input device ³ | – | p50 **2 ms** / p95 3 ms |
 
-¹ Built-in measurement. Waylus syncs the two clocks with ping/pong and logs these numbers every 5 seconds. "Shown" is when Android reports the frame as rendered (`OnFrameRenderedListener`, or the callback time on MediaTek, whose codec reports a bogus timestamp), so it does not include the panel's scan-out time. Breakdown at 1080p: DMA-BUF import plus readback about 1.6 ms, NVENC including the copy about 6 ms, USB about 2 ms, decode plus present about 13 ms.
+¹ A local build of [Weylus](https://github.com/H-M-H/Weylus) with niri/NVIDIA fixes (upstream does not run on this setup). Settings: NVENC, Chrome on the tablet, "Lower Latency" on, frame-rate slider at maximum, no stretching.
 
-Cells stay "TBD" until they are measured. No numbers are estimated.
+² Measured with [`tools/latency`](tools/latency).
+- A page on the mirrored monitor shows the host clock as a barcode, once per frame.
+- An overlay on the tablet shows when Android expects to present each frame, synced to the host clock.
+- Tablet screenshots contain both barcodes, and the difference between them is the latency.
+- The number includes Chrome on the host rendering the page and niri compositing it (roughly 40–60 ms, the same for both tools). It is therefore higher than what you perceive relative to the real monitor.
+- 40–60 samples per run. Each tool was measured with the other one stopped.
+- To reproduce: open `tools/latency/barcode.html` fullscreen on the mirrored monitor, start the mirroring tool, then run `python3 -I tools/latency/probe.py --label <name>` (needs Pillow and the Waylus APK installed).
+
+³ Waylus logs these every 5 s. It syncs the clocks with ping/pong. "Shown" is the decoder's render callback, so it excludes scan-out. Breakdown at 1080p:
+- DMA-BUF import + readback: ~1.6 ms
+- NVENC incl. copy: ~6 ms
+- USB: ~2 ms
+- Decode + present: 12–25 ms (higher under full-screen motion)
 
 ## Requirements
 
@@ -111,7 +123,8 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] Pen (pressure, tilt, hover, buttons, eraser) and multitouch over USB
 - [x] Portal / PipeWire capture → NVENC → MediaCodec video
 - [x] Built-in latency statistics
-- [ ] Latency tuning to below 50 ms glass-to-glass, then measure against Weylus
+- [x] Reproducible latency comparison against Weylus (`tools/latency`)
+- [ ] Faster decode under full-screen motion (received → shown grows from ~12 to ~25 ms)
 - [ ] Full tilt direction on devices whose Android input config drops `AXIS_ORIENTATION` (e.g. NXTPAPER 14), via a raw evdev helper running as the adb shell user
 - [ ] VAAPI encoder fallback (AMD / Intel)
 - [ ] DMA-BUF zero-copy capture (PipeWire dmabuf → GPU encoder)

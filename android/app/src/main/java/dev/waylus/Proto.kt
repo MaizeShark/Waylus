@@ -7,7 +7,7 @@ import java.nio.ByteOrder
 
 /** Wire protocol, mirrors host/src/proto.rs. Frames: [u8 type][u32 len LE][payload]. */
 object Proto {
-    const val VERSION = 1
+    const val VERSION = 2
     const val DEFAULT_PORT = 27183
 
     const val HELLO = 1
@@ -41,13 +41,14 @@ object Proto {
         return b
     }
 
-    fun hello(surfaceW: Int, surfaceH: Int, maxW: Int, maxH: Int, mbFrame: Int, mbSec: Int, decoder: String): ByteArray {
+    fun hello(surfaceW: Int, surfaceH: Int, maxW: Int, maxH: Int, mbFrame: Int, mbSec: Int, refreshHz: Float, decoder: String): ByteArray {
         val name = decoder.toByteArray().take(255).toByteArray()
-        val b = msg(HELLO, 2 + 2 + 2 + 2 + 2 + 4 + 4 + 1 + name.size)
+        val b = msg(HELLO, 2 + 2 + 2 + 2 + 2 + 4 + 4 + 2 + 1 + name.size)
         b.putShort(VERSION.toShort())
         b.putShort(surfaceW.toShort()); b.putShort(surfaceH.toShort())
         b.putShort(maxW.toShort()); b.putShort(maxH.toShort())
         b.putInt(mbFrame); b.putInt(mbSec)
+        b.putShort((refreshHz * 100).toInt().coerceIn(0, 65535).toShort())
         b.put(name.size.toByte()); b.put(name)
         return b.array()
     }

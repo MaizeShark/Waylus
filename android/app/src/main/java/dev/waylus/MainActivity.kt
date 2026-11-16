@@ -37,6 +37,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     private var videoW = 16
     private var videoH = 9
     @Volatile private var firstFrameShown = false
+    /** Refresh rate of the display mode we asked for (the highest available). */
+    @Volatile private var refreshHz = 60f
 
     /** Full-screen container that receives all pointer events, unbatched. */
     inner class Root(ctx: Context) : FrameLayout(ctx) {
@@ -53,6 +55,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         val port = intent.getIntExtra("port", Proto.DEFAULT_PORT)
+        pickFastestMode()
 
         root = Root(this).apply { setBackgroundColor(Color.BLACK) }
         surfaceView = SurfaceView(this)
@@ -89,6 +92,20 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         input = InputCapture(conn::send) { videoRect }
         Log.i(TAG, "decoder: $decoderInfo, port $port")
         conn.start()
+    }
+
+    /** Ask for the highest refresh rate at the current resolution (e.g. 120/144 Hz tablets). */
+    private fun pickFastestMode() {
+        val d = display ?: return
+        val cur = d.mode
+        val best = d.supportedModes
+            .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+            .maxByOrNull { it.refreshRate } ?: cur
+        refreshHz = best.refreshRate
+        if (best.modeId != cur.modeId) {
+            window.attributes = window.attributes.apply { preferredDisplayModeId = best.modeId }
+        }
+        Log.i(TAG, "display mode ${best.physicalWidth}x${best.physicalHeight} @ ${best.refreshRate} Hz")
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -135,7 +152,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         val h = minOf(bounds.width(), bounds.height())
         val d = decoderInfo
         runOnUiThread { setStatus("Waylus\nconnected") }
-        return Proto.hello(w, h, d.maxW, d.maxH, d.mbPerFrame, d.mbPerSec, d.name + if (d.lowLatency) " (low-latency)" else "")
+        return Proto.hello(w, h, d.maxW, d.maxH, d.mbPerFrame, d.mbPerSec, refreshHz, d.name + if (d.lowLatency) " (low-latency)" else "")
     }
 
     override fun onDisconnected() {
@@ -173,6 +190,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     override fun surfaceCreated(holder: SurfaceHolder) {}
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        // Tell the system our content rate so variable-refresh panels stay at full speed.
+        runCatching { holder.surface.setFrameRate(refreshHz, android.view.Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) }
         decoder.setSurface(holder.surface)
     }
 

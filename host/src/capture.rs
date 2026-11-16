@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
 };
@@ -57,6 +57,9 @@ pub struct StreamGeometry {
 
 pub struct Capture {
     pub frames: Arc<LatestSlot<Frame>>,
+    /// Target frame interval for pacing (0 = pass every frame). Set per session
+    /// from the tablet's refresh rate.
+    pub pace_ns: Arc<AtomicU64>,
     /// Recycled frame buffers, sent back by the encoder.
     pub recycle: crossbeam_channel::Sender<Vec<u8>>,
     pub geometry: StreamGeometry,
@@ -73,10 +76,14 @@ fn token_path() -> PathBuf {
 
 /// Opens a portal session and starts the PipeWire consumer thread.
 /// Blocks until the user picked a monitor (first run) or the restore token was accepted.
-pub fn start(max_fps: u32) -> Result<Capture> {
+/// `source_max_fps` is the highest rate we ask the compositor for; pacing to the
+/// tablet's rate happens on our side (see [`Capture::pace_ns`]).
+pub fn start(source_max_fps: u32) -> Result<Capture> {
     let (geo_tx, geo_rx) = crossbeam_channel::bounded::<Result<(StreamGeometry, u32, std::os::fd::OwnedFd)>>(1);
     let frames = Arc::new(LatestSlot::new());
     let running = Arc::new(AtomicBool::new(true));
+    let pace_ns = Arc::new(AtomicU64::new(0));
+    let pace2 = pace_ns.clone();
     let (recycle_tx, recycle_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let frames2 = frames.clone();
@@ -101,7 +108,7 @@ pub fn start(max_fps: u32) -> Result<Capture> {
         };
         let _keep = (proxy, session);
         let _ = geo_tx.send(Ok((geometry, node, fd.try_clone().expect("dup fd"))));
-        if let Err(e) = run_pipewire(fd, node, max_fps, frames2, recycle_rx, running2.clone()) {
+        if let Err(e) = run_pipewire(fd, node, source_max_fps, pace2, frames2, recycle_rx, running2.clone()) {
             warn!("capture stopped: {e:#}");
         }
         running2.store(false, Ordering::SeqCst);
@@ -109,7 +116,7 @@ pub fn start(max_fps: u32) -> Result<Capture> {
 
     let (geometry, node, _fd) = geo_rx.recv().context("capture thread died")??;
     info!("screencast node {node}, geometry {geometry:?}");
-    Ok(Capture { frames, recycle: recycle_tx, geometry, running })
+    Ok(Capture { frames, pace_ns, recycle: recycle_tx, geometry, running })
 }
 
 async fn open_portal() -> Result<(
@@ -171,8 +178,8 @@ struct UserData {
     importer: Option<Importer>,
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
-    /// Frame pacing: target interval and the earliest time the next frame is due.
-    interval_ns: u64,
+    /// Frame pacing: target interval (shared, 0 = off) and the earliest time the next frame is due.
+    pace_ns: Arc<AtomicU64>,
     next_due_ns: u64,
     logged_type: bool,
     read_ns: u64,
@@ -263,8 +270,8 @@ fn format_pod(formats: &[spa::param::video::VideoFormat], modifiers: Option<&[u6
         ))),
     ));
     // Compositors throttle by minimum frame interval (niri does), which turns a 75 Hz
-    // output into 37.5 fps when we ask for 60. Ask for 2x and pace precisely ourselves.
-    let source_max = max_fps.saturating_mul(2).max(1);
+    // output into 37.5 fps when we ask for 60. Ask for plenty and pace precisely ourselves.
+    let source_max = max_fps.max(1);
     props.push(Property::new(
         FP::VideoMaxFramerate.as_raw(),
         Value::Choice(ChoiceValue::Fraction(Choice(
@@ -308,6 +315,7 @@ fn run_pipewire(
     fd: std::os::fd::OwnedFd,
     node: u32,
     max_fps: u32,
+    pace_ns: Arc<AtomicU64>,
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
     running: Arc<AtomicBool>,
@@ -356,7 +364,7 @@ fn run_pipewire(
         importer,
         frames,
         recycle,
-        interval_ns: if max_fps > 0 { 1_000_000_000 / max_fps as u64 } else { 0 },
+        pace_ns,
         next_due_ns: 0,
         logged_type: false,
         read_ns: 0,
@@ -441,9 +449,10 @@ fn run_pipewire(
             let Some(mut buffer) = newest else { return };
             let Some(fmt) = ud.format else { return };
             let now = now_ns();
-            // Pacing that keeps the average rate at max_fps: a 75 Hz source passes 60 of
+            // Pacing that keeps the average rate at the target: a 75 Hz source passes 60 of
             // every 75 frames instead of every other one. Half an interval of slack absorbs jitter.
-            if now + ud.interval_ns / 2 < ud.next_due_ns {
+            let interval = ud.pace_ns.load(Ordering::Relaxed);
+            if now + interval / 2 < ud.next_due_ns {
                 return;
             }
             let width = ud.info.size().width;
@@ -498,7 +507,7 @@ fn run_pipewire(
                 buf.extend_from_slice(&src[offset..offset + need]);
                 (stride, fmt)
             };
-            ud.next_due_ns = (ud.next_due_ns + ud.interval_ns).max(now.saturating_sub(ud.interval_ns / 2));
+            ud.next_due_ns = (ud.next_due_ns + interval).max(now.saturating_sub(interval / 2));
             ud.stat_out += 1;
             ud.frames.put(Frame { width, height, stride, format, capture_ns: now, data: buf });
         })

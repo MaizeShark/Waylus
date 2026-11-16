@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 pub const DEFAULT_PORT: u16 = 27183;
 /// Upper bound for a single message, protects against garbage on the wire.
 const MAX_LEN: u32 = 16 * 1024 * 1024;
@@ -54,6 +54,8 @@ pub struct Hello {
     pub max_h: u16,
     pub max_mb_per_frame: u32,
     pub max_mb_per_sec: u32,
+    /// Display refresh rate in Hz (0 = unknown).
+    pub refresh_hz: f32,
     pub decoder: String,
 }
 
@@ -143,6 +145,7 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             let max_h = c.u16()?;
             let max_mb_per_frame = c.u32()?;
             let max_mb_per_sec = c.u32()?;
+            let refresh_hz = c.u16()? as f32 / 100.0;
             let n = c.u8()? as usize;
             let name = c.0.get(..n).unwrap_or(c.0);
             DeviceMsg::Hello(Hello {
@@ -153,6 +156,7 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
                 max_h,
                 max_mb_per_frame,
                 max_mb_per_sec,
+                refresh_hz,
                 decoder: String::from_utf8_lossy(name).into_owned(),
             })
         }

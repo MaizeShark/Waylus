@@ -30,6 +30,8 @@ const TABLET_PX_PER_MM: f32 = 7.95;
 pub struct Opts {
     pub port: u16,
     pub enc: EncoderOpts,
+    /// Forced frame rate; None = follow the tablet's refresh rate.
+    pub fps: Option<u32>,
     /// Size reported to the tablet in input-only mode (aspect ratio of the output).
     pub output_size: (u32, u32),
 }
@@ -99,10 +101,11 @@ fn session(
         m => bail!("expected hello, got {m:?}"),
     };
     info!(
-        "client v{} surface {}x{}, decoder {} (max {}x{}, {} MB/frame, {} MB/s)",
+        "client v{} surface {}x{} @ {:.1} Hz, decoder {} (max {}x{}, {} MB/frame, {} MB/s)",
         hello.version,
         hello.surface_w,
         hello.surface_h,
+        hello.refresh_hz,
         hello.decoder,
         hello.max_w,
         hello.max_h,
@@ -143,13 +146,15 @@ fn session(
         let recycle = cap.recycle.clone();
         let capture_running = cap.running.clone();
         let refresh_ids = refresh_ids.clone();
-        let enc_opts = opts.enc.clone();
+        let mut enc_opts = opts.enc.clone();
+        enc_opts.fps = opts.fps.unwrap_or(if hello.refresh_hz >= 1.0 { hello.refresh_hz.round() as u32 } else { 60 });
+        let pace = cap.pace_ns.clone();
         let hello = hello.clone();
         let first = last_frame.take();
         thread::Builder::new()
             .name("video".into())
             .spawn(move || {
-                let r = video_loop(&enc_opts, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids);
+                let r = video_loop(&mut enc_opts, &pace, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids);
                 stop.store(true, Ordering::SeqCst);
                 let _ = writer.lock().unwrap().shutdown(Shutdown::Both);
                 r
@@ -237,7 +242,8 @@ fn is_disconnect(e: &anyhow::Error) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn video_loop(
-    opts: &EncoderOpts,
+    opts: &mut EncoderOpts,
+    pace: &std::sync::atomic::AtomicU64,
     hello: &Hello,
     frames: &crate::slot::LatestSlot<Frame>,
     recycle: &crossbeam_channel::Sender<Vec<u8>>,
@@ -294,6 +300,16 @@ fn video_loop(
                     frame.width, frame.height, hello.max_mb_per_frame
                 );
             }
+            // Frame rate: the tablet's refresh rate, limited by its decoder's throughput.
+            if hello.max_mb_per_sec > 0 && mb > 0 {
+                let dec_max = (hello.max_mb_per_sec / mb).max(1);
+                if dec_max < opts.fps {
+                    warn!("{}x{} decodes at most {dec_max} fps on the tablet; capping from {}", frame.width, frame.height, opts.fps);
+                    opts.fps = dec_max;
+                }
+            }
+            pace.store(1_000_000_000 / opts.fps.max(1) as u64, Ordering::Relaxed);
+            info!("streaming at {} fps", opts.fps);
             let e = Encoder::new(opts, frame.width, frame.height, frame.format)?;
             send(writer, |w| proto::write_config(w, codec::H264, frame.width as u16, frame.height as u16))?;
             if let Some(x) = e.extradata() {
