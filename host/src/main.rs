@@ -66,6 +66,14 @@ struct Args {
     /// (MediaTek). Off by default; not used for the published comparisons.
     #[arg(long, value_delimiter = ',')]
     vendor_tweaks: Vec<String>,
+    /// Keep the tablet's CPU clocks up for this many seconds after pen/touch input
+    /// (0 = off). Decoding on some tablets (e.g. MediaTek) is much faster at high clocks,
+    /// which Android only grants while you touch the screen. Costs tablet battery.
+    #[arg(long, default_value_t = 20)]
+    boost: u32,
+    /// Busy threads per CPU cluster the clock boost uses on the tablet.
+    #[arg(long, default_value_t = 1, hide = true)]
+    boost_threads: u32,
     /// Back-pressure: max frames sent but not yet shown on the tablet (0 = off).
     #[arg(long, default_value_t = 2)]
     max_in_flight: usize,
@@ -172,7 +180,7 @@ fn main() -> Result<()> {
     let output_size = output.as_ref().map(|o| (o.mode_w, o.mode_h)).unwrap_or((1920, 1080));
 
     if let Some(adb) = &adb {
-        adb.start_app(args.port)?;
+        adb.start_app(args.port, args.boost, args.boost_threads)?;
     }
 
     session::serve(

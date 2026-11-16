@@ -30,6 +30,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     private lateinit var conn: Connection
     private lateinit var decoder: VideoDecoder
     private lateinit var input: InputCapture
+    private lateinit var boost: ClockBoost
     private val decoderInfo by lazy { VideoDecoder.pick() }
 
     /** Where the video is drawn, in root-view coordinates. Read from the UI thread only. */
@@ -42,8 +43,14 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
 
     /** Full-screen container that receives all pointer events, unbatched. */
     inner class Root(ctx: Context) : FrameLayout(ctx) {
-        override fun onTouchEvent(e: MotionEvent) = input.onEvent(e) || super.onTouchEvent(e)
-        override fun onGenericMotionEvent(e: MotionEvent) = input.onEvent(e) || super.onGenericMotionEvent(e)
+        override fun onTouchEvent(e: MotionEvent): Boolean {
+            boost.poke()
+            return input.onEvent(e) || super.onTouchEvent(e)
+        }
+        override fun onGenericMotionEvent(e: MotionEvent): Boolean {
+            boost.poke()
+            return input.onEvent(e) || super.onGenericMotionEvent(e)
+        }
         override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
             super.onLayout(changed, l, t, r, b)
             if (changed) post { relayout() }
@@ -60,6 +67,10 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         android.util.Log.i("waylus", "sustained performance mode supported: ${pm.isSustainedPerformanceModeSupported}")
         window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         val port = intent.getIntExtra("port", Proto.DEFAULT_PORT)
+        boost = ClockBoost(
+            intent.getIntExtra("boost_secs", 20) * 1000L,
+            intent.getIntExtra("boost_threads", 1).coerceIn(1, 4),
+        )
         pickFastestMode()
 
         root = Root(this).apply { setBackgroundColor(Color.BLACK) }
@@ -125,7 +136,13 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         }
     }
 
+    override fun onPause() {
+        boost.idle()
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        boost.shutdown()
         conn.stop()
         decoder.shutdown()
         super.onDestroy()

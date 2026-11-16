@@ -91,8 +91,11 @@ impl Adb {
         let _ = self.run(&["reverse", "--remove", &format!("tcp:{port}")]);
     }
 
-    pub fn start_app(&self, port: u16) -> Result<()> {
-        self.shell(&format!("am start -S -n {ACTIVITY} --ei port {port}"))?;
+    /// `boost_secs`: keep the tablet's CPU clocks up this long after pen/touch input (0 = off).
+    pub fn start_app(&self, port: u16, boost_secs: u32, boost_threads: u32) -> Result<()> {
+        self.shell(&format!(
+            "am start -S -n {ACTIVITY} --ei port {port} --ei boost_secs {boost_secs} --ei boost_threads {boost_threads}"
+        ))?;
         Ok(())
     }
 
