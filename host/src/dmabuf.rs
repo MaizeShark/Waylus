@@ -61,6 +61,11 @@ pub struct Importer {
     cache: HashMap<(RawFd, u32, u32, u32), Imported>,
     /// Our own render target the imported buffer is blitted into before readback.
     staging: Option<(glow::Texture, glow::Framebuffer, u32, u32)>,
+    /// GPU-side pixel buffer for the zero-copy path (buffer, byte size).
+    pbo: Option<(glow::Buffer, usize)>,
+    /// Bumped whenever `pbo` is recreated. GL reuses object names, so the name
+    /// alone can't tell CUDA that its registration now points at freed memory.
+    pbo_generation: u64,
 }
 
 impl Importer {
@@ -96,10 +101,15 @@ impl Importer {
             .flatten()
             .map(|p| unsafe { std::mem::transmute::<extern "system" fn(), QueryModifiers>(p) });
         info!("EGL importer: {}", unsafe { gl.get_parameter_string(glow::RENDERER) });
-        Ok(Self { egl, display, _ctx: ctx, gl, image_target, query_modifiers, cache: HashMap::new(), staging: None })
+        Ok(Self { egl, display, _ctx: ctx, gl, image_target, query_modifiers, cache: HashMap::new(), staging: None, pbo: None, pbo_generation: 0 })
     }
 
     fn open_display(egl: &Egl) -> Result<egl::Display> {
+        // GBM on the render node first (what compositors use), then the EGL device platform.
+        match Self::open_gbm_display(egl) {
+            Ok(d) => return Ok(d),
+            Err(e) => debug!("GBM EGL display unavailable: {e:#}"),
+        }
         // Prefer an explicit DRM device (works without any window system).
         if let (Some(qd), Some(qs)) =
             (egl.get_proc_address("eglQueryDevicesEXT"), egl.get_proc_address("eglQueryDeviceStringEXT"))
@@ -123,6 +133,29 @@ impl Importer {
             }
         }
         unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.ok_or_else(|| anyhow!("no EGL display"))
+    }
+
+    fn open_gbm_display(egl: &Egl) -> Result<egl::Display> {
+        const PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
+        let node = std::fs::read_dir("/dev/dri")?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("renderD")))
+            .min()
+            .ok_or_else(|| anyhow!("no render node"))?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&node)?;
+        // Leaked on purpose: the GBM device and its fd must outlive the EGL display.
+        let lib = Box::leak(Box::new(unsafe { libloading::Library::new("libgbm.so.1")? }));
+        let create: libloading::Symbol<unsafe extern "C" fn(i32) -> *mut c_void> =
+            unsafe { lib.get(b"gbm_create_device\0")? };
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+        let dev = unsafe { create(fd) };
+        if dev.is_null() {
+            bail!("gbm_create_device failed");
+        }
+        let d = unsafe { egl.get_platform_display(PLATFORM_GBM_KHR, dev, &[egl::ATTRIB_NONE]) }
+            .map_err(|e| anyhow!("eglGetPlatformDisplay(GBM): {e}"))?;
+        debug!("EGL on GBM ({})", node.display());
+        Ok(d)
     }
 
     /// Modifiers the GPU can import for `format` as a regular 2D texture.
@@ -266,8 +299,33 @@ impl Importer {
         planes: &[Plane],
         interop: &mut crate::cuda::Interop,
     ) -> Result<ffmpeg_next::frame::Video> {
-        let tex = self.blit(w, h, ow, oh, format, modifier, planes)?;
-        interop.copy_texture(tex, ow, oh)
+        self.blit(w, h, ow, oh, format, modifier, planes)?;
+        let (_, fbo, _, _) = self.staging.unwrap();
+        let bytes = ow as usize * oh as usize * 4;
+        let pbo = unsafe {
+            let gl = &self.gl;
+            if self.pbo.is_none_or(|(_, n)| n != bytes) {
+                if let Some((b, _)) = self.pbo.take() {
+                    gl.delete_buffer(b);
+                }
+                let b = gl.create_buffer().map_err(|e| anyhow!(e))?;
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(b));
+                // Immutable storage: the driver can't swap the memory behind CUDA's back.
+                gl.buffer_storage(glow::PIXEL_PACK_BUFFER, bytes as i32, None, 0);
+                self.pbo = Some((b, bytes));
+                self.pbo_generation += 1;
+            }
+            let (b, _) = self.pbo.unwrap();
+            // GPU-to-GPU: read the scaled frame into the pixel buffer, no CPU copy.
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(b));
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+            gl.read_pixels(0, 0, ow as i32, oh as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::BufferOffset(0));
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            gl.finish();
+            b.0.get()
+        };
+        interop.copy_buffer(pbo, self.pbo_generation, ow, oh)
     }
 
     /// Forget imported buffers (after renegotiation / buffer removal).

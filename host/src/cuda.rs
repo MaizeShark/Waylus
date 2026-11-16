@@ -39,19 +39,17 @@ struct Memcpy2D {
 }
 
 const CU_MEMORYTYPE_DEVICE: u32 = 2;
-const CU_MEMORYTYPE_ARRAY: u32 = 3;
 const CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY: u32 = 1;
-const GL_TEXTURE_2D: u32 = 0x0DE1;
 
 struct Api {
     _lib: Library,
     push: unsafe extern "C" fn(CuContext) -> CuResult,
     pop: unsafe extern "C" fn(*mut CuContext) -> CuResult,
-    register_image: unsafe extern "C" fn(*mut CuResource, u32, u32, u32) -> CuResult,
+    register_buffer: unsafe extern "C" fn(*mut CuResource, u32, u32) -> CuResult,
+    mapped_pointer: unsafe extern "C" fn(*mut u64, *mut usize, CuResource) -> CuResult,
     unregister: unsafe extern "C" fn(CuResource) -> CuResult,
     map: unsafe extern "C" fn(u32, *mut CuResource, *mut c_void) -> CuResult,
     unmap: unsafe extern "C" fn(u32, *mut CuResource, *mut c_void) -> CuResult,
-    mapped_array: unsafe extern "C" fn(*mut CuArray, CuResource, u32, u32) -> CuResult,
     memcpy2d: unsafe extern "C" fn(*const Memcpy2D) -> CuResult,
 }
 
@@ -67,11 +65,11 @@ impl Api {
             Ok(Self {
                 push: sym!("cuCtxPushCurrent_v2"),
                 pop: sym!("cuCtxPopCurrent_v2"),
-                register_image: sym!("cuGraphicsGLRegisterImage"),
+                register_buffer: sym!("cuGraphicsGLRegisterBuffer"),
+                mapped_pointer: sym!("cuGraphicsResourceGetMappedPointer_v2"),
                 unregister: sym!("cuGraphicsUnregisterResource"),
                 map: sym!("cuGraphicsMapResources"),
                 unmap: sym!("cuGraphicsUnmapResources"),
-                mapped_array: sym!("cuGraphicsSubResourceGetMappedArray"),
                 memcpy2d: sym!("cuMemcpy2D_v2"),
                 _lib: lib,
             })
@@ -89,7 +87,8 @@ pub struct Interop {
     ctx: CuContext,
     frames: *mut ffi::AVBufferRef,
     frames_size: (u32, u32),
-    registered: Option<(CuResource, u32)>,
+    /// Registered GL buffer: (resource, GL name, generation).
+    registered: Option<(CuResource, u32, u64)>,
 }
 
 impl Interop {
@@ -145,23 +144,26 @@ impl Interop {
         Ok(())
     }
 
-    /// Copies GL texture `tex` (RGBA8, `w`x`h`) into a fresh CUDA frame.
-    pub fn copy_texture(&mut self, tex: u32, w: u32, h: u32) -> Result<ff::frame::Video> {
+    /// Copies GL pixel buffer `pbo` (tightly packed RGBA rows, `w`x`h`) into a fresh
+    /// CUDA frame. `generation` changes whenever the buffer was recreated: GL reuses
+    /// object names, and a stale registration silently maps the freed old buffer
+    /// (that bug froze the stream after the first resize).
+    pub fn copy_buffer(&mut self, pbo: u32, generation: u64, w: u32, h: u32) -> Result<ff::frame::Video> {
         self.ensure_frames(w, h)?;
         let api = &self.api;
         unsafe {
             check((api.push)(self.ctx), "cuCtxPushCurrent")?;
             let result = (|| -> Result<ff::frame::Video> {
-                if self.registered.is_none_or(|(_, t)| t != tex) {
-                    if let Some((res, _)) = self.registered.take() {
+                if self.registered.is_none_or(|(_, name, g)| (name, g) != (pbo, generation)) {
+                    if let Some((res, _, _)) = self.registered.take() {
                         (api.unregister)(res);
                     }
                     let mut res = ptr::null_mut();
                     check(
-                        (api.register_image)(&mut res, tex, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY),
-                        "cuGraphicsGLRegisterImage",
+                        (api.register_buffer)(&mut res, pbo, CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY),
+                        "cuGraphicsGLRegisterBuffer",
                     )?;
-                    self.registered = Some((res, tex));
+                    self.registered = Some((res, pbo, generation));
                 }
                 let mut res = self.registered.unwrap().0;
                 let mut frame = ff::frame::Video::empty();
@@ -169,20 +171,23 @@ impl Interop {
                 if r < 0 {
                     bail!("av_hwframe_get_buffer failed: {}", ff::Error::from(r));
                 }
-                // Mapping waits for the GL blit that wrote the texture.
                 check((api.map)(1, &mut res, ptr::null_mut()), "cuGraphicsMapResources")?;
-                let mut array = ptr::null_mut();
-                let copied = check((api.mapped_array)(&mut array, res, 0, 0), "cuGraphicsSubResourceGetMappedArray")
+                let mut src = 0u64;
+                let mut size = 0usize;
+                let copied = check((api.mapped_pointer)(&mut src, &mut size, res), "cuGraphicsResourceGetMappedPointer")
                     .and_then(|_| {
+                        if size < w as usize * 4 * h as usize {
+                            bail!("pixel buffer too small");
+                        }
                         let f = frame.as_ptr();
                         let m = Memcpy2D {
                             src_x_in_bytes: 0,
                             src_y: 0,
-                            src_memory_type: CU_MEMORYTYPE_ARRAY,
+                            src_memory_type: CU_MEMORYTYPE_DEVICE,
                             src_host: ptr::null(),
-                            src_device: 0,
-                            src_array: array,
-                            src_pitch: 0,
+                            src_device: src,
+                            src_array: ptr::null_mut(),
+                            src_pitch: w as usize * 4,
                             dst_x_in_bytes: 0,
                             dst_y: 0,
                             dst_memory_type: CU_MEMORYTYPE_DEVICE,
@@ -193,7 +198,8 @@ impl Interop {
                             width_in_bytes: w as usize * 4,
                             height: h as usize,
                         };
-                        check((api.memcpy2d)(&m), "cuMemcpy2D")
+                        check((api.memcpy2d)(&m), "cuMemcpy2D")?;
+                        Ok(())
                     });
                 (api.unmap)(1, &mut res, ptr::null_mut());
                 copied?;
@@ -209,7 +215,7 @@ impl Interop {
 impl Drop for Interop {
     fn drop(&mut self) {
         unsafe {
-            if let Some((res, _)) = self.registered.take() {
+            if let Some((res, _, _)) = self.registered.take() {
                 (self.api.push)(self.ctx);
                 (self.api.unregister)(res);
                 let mut p = ptr::null_mut();
