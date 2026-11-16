@@ -23,7 +23,7 @@ impl Adb {
         Self { serial }
     }
 
-    fn cmd(&self) -> Command {
+    pub fn command(&self) -> Command {
         let mut c = Command::new("adb");
         if let Some(s) = &self.serial {
             c.args(["-s", s]);
@@ -33,7 +33,7 @@ impl Adb {
 
     pub fn run(&self, args: &[&str]) -> Result<String> {
         debug!("adb {}", args.join(" "));
-        let out = self.cmd().args(args).output().context("failed to run adb (is it installed?)")?;
+        let out = self.command().args(args).output().context("failed to run adb (is it installed?)")?;
         if !out.status.success() {
             bail!(
                 "adb {} failed: {}{}",

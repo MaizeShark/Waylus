@@ -28,11 +28,11 @@ Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet t
 | Tablet client | Any modern web browser | Native Android app |
 | Transport | Wi-Fi / LAN, HTTP + WebSocket | USB (`adb reverse` tunnel); AOA planned |
 | Host OS focus | Linux (X11 first, Wayland experimental), Windows, macOS | Linux, Wayland first (xdg-desktop-portal + PipeWire) |
-| Video encode | FFmpeg; software by default, VAAPI / NVENC / VideoToolbox optional | FFmpeg NVENC by default (VAAPI planned), low-latency tuned: no B-frames, no lookahead, 1-frame VBV, keyframes on demand |
+| Video encode | FFmpeg; software by default, VAAPI / NVENC / VideoToolbox optional | NVENC, zero-copy on the GPU (compositor DMA-BUF → GL blit/scale → CUDA → NVENC), low-latency tuned: no B-frames, no lookahead, small VBV, keyframes on demand; VAAPI planned |
 | Video decode | In the browser | Android `MediaCodec` hardware decoder straight to a `SurfaceView` |
-| Pen input | Browser PointerEvents: pressure and tilt | `MotionEvent` with unbuffered dispatch and every batched sample forwarded: pressure (4096 levels on the T-Pen), tilt, hover, both side buttons, eraser |
+| Pen input | Browser PointerEvents: pressure and tilt | The tablet's raw stylus evdev device, read over adb: full sensor resolution, pressure, both tilt axes, hover, buttons, eraser. Falls back to unbuffered `MotionEvent`s |
 | Touch | Multitouch | Multitouch, with palm rejection while the pen is near |
-| Virtual / extra monitor | Yes on X11 (Intel VirtualHeads / xrandr) | Not yet (mirrors an existing output) |
+| Virtual / extra monitor | Yes on X11 (Intel VirtualHeads / xrandr) | `--virtual` via the ScreenCast portal on GNOME / KDE. niri doesn't implement it; an HDMI/DP dummy plug works there |
 | Platforms for the tablet | Anything with a browser (iPad, Android, …) | Android 11+ |
 | Licence | AGPL-3.0-or-later | GPL-3.0-or-later |
 
@@ -56,11 +56,12 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 - 40–60 samples per run. Each tool was measured with the other one stopped.
 - To reproduce: open `tools/latency/barcode.html` fullscreen on the mirrored monitor, start the mirroring tool, then run `python3 -I tools/latency/probe.py --label <name>` (needs Pillow and the Waylus APK installed).
 
-³ Waylus logs these every 5 s. It syncs the clocks with ping/pong. "Shown" is the decoder's render callback, so it excludes scan-out. Breakdown at 1080p:
-- DMA-BUF import + readback: ~1.6 ms
-- NVENC incl. copy: ~6 ms
-- USB: ~2 ms
-- Decode + present: 12–25 ms (higher under full-screen motion)
+³ Waylus logs these every 5 s. It syncs the clocks with ping/pong. "Shown" is the decoder's render callback, so it excludes scan-out. Breakdown with zero-copy at 2400×1350:
+- capture → sent (GPU blit/scale + CUDA copy + NVENC): ~3 ms
+- USB: ~3–5 ms
+- Decode + present: 15–25 ms (higher under full-screen motion)
+
+The Weylus comparison above was measured before zero-copy; Waylus has gained ~3 ms (1080p) to ~10 ms (1440p) since.
 
 ## Requirements
 
@@ -114,8 +115,12 @@ Useful flags:
 - `--fps` (default: the tablet's refresh rate)
 - `--encoder h264_nvenc`
 - `--serial <adb serial>`
+- `--virtual[=WxH]`: create a virtual monitor instead of mirroring (GNOME / KDE). The size defaults to the tablet's screen within its decoder limits
+- `--no-raw-pen`: use Android's pen events instead of reading the stylus device over adb
 - `--keep-app`
 - `--no-adb`
+
+Monitors larger than the tablet can show or decode (e.g. 4K) are scaled down on the GPU automatically. Set `WAYLUS_NO_ZEROCOPY=1` to force the CPU readback path.
 
 Set `RUST_LOG=waylus=debug` for verbose logs.
 
@@ -126,11 +131,11 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] Built-in latency statistics
 - [x] Reproducible latency comparison against Weylus (`tools/latency`)
 - [ ] Faster decode under full-screen motion (received → shown grows from ~12 to ~25 ms)
-- [ ] Full tilt direction on devices whose Android input config drops `AXIS_ORIENTATION` (e.g. NXTPAPER 14), via a raw evdev helper running as the adb shell user
+- [x] Raw stylus input over adb (full tilt on devices whose Android config drops it, e.g. NXTPAPER 14)
 - [ ] VAAPI encoder fallback (AMD / Intel)
-- [ ] DMA-BUF zero-copy capture (PipeWire dmabuf → GPU encoder)
+- [x] Zero-copy GPU path (DMA-BUF → GL → CUDA → NVENC) and GPU downscaling to fit the tablet
 - [ ] AOA transport (no adb needed)
-- [ ] Virtual monitor where the portal supports it (GNOME / KDE)
+- [ ] Virtual monitor: implemented for GNOME / KDE (`--virtual`), still untested there; niri lacks `RecordVirtual`
 
 ## Licence
 

@@ -142,6 +142,19 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         for (v in listOf(surfaceView, frame)) {
             v.layoutParams = FrameLayout.LayoutParams(w.toInt(), h.toInt(), Gravity.CENTER)
         }
+        sendLayout()
+    }
+
+    /** Lets the host map raw stylus coordinates (read over adb) into the video rect. */
+    private fun sendLayout() {
+        val d = display ?: return
+        val loc = IntArray(2)
+        root.getLocationOnScreen(loc)
+        val r = videoRect
+        conn.send(Proto.layout(
+            d.rotation, d.mode.physicalWidth, d.mode.physicalHeight,
+            (r.left + loc[0]).toInt(), (r.top + loc[1]).toInt(), (r.right + loc[0]).toInt(), (r.bottom + loc[1]).toInt(),
+        ))
     }
 
     // --- Connection.Listener (network thread) ---

@@ -40,6 +40,8 @@ pub enum PixFmt {
 }
 
 pub struct Frame {
+    /// On the GPU (zero-copy path): an FFmpeg CUDA frame; `data` is then empty.
+    pub gpu: Option<ffmpeg_next::frame::Video>,
     pub width: u32,
     pub height: u32,
     pub stride: usize,
@@ -82,7 +84,9 @@ fn token_path() -> PathBuf {
 /// Blocks until the user picked a monitor (first run) or the restore token was accepted.
 /// `source_max_fps` is the highest rate we ask the compositor for; pacing to the
 /// tablet's rate happens on our side (see [`Capture::pace_ns`]).
-pub fn start(source_max_fps: u32, choose_again: bool) -> Result<Capture> {
+/// `virtual_size`: instead of mirroring a monitor, ask the compositor for a new
+/// virtual monitor of that size (portal source type VIRTUAL).
+pub fn start(source_max_fps: u32, choose_again: bool, virtual_size: Option<(u32, u32)>) -> Result<Capture> {
     let (geo_tx, geo_rx) = crossbeam_channel::bounded::<Result<(StreamGeometry, u32, std::os::fd::OwnedFd)>>(1);
     let frames = Arc::new(LatestSlot::new());
     let running = Arc::new(AtomicBool::new(true));
@@ -105,7 +109,7 @@ pub fn start(source_max_fps: u32, choose_again: bool) -> Result<Capture> {
                 return;
             }
         };
-        let portal = rt.block_on(open_portal(choose_again));
+        let portal = rt.block_on(open_portal(choose_again, virtual_size.is_some()));
         let (proxy, session, geometry, node, fd) = match portal {
             Ok(v) => v,
             Err(e) => {
@@ -115,7 +119,7 @@ pub fn start(source_max_fps: u32, choose_again: bool) -> Result<Capture> {
         };
         let _keep = (proxy, session);
         let _ = geo_tx.send(Ok((geometry, node, fd.try_clone().expect("dup fd"))));
-        if let Err(e) = run_pipewire(fd, node, source_max_fps, pace2, sizes, frames2, recycle_rx, running2.clone()) {
+        if let Err(e) = run_pipewire(fd, node, source_max_fps, virtual_size, pace2, sizes, frames2, recycle_rx, running2.clone()) {
             warn!("capture stopped: {e:#}");
         }
         running2.store(false, Ordering::SeqCst);
@@ -126,7 +130,7 @@ pub fn start(source_max_fps: u32, choose_again: bool) -> Result<Capture> {
     Ok(Capture { frames, pace_ns, source_size, target_size, recycle: recycle_tx, geometry, running })
 }
 
-async fn open_portal(choose_again: bool) -> Result<(
+async fn open_portal(choose_again: bool, virtual_monitor: bool) -> Result<(
     Screencast,
     ashpd::desktop::Session<Screencast>,
     StreamGeometry,
@@ -136,7 +140,7 @@ async fn open_portal(choose_again: bool) -> Result<(
     let proxy = Screencast::new().await.context("ScreenCast portal unavailable")?;
     let session = proxy.create_session(Default::default()).await?;
     let token_file = token_path();
-    let token = if choose_again { None } else { std::fs::read_to_string(&token_file).ok().map(|s| s.trim().to_owned()) };
+    let token = if choose_again || virtual_monitor { None } else { std::fs::read_to_string(&token_file).ok().map(|s| s.trim().to_owned()) };
     let cursor = if proxy.available_cursor_modes().await?.contains(CursorMode::EMBEDDED) {
         CursorMode::EMBEDDED
     } else {
@@ -148,10 +152,10 @@ async fn open_portal(choose_again: bool) -> Result<(
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(cursor)
-                .set_sources(SourceType::MONITOR)
+                .set_sources(if virtual_monitor { SourceType::VIRTUAL } else { SourceType::MONITOR })
                 .set_multiple(false)
                 .set_restore_token(token.as_deref())
-                .set_persist_mode(PersistMode::ExplicitlyRevoked),
+                .set_persist_mode(if virtual_monitor { PersistMode::DoNot } else { PersistMode::ExplicitlyRevoked }),
         )
         .await?
         .response()?;
@@ -163,7 +167,7 @@ async fn open_portal(choose_again: bool) -> Result<(
         .await?
         .response()
         .context("screencast was cancelled or failed")?;
-    if let Some(t) = streams.restore_token() {
+    if let Some(t) = streams.restore_token().filter(|_| !virtual_monitor) {
         if let Some(dir) = token_file.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -183,6 +187,7 @@ struct UserData {
     format: Option<PixFmt>,
     dmabuf: bool,
     importer: Option<Importer>,
+    interop: Option<crate::cuda::Interop>,
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
     source_size: Arc<AtomicU64>,
@@ -228,7 +233,13 @@ fn serialize(obj: spa::pod::Object) -> Result<Vec<u8>> {
 }
 
 /// EnumFormat for one or more raw formats; with `modifiers` it describes a DMA-BUF format.
-fn format_pod(formats: &[spa::param::video::VideoFormat], modifiers: Option<&[u64]>, max_fps: u32) -> Result<Vec<u8>> {
+/// `size`: a fixed size (virtual monitors take their size from the consumer), else any.
+fn format_pod(
+    formats: &[spa::param::video::VideoFormat],
+    modifiers: Option<&[u64]>,
+    max_fps: u32,
+    size: Option<(u32, u32)>,
+) -> Result<Vec<u8>> {
     use spa::param::{format::FormatProperties as FP, format::MediaSubtype, format::MediaType};
     use spa::pod::{ChoiceValue, Property, PropertyFlags, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle};
@@ -258,14 +269,17 @@ fn format_pod(formats: &[spa::param::video::VideoFormat], modifiers: Option<&[u6
     }
     props.push(Property::new(
         FP::VideoSize.as_raw(),
-        Value::Choice(ChoiceValue::Rectangle(Choice(
-            ChoiceFlags::empty(),
-            ChoiceEnum::Range {
-                default: Rectangle { width: 1920, height: 1080 },
-                min: Rectangle { width: 1, height: 1 },
-                max: Rectangle { width: 8192, height: 8192 },
-            },
-        ))),
+        match size {
+            Some((width, height)) => Value::Rectangle(Rectangle { width, height }),
+            None => Value::Choice(ChoiceValue::Rectangle(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: Rectangle { width: 1920, height: 1080 },
+                    min: Rectangle { width: 1, height: 1 },
+                    max: Rectangle { width: 8192, height: 8192 },
+                },
+            ))),
+        },
     ));
     props.push(Property::new(
         FP::VideoFramerate.as_raw(),
@@ -324,6 +338,7 @@ fn run_pipewire(
     fd: std::os::fd::OwnedFd,
     node: u32,
     max_fps: u32,
+    virtual_size: Option<(u32, u32)>,
     pace_ns: Arc<AtomicU64>,
     (source_size, target_size): (Arc<AtomicU64>, Arc<AtomicU64>),
     frames: Arc<LatestSlot<Frame>>,
@@ -351,11 +366,11 @@ fn run_pipewire(
             let mods = imp.modifiers(drm_fourcc(map_format(f).unwrap()));
             if !mods.is_empty() {
                 debug!("{f:?}: {} importable modifiers", mods.len());
-                pods.push(format_pod(&[f], Some(&mods), max_fps)?);
+                pods.push(format_pod(&[f], Some(&mods), max_fps, virtual_size)?);
             }
         }
     }
-    pods.push(format_pod(&[VF::BGRx, VF::BGRx, VF::BGRA, VF::RGBx, VF::RGBA], None, max_fps)?);
+    pods.push(format_pod(&[VF::BGRx, VF::BGRx, VF::BGRA, VF::RGBx, VF::RGBA], None, max_fps, virtual_size)?);
 
     let stream = pw::stream::StreamBox::new(
         &core,
@@ -371,6 +386,11 @@ fn run_pipewire(
         info: Default::default(),
         format: None,
         dmabuf: false,
+        interop: if importer.is_some() && std::env::var_os("WAYLUS_NO_ZEROCOPY").is_none() {
+            crate::cuda::Interop::new().map_err(|e| info!("zero-copy unavailable ({e:#}); using readback")).ok()
+        } else {
+            None
+        },
         importer,
         frames,
         recycle,
@@ -492,6 +512,29 @@ fn run_pipewire(
                     .map(|d| Plane { fd: d.fd() as RawFd, offset: d.chunk().offset(), stride: d.chunk().stride() as u32 })
                     .collect();
                 let t0 = now_ns();
+                if let Some(interop) = ud.interop.as_mut() {
+                    match imp.read_gpu(width, height, ow, oh, drm_fourcc(fmt), ud.info.modifier(), &planes, interop) {
+                        Ok(gpu) => {
+                            ud.next_due_ns = (ud.next_due_ns + interval).max(now.saturating_sub(interval / 2));
+                            ud.stat_out += 1;
+                            tracing::trace!("zero-copy frame {:.2} ms", (now_ns() - t0) as f64 / 1e6);
+                            ud.frames.put(Frame {
+                                gpu: Some(gpu),
+                                width: ow,
+                                height: oh,
+                                stride: 0,
+                                format: PixFmt::Rgbx,
+                                capture_ns: now,
+                                data: buf,
+                            });
+                            return;
+                        }
+                        Err(e) => {
+                            warn!("zero-copy failed ({e:#}); falling back to readback");
+                            ud.interop = None;
+                        }
+                    }
+                }
                 if let Err(e) = imp.read(width, height, ow, oh, drm_fourcc(fmt), ud.info.modifier(), &planes, &mut buf) {
                     warn!("dmabuf read failed: {e:#}");
                     return;
@@ -525,7 +568,7 @@ fn run_pipewire(
             };
             ud.next_due_ns = (ud.next_due_ns + interval).max(now.saturating_sub(interval / 2));
             ud.stat_out += 1;
-            ud.frames.put(Frame { width: fw, height: fh, stride, format, capture_ns: now, data: buf });
+            ud.frames.put(Frame { gpu: None, width: fw, height: fh, stride, format, capture_ns: now, data: buf });
         })
         .register()?;
 

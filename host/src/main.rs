@@ -3,11 +3,13 @@
 
 mod adb;
 mod capture;
+mod cuda;
 mod dmabuf;
 mod encode;
 mod input;
 mod niri;
 mod proto;
+mod rawpen;
 mod session;
 mod slot;
 
@@ -36,6 +38,10 @@ struct Args {
     /// Show the monitor picker again instead of reusing the remembered monitor.
     #[arg(long)]
     choose: bool,
+    /// Create a virtual monitor instead of mirroring one (GNOME/KDE; niri lacks it).
+    /// Size defaults to the tablet's screen within its decoder limits, or give WIDTHxHEIGHT.
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto", value_name = "SIZE")]
+    r#virtual: Option<String>,
     /// Frame rate (default: the tablet's display refresh rate, within decoder limits).
     #[arg(long)]
     fps: Option<u32>,
@@ -54,6 +60,9 @@ struct Args {
     /// Leave the app running on the tablet on exit.
     #[arg(long)]
     keep_app: bool,
+    /// Don't read the stylus device directly over adb; use Android's pen events.
+    #[arg(long)]
+    no_raw_pen: bool,
 }
 
 fn main() -> Result<()> {
@@ -77,16 +86,50 @@ fn main() -> Result<()> {
 
     install_exit_handler(adb.clone(), args.port, args.keep_app)?;
 
+    let pen_sink: rawpen::Sink = Default::default();
+    let _raw_pen = match &adb {
+        Some(adb) if !args.no_raw_pen => match rawpen::start(adb, pen_sink.clone()) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                info!("raw pen unavailable ({e:#}); using Android pen events");
+                None
+            }
+        },
+        _ => None,
+    };
+
     let mut output = args.output.as_deref().and_then(niri::by_name);
     if args.output.is_some() && output.is_none() && niri::is_niri() {
         warn!("output {:?} not found via niri IPC", args.output);
     }
 
+    let source_max_fps = args.fps.map_or(240, |f| f * 2);
+    let virtual_size = match args.r#virtual.as_deref() {
+        None => None,
+        Some("auto") => Some(None),
+        Some(v) => Some(Some(parse_size(v).map_err(anyhow::Error::msg)?)),
+    };
+    let mut lazy: Option<session::LazyCapture> = None;
     let capture = if args.no_video {
         None
+    } else if let Some(size) = virtual_size {
+        let fps = args.fps;
+        lazy = Some(Box::new(move |hello: &proto::Hello| {
+            let size = size.unwrap_or_else(|| {
+                let fps = fps.unwrap_or(hello.refresh_hz.round().max(1.0) as u32);
+                session::stream_size((hello.surface_w as u32, hello.surface_h as u32), hello, fps)
+            });
+            info!("creating a {}x{} virtual monitor", size.0, size.1);
+            let cap = capture::start(source_max_fps, true, Some(size))?;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if !cap.running.load(std::sync::atomic::Ordering::SeqCst) {
+                bail!("virtual monitor capture failed to start (see warnings above)");
+            }
+            Ok(cap)
+        }));
+        None
     } else {
-        // Ask the compositor for more than we need; we pace to the tablet's rate per session.
-        let cap = capture::start(args.fps.map_or(240, |f| f * 2), args.choose)?;
+        let cap = capture::start(source_max_fps, args.choose, None)?;
         // Give PipeWire a moment to negotiate so format errors surface before the tablet connects.
         std::thread::sleep(std::time::Duration::from_millis(500));
         if !cap.running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -125,9 +168,11 @@ fn main() -> Result<()> {
                 fps: args.fps.unwrap_or(60),
             },
             fps: args.fps,
+            raw_pen: _raw_pen.as_ref().map(|_| pen_sink.clone()),
             output_size,
         },
         capture,
+        lazy,
     )
 }
 
@@ -155,4 +200,9 @@ fn install_exit_handler(adb: Option<adb::Adb>, port: u16, keep_app: bool) -> Res
         unsafe { libc::_exit(0) };
     })
     .context("install Ctrl-C handler")
+}
+
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
+    Ok((w.parse().map_err(|e| format!("{e}"))?, h.parse().map_err(|e| format!("{e}"))?))
 }

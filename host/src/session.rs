@@ -32,6 +32,8 @@ pub struct Opts {
     pub enc: EncoderOpts,
     /// Forced frame rate; None = follow the tablet's refresh rate.
     pub fps: Option<u32>,
+    /// Raw stylus stream (rawpen.rs); when set, the app's pen messages are ignored.
+    pub raw_pen: Option<crate::rawpen::Sink>,
     /// Size reported to the tablet in input-only mode (aspect ratio of the output).
     pub output_size: (u32, u32),
 }
@@ -48,10 +50,14 @@ fn send(w: &Writer, f: impl FnOnce(&mut TcpStream) -> std::io::Result<()>) -> st
     f(&mut g)
 }
 
-pub fn serve(opts: Opts, capture: Option<Capture>) -> Result<()> {
+/// Creates the capture once the first tablet has said hello (virtual monitors are
+/// sized after the tablet).
+pub type LazyCapture = Box<dyn Fn(&Hello) -> Result<Capture>>;
+
+pub fn serve(opts: Opts, mut capture: Option<Capture>, lazy: Option<LazyCapture>) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", opts.port)).with_context(|| format!("bind port {}", opts.port))?;
     info!("waiting for the tablet on 127.0.0.1:{} (adb reverse)", opts.port);
-    let mut inputs: Option<(Pen, Touch)> = None;
+    let mut inputs: Option<(Arc<Mutex<Pen>>, Touch)> = None;
     let mut last_frame: Option<Frame> = None;
     for conn in listener.incoming() {
         let stream = match conn {
@@ -62,12 +68,15 @@ pub fn serve(opts: Opts, capture: Option<Capture>) -> Result<()> {
             }
         };
         info!("tablet connected");
-        match session(&opts, capture.as_ref(), stream, &mut inputs, &mut last_frame) {
+        match session(&opts, &mut capture, lazy.as_deref(), stream, &mut inputs, &mut last_frame) {
             Ok(()) => info!("tablet disconnected"),
             Err(e) => warn!("session ended: {e:#}"),
         }
+        if let Some(sink) = &opts.raw_pen {
+            sink.lock().unwrap().take();
+        }
         if let Some((pen, touch)) = inputs.as_mut() {
-            let _ = pen.reset();
+            let _ = pen.lock().unwrap().reset();
             let _ = touch.reset();
         }
         if capture.as_ref().is_some_and(|c| !c.running.load(Ordering::SeqCst)) {
@@ -91,7 +100,7 @@ fn wait_source_size(cap: &Capture) -> Option<(u32, u32)> {
 /// Stream size for a `src`-sized capture: never larger than the area the video
 /// covers on the tablet, within the decoder's size and macroblock-rate limits
 /// at `fps`, never upscaled, aspect ratio kept.
-fn stream_size(src: (u32, u32), h: &Hello, fps: u32) -> (u32, u32) {
+pub fn stream_size(src: (u32, u32), h: &Hello, fps: u32) -> (u32, u32) {
     let (sw, sh) = (src.0 as f64, src.1 as f64);
     let (rw, rh) = fit(src, (h.surface_w as u32, h.surface_h as u32));
     let mut s = (rw as f64 / sw).min(rh as f64 / sh).min(1.0);
@@ -120,9 +129,10 @@ fn fit(video: (u32, u32), surface: (u32, u32)) -> (f32, f32) {
 
 fn session(
     opts: &Opts,
-    capture: Option<&Capture>,
+    capture_slot: &mut Option<Capture>,
+    lazy: Option<&dyn Fn(&Hello) -> Result<Capture>>,
     stream: TcpStream,
-    inputs: &mut Option<(Pen, Touch)>,
+    inputs: &mut Option<(Arc<Mutex<Pen>>, Touch)>,
     last_frame: &mut Option<Frame>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
@@ -149,6 +159,12 @@ fn session(
         bail!("protocol mismatch: host {} client {}", proto::PROTO_VERSION, hello.version);
     }
     stream.set_read_timeout(None)?;
+    if capture_slot.is_none()
+        && let Some(make) = lazy
+    {
+        *capture_slot = Some(make(&hello)?);
+    }
+    let capture = capture_slot.as_ref();
 
     let video_size = match (capture, last_frame.as_ref()) {
         (Some(_), Some(f)) => (f.width, f.height),
@@ -158,7 +174,7 @@ fn session(
         let (w, h) = fit(video_size, (hello.surface_w as u32, hello.surface_h as u32));
         let area = AreaMm { width: w / TABLET_PX_PER_MM, height: h / TABLET_PX_PER_MM };
         info!("creating virtual pen + touchscreen ({:.0}x{:.0} mm)", area.width, area.height);
-        *inputs = Some((Pen::new(area)?, Touch::new(area)?));
+        *inputs = Some((Arc::new(Mutex::new(Pen::new(area)?)), Touch::new(area)?));
     }
     let (pen, touch) = inputs.as_mut().unwrap();
 
@@ -232,9 +248,30 @@ fn session(
         let msg = proto::read_msg(&mut reader, &mut buf)?;
         match msg {
             DeviceMsg::Pen(s) => {
-                tracing::trace!("pen {s:?}");
-                pen.handle(&s)?;
-                stats.pen(&s);
+                if opts.raw_pen.is_none() {
+                    pen.lock().unwrap().handle(&s)?;
+                    stats.pen(&s);
+                }
+            }
+            DeviceMsg::Layout(layout) => {
+                debug!("tablet layout {layout:?}");
+                if let Some(sink) = &opts.raw_pen {
+                    let mut g = sink.lock().unwrap();
+                    match g.as_mut() {
+                        Some((l, _)) => *l = layout,
+                        None => {
+                            let pen = pen.clone();
+                            *g = Some((
+                                layout,
+                                Box::new(move |s| {
+                                    if let Err(e) = pen.lock().unwrap().handle(&s) {
+                                        warn!("pen: {e}");
+                                    }
+                                }),
+                            ));
+                        }
+                    }
+                }
             }
             DeviceMsg::Touch { points, .. } => touch.handle(&points)?,
             DeviceMsg::Pong { host_ns, dev_ns } => stats.pong(host_ns, dev_ns),
@@ -360,7 +397,8 @@ fn video_loop(
             }
             pace.store(1_000_000_000 / opts.fps.max(1) as u64, Ordering::Relaxed);
             info!("streaming at {} fps", opts.fps);
-            let e = Encoder::new(opts, frame.width, frame.height, frame.format)?;
+            let hw = frame.gpu.as_ref().map(crate::cuda::frames_ctx_of).transpose()?;
+            let e = Encoder::new(opts, frame.width, frame.height, frame.format, hw)?;
             send(writer, |w| proto::write_config(w, codec::H264, frame.width as u16, frame.height as u16))?;
             if let Some(x) = e.extradata() {
                 send(writer, |w| proto::write_video(w, 0, video_flags::CONFIG, &x))?;

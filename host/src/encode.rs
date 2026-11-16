@@ -32,6 +32,7 @@ pub struct Encoder {
     width: u32,
     height: u32,
     format: PixFmt,
+    gpu: bool,
     pending_ns: std::collections::VecDeque<(i64, u64)>,
     pkt: ff::Packet,
     force_key: bool,
@@ -47,8 +48,18 @@ fn pixel(f: PixFmt) -> Pixel {
 }
 
 impl Encoder {
-    pub fn new(opts: &EncoderOpts, width: u32, height: u32, format: PixFmt) -> Result<Self> {
+    /// `hw_frames`: the CUDA frames context of zero-copy input frames (None = system memory).
+    pub fn new(
+        opts: &EncoderOpts,
+        width: u32,
+        height: u32,
+        format: PixFmt,
+        hw_frames: Option<*mut ff::ffi::AVBufferRef>,
+    ) -> Result<Self> {
         ff::init().context("ffmpeg init")?;
+        if std::env::var_os("WAYLUS_FFMPEG_LOG").is_some() {
+            ff::util::log::set_level(ff::util::log::Level::Debug);
+        }
         let codec = ff::encoder::find_by_name(&opts.encoder)
             .ok_or_else(|| anyhow!("encoder {} not found in this ffmpeg build", opts.encoder))?;
         let bitrate = opts.bitrate.unwrap_or_else(|| {
@@ -61,6 +72,13 @@ impl Encoder {
         enc.set_width(width);
         enc.set_height(height);
         enc.set_format(pixel(format));
+        if let Some(hw) = hw_frames {
+            unsafe {
+                let c = enc.as_mut_ptr();
+                (*c).pix_fmt = ff::ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
+                (*c).hw_frames_ctx = ff::ffi::av_buffer_ref(hw);
+            }
+        }
         enc.set_time_base((1, 1_000_000));
         enc.set_frame_rate(Some((opts.fps as i32, 1)));
         enc.set_bit_rate(bitrate);
@@ -89,7 +107,14 @@ impl Encoder {
             dict.set("profile", "high");
         }
         let enc = enc.open_as_with(codec, dict).with_context(|| format!("open {}", opts.encoder))?;
-        info!("encoder {} {}x{} {:?} {} kbit/s", opts.encoder, width, height, format, bitrate / 1000);
+        info!(
+            "encoder {} {}x{} {} {} kbit/s",
+            opts.encoder,
+            width,
+            height,
+            if hw_frames.is_some() { "CUDA (zero-copy)".to_string() } else { format!("{format:?}") },
+            bitrate / 1000
+        );
         let frame = frame::Video::new(pixel(format), width, height);
         Ok(Self {
             enc,
@@ -97,6 +122,7 @@ impl Encoder {
             width,
             height,
             format,
+            gpu: hw_frames.is_some(),
             pending_ns: Default::default(),
             pkt: ff::Packet::empty(),
             force_key: true,
@@ -115,7 +141,7 @@ impl Encoder {
     }
 
     pub fn matches(&self, f: &Frame) -> bool {
-        f.width == self.width && f.height == self.height && f.format == self.format
+        f.width == self.width && f.height == self.height && f.format == self.format && f.gpu.is_some() == self.gpu
     }
 
     pub fn request_keyframe(&mut self) {
@@ -128,19 +154,29 @@ impl Encoder {
         if !self.matches(f) {
             bail!("frame format changed");
         }
-        let row = self.width as usize * 4;
-        let dst_stride = self.frame.stride(0);
-        let dst = self.frame.data_mut(0);
-        for y in 0..self.height as usize {
-            let s = &f.data[y * f.stride..y * f.stride + row];
-            dst[y * dst_stride..y * dst_stride + row].copy_from_slice(s);
-        }
         let pts = (capture_ns / 1000) as i64;
-        self.frame.set_pts(Some(pts));
-        self.frame.set_kind(if self.force_key { picture::Type::I } else { picture::Type::None });
+        let kind = if self.force_key { picture::Type::I } else { picture::Type::None };
         self.force_key = false;
         self.pending_ns.push_back((pts, capture_ns));
-        self.enc.send_frame(&self.frame)?;
+        if let Some(gpu) = &f.gpu {
+            // New reference to the same CUDA buffer. (ffmpeg-next's clone() would try
+            // a deep CPU copy, which fails for hardware frames.)
+            let mut fr = unsafe { frame::Video::wrap(ff::ffi::av_frame_clone(gpu.as_ptr())) };
+            fr.set_pts(Some(pts));
+            fr.set_kind(kind);
+            self.enc.send_frame(&fr).context("send CUDA frame to encoder")?;
+        } else {
+            let row = self.width as usize * 4;
+            let dst_stride = self.frame.stride(0);
+            let dst = self.frame.data_mut(0);
+            for y in 0..self.height as usize {
+                let s = &f.data[y * f.stride..y * f.stride + row];
+                dst[y * dst_stride..y * dst_stride + row].copy_from_slice(s);
+            }
+            self.frame.set_pts(Some(pts));
+            self.frame.set_kind(kind);
+            self.enc.send_frame(&self.frame).context("send frame to encoder")?;
+        }
         loop {
             match self.enc.receive_packet(&mut self.pkt) {
                 Ok(()) => {
@@ -165,7 +201,7 @@ impl Encoder {
                 }
                 Err(ff::Error::Other { errno }) if errno == ff::util::error::EAGAIN => break,
                 Err(ff::Error::Eof) => break,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(anyhow::Error::from(e).context("receive packet from encoder")),
             }
         }
         Ok(())

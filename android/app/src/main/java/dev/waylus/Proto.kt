@@ -7,7 +7,7 @@ import java.nio.ByteOrder
 
 /** Wire protocol, mirrors host/src/proto.rs. Frames: [u8 type][u32 len LE][payload]. */
 object Proto {
-    const val VERSION = 2
+    const val VERSION = 3
     const val DEFAULT_PORT = 27183
 
     const val HELLO = 1
@@ -19,6 +19,7 @@ object Proto {
     const val PONG = 7
     const val FRAME_SHOWN = 8
     const val REQUEST_KEYFRAME = 9
+    const val LAYOUT = 10
 
     const val VIDEO_KEY = 1
     const val VIDEO_CONFIG = 2
@@ -84,6 +85,15 @@ object Proto {
         val b = msg(FRAME_SHOWN, 24)
         b.putLong(captureNs); b.putLong(recvNs); b.putLong(renderNs)
         return b.array()
+    }
+
+    /** Display rotation, natural display size and the video rect (current orientation, px). */
+    fun layout(rotation: Int, naturalW: Int, naturalH: Int, l: Int, t: Int, r: Int, b: Int): ByteArray {
+        val m = msg(LAYOUT, 1 + 2 * 6)
+        m.put(rotation.toByte())
+        m.putShort(naturalW.toShort()); m.putShort(naturalH.toShort())
+        m.putShort(l.toShort()); m.putShort(t.toShort()); m.putShort(r.toShort()); m.putShort(b.toShort())
+        return m.array()
     }
 
     fun requestKeyframe(): ByteArray = msg(REQUEST_KEYFRAME, 0).array()

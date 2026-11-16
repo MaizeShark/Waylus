@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const PROTO_VERSION: u16 = 2;
+pub const PROTO_VERSION: u16 = 3;
 pub const DEFAULT_PORT: u16 = 27183;
 /// Upper bound for a single message, protects against garbage on the wire.
 const MAX_LEN: u32 = 16 * 1024 * 1024;
@@ -22,6 +22,7 @@ pub mod ty {
     pub const PONG: u8 = 7;
     pub const FRAME_SHOWN: u8 = 8;
     pub const REQUEST_KEYFRAME: u8 = 9;
+    pub const LAYOUT: u8 = 10;
 }
 
 pub mod video_flags {
@@ -74,6 +75,21 @@ pub struct PenSample {
     pub tilt_y: i16,
 }
 
+/// Where the video sits on the tablet's display, so raw sensor coordinates can be
+/// mapped (see rawpen.rs). Rotation is Android's Surface.ROTATION_* (0..3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layout {
+    pub rotation: u8,
+    /// Display size in its natural orientation, pixels.
+    pub natural_w: u16,
+    pub natural_h: u16,
+    /// Video rectangle in current-orientation display pixels.
+    pub left: i16,
+    pub top: i16,
+    pub right: i16,
+    pub bottom: i16,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TouchPoint {
     pub id: u8,
@@ -94,6 +110,7 @@ pub enum DeviceMsg {
     Pong { host_ns: u64, dev_ns: u64 },
     FrameShown { capture_ns: u64, recv_ns: u64, render_ns: u64 },
     RequestKeyframe,
+    Layout(Layout),
     Unknown(u8),
 }
 
@@ -186,6 +203,15 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             render_ns: c.u64()?,
         },
         ty::REQUEST_KEYFRAME => DeviceMsg::RequestKeyframe,
+        ty::LAYOUT => DeviceMsg::Layout(Layout {
+            rotation: c.u8()?,
+            natural_w: c.u16()?,
+            natural_h: c.u16()?,
+            left: c.i16()?,
+            top: c.i16()?,
+            right: c.i16()?,
+            bottom: c.i16()?,
+        }),
         other => DeviceMsg::Unknown(other),
     })
 }

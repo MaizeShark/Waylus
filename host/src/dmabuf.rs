@@ -178,20 +178,10 @@ impl Importer {
         }
     }
 
-    /// Copies the `w`x`h` DMA-BUF into `out` as tightly packed BGRA (BGRx) rows,
-    /// scaled to `ow`x`oh` on the GPU (bilinear) when that differs.
+    /// Blits the `w`x`h` DMA-BUF into our own RGBA8 texture of size `ow`x`oh`
+    /// (bilinear when scaling). Returns that texture's GL name.
     #[allow(clippy::too_many_arguments)]
-    pub fn read(
-        &mut self,
-        w: u32,
-        h: u32,
-        ow: u32,
-        oh: u32,
-        format: u32,
-        modifier: u64,
-        planes: &[Plane],
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
+    fn blit(&mut self, w: u32, h: u32, ow: u32, oh: u32, format: u32, modifier: u64, planes: &[Plane]) -> Result<u32> {
         let p0 = planes.first().ok_or_else(|| anyhow!("no planes"))?;
         let key = (p0.fd, p0.offset, p0.stride, w << 16 | h);
         if !self.cache.contains_key(&key) {
@@ -199,7 +189,6 @@ impl Importer {
             self.cache.insert(key, imp);
         }
         let src_fbo = self.cache[&key].fbo;
-        out.resize(ow as usize * oh as usize * 4, 0);
         unsafe {
             let gl = &self.gl;
             if self.staging.is_none_or(|s| (s.2, s.3) != (ow, oh)) {
@@ -215,14 +204,36 @@ impl Importer {
                 gl.framebuffer_texture_2d(glow::DRAW_FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
                 self.staging = Some((tex, fbo, ow, oh));
             }
-            let (_, dst_fbo, _, _) = self.staging.unwrap();
-            let t0 = std::time::Instant::now();
+            let (tex, dst_fbo, _, _) = self.staging.unwrap();
+            // Blitting first matters on NVIDIA: reading the imported (tiled) buffer
+            // directly with glReadPixels takes a pathological ~800 ms path.
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(src_fbo));
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(dst_fbo));
             let filter = if (ow, oh) == (w, h) { glow::NEAREST } else { glow::LINEAR };
             gl.blit_framebuffer(0, 0, w as i32, h as i32, 0, 0, ow as i32, oh as i32, glow::COLOR_BUFFER_BIT, filter);
-            gl.finish();
-            let t1 = std::time::Instant::now();
+            gl.flush();
+            Ok(tex.0.get())
+        }
+    }
+
+    /// Copies the DMA-BUF into `out` as tightly packed BGRA (BGRx) rows, scaled to `ow`x`oh`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read(
+        &mut self,
+        w: u32,
+        h: u32,
+        ow: u32,
+        oh: u32,
+        format: u32,
+        modifier: u64,
+        planes: &[Plane],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.blit(w, h, ow, oh, format, modifier, planes)?;
+        let (_, dst_fbo, _, _) = self.staging.unwrap();
+        out.resize(ow as usize * oh as usize * 4, 0);
+        unsafe {
+            let gl = &self.gl;
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(dst_fbo));
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
             gl.read_pixels(
@@ -234,13 +245,29 @@ impl Importer {
                 glow::UNSIGNED_BYTE,
                 glow::PixelPackData::Slice(Some(out.as_mut_slice())),
             );
-            tracing::trace!("blit+finish {:?}, readpixels {:?}", t1 - t0, t1.elapsed());
             let err = gl.get_error();
             if err != glow::NO_ERROR {
                 bail!("glReadPixels error {err:#x}");
             }
         }
         Ok(())
+    }
+
+    /// Zero-copy variant: the scaled frame stays on the GPU as an FFmpeg CUDA frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_gpu(
+        &mut self,
+        w: u32,
+        h: u32,
+        ow: u32,
+        oh: u32,
+        format: u32,
+        modifier: u64,
+        planes: &[Plane],
+        interop: &mut crate::cuda::Interop,
+    ) -> Result<ffmpeg_next::frame::Video> {
+        let tex = self.blit(w, h, ow, oh, format, modifier, planes)?;
+        interop.copy_texture(tex, ow, oh)
     }
 
     /// Forget imported buffers (after renegotiation / buffer removal).
