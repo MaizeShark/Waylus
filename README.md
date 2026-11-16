@@ -42,8 +42,8 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 
 | Metric | Weylus ¹ | Waylus |
 |---|---|---|
-| Host page frame → presented on tablet ² | p50 **166 ms** / p95 **229 ms** | p50 **94–106 ms** / p95 **108–118 ms** |
-| Capture → frame shown (built-in stats) ³ | – | p50 24 ms (desktop) to 40 ms (full-screen motion) |
+| Host page frame → presented on tablet ² | p50 **166 ms** / p95 **229 ms** | p50 **74–84 ms** / p95 **106–116 ms** (pen idle); p50 72 / p95 83 ms right after pen input (`--boost`) |
+| Capture → frame shown (built-in stats) ³ | – | p50 ~17 ms (while drawing) / ~21 ms (pen idle), full-screen motion |
 | Pen event → host input device ³ | – | p50 **2 ms** / p95 3 ms |
 
 ¹ A local build of [Weylus](https://github.com/H-M-H/Weylus) with niri/NVIDIA fixes (upstream does not run on this setup). Settings: NVENC, Chrome on the tablet, "Lower Latency" on, frame-rate slider at maximum, no stretching.
@@ -65,7 +65,7 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 
 Back-pressure (`--max-in-flight`, default 2) keeps a slow decoder from building a queue: the host waits and then encodes the newest frame instead of a backlog.
 
-The Weylus comparison above was measured before zero-copy; Waylus has gained ~3 ms (1080p) to ~10 ms (1440p) since.
+The Waylus probe numbers were re-measured on 2026-11-16 (commit 994ec89: zero-copy, single-write transfer fix, back-pressure, clock boost); the Weylus numbers are from the earlier session with the same setup and method. The probe takes `adb screencap`s over the same USB link while it runs, which loads the tablet and inflates both tools' numbers somewhat.
 
 ## Requirements
 
