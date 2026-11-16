@@ -99,6 +99,13 @@ impl Adb {
     pub fn stop_app(&self) {
         let _ = self.shell(&format!("am force-stop {PACKAGE}"));
     }
+
+    /// Kills raw-pen readers (`cat <device>`, see rawpen.rs) on the tablet. Killing the local
+    /// `adb exec-out` does not end the remote `cat`, which stays blocked in read() until the
+    /// pen next produces an event, so every session would otherwise leave one behind.
+    pub fn kill_remote_cat(&self, device: &str) {
+        let _ = self.shell(&format!("pkill -x -f 'cat {device}'"));
+    }
 }
 
 fn sha256_local(p: &Path) -> Result<String> {

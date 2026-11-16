@@ -53,6 +53,11 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Generic Android API: ask for stable (not bursty) CPU/GPU clocks. Decode latency on
+        // some SoCs follows the CPU clock, so frequency drops show up as decode spikes.
+        val pm = getSystemService(android.os.PowerManager::class.java)
+        if (pm.isSustainedPerformanceModeSupported) window.setSustainedPerformanceMode(true)
+        android.util.Log.i("waylus", "sustained performance mode supported: ${pm.isSustainedPerformanceModeSupported}")
         window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         val port = intent.getIntExtra("port", Proto.DEFAULT_PORT)
         pickFastestMode()

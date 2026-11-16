@@ -98,7 +98,10 @@ fn main() -> Result<()> {
     let pen_sink: rawpen::Sink = Default::default();
     let _raw_pen = match &adb {
         Some(adb) if !args.no_raw_pen => match rawpen::start(adb, pen_sink.clone()) {
-            Ok(r) => Some(r),
+            Ok(r) => {
+                let _ = RAW_PEN_DEVICE.set(r.device.clone());
+                Some(r)
+            }
             Err(e) => {
                 info!("raw pen unavailable ({e:#}); using Android pen events");
                 None
@@ -199,6 +202,9 @@ fn main() -> Result<()> {
 /// Ctrl-C: undo the adb setup, then leave with `_exit`. A normal `exit` runs
 /// CUDA/NVENC teardown while the encoder thread is still active, which can
 /// hang. A second Ctrl-C, or a stuck cleanup, exits immediately.
+/// Stylus device the raw pen reader streams on the tablet, for cleanup on Ctrl-C.
+static RAW_PEN_DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn install_exit_handler(adb: Option<adb::Adb>, port: u16, keep_app: bool) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -215,6 +221,10 @@ fn install_exit_handler(adb: Option<adb::Adb>, port: u16, keep_app: bool) -> Res
             adb.remove_reverse(port);
             if !keep_app {
                 adb.stop_app();
+            }
+            // _exit skips RawPen's Drop; end the remote stylus reader here.
+            if let Some(dev) = RAW_PEN_DEVICE.get() {
+                adb.kill_remote_cat(dev);
             }
         }
         unsafe { libc::_exit(0) };

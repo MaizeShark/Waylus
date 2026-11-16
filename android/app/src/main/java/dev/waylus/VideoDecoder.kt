@@ -111,6 +111,7 @@ class VideoDecoder(
             c.setCallback(callback, handler)
             c.setOnFrameRenderedListener({ _, ptsUs, nanoTime -> frameRendered(ptsUs, nanoTime) }, handler)
             if (tweaks != 0) applyVendorTweaks(format)
+            applyDebugParams(format)
             c.configure(format, s, null, 0)
             if (android.os.Build.VERSION.SDK_INT >= 31 && !loggedVendorParams) {
                 loggedVendorParams = true
@@ -138,6 +139,25 @@ class VideoDecoder(
             format.setInteger("vendor.mtk.vdec.cpu.boost.mode.value", 1)
         }
         Log.i(TAG, "vendor tweaks enabled: $tweaks")
+    }
+
+    /**
+     * Developer hook for decoder experiments, not a feature:
+     * `adb shell setprop debug.waylus.vdec "key=int;key=int"` sets those integer keys on the
+     * next decoder start. Empty by default.
+     */
+    @android.annotation.SuppressLint("PrivateApi")
+    private fun applyDebugParams(format: MediaFormat) {
+        val v = runCatching {
+            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
+                .invoke(null, "debug.waylus.vdec") as String
+        }.getOrDefault("")
+        for (kv in v.split(';').map { it.trim() }.filter { it.isNotEmpty() }) {
+            val (k, num) = kv.split('=', limit = 2).let { it[0].trim() to it.getOrNull(1)?.trim()?.toIntOrNull() }
+            if (num == null) { Log.w(TAG, "debug.waylus.vdec: bad entry '$kv'"); continue }
+            format.setInteger(k, num)
+            Log.i(TAG, "debug decoder param $k=$num")
+        }
     }
 
     private fun drain(c: MediaCodec) {

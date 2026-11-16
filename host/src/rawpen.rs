@@ -207,11 +207,14 @@ pub type Sink = Arc<Mutex<Option<(Layout, Box<dyn FnMut(PenSample) + Send>)>>>;
 
 pub struct RawPen {
     child: Child,
+    adb: Adb,
+    pub device: String,
 }
 
 impl Drop for RawPen {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        self.adb.kill_remote_cat(&self.device);
     }
 }
 
@@ -230,6 +233,7 @@ pub fn start(adb: &Adb, sink: Sink) -> Result<RawPen> {
         device.pressure.max,
         if device.tilt_x.is_some() { "x+y" } else { "none" }
     );
+    adb.kill_remote_cat(&device.path); // leftovers from crashed or killed sessions
     let mut child = adb
         .command()
         .args(["exec-out", "cat", &device.path])
@@ -288,7 +292,7 @@ pub fn start(adb: &Adb, sink: Sink) -> Result<RawPen> {
         warn!("raw pen stream ended");
     })?;
     debug!("raw pen streaming from {}", device.path);
-    Ok(RawPen { child })
+    Ok(RawPen { child, adb: adb.clone(), device: device.path.clone() })
 }
 
 #[cfg(test)]
