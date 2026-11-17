@@ -108,10 +108,6 @@ impl Aoa {
         }
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.iface.is_some()
-    }
-
     fn serial_matches(&self, d: &DeviceInfo) -> bool {
         self.serial.as_deref().is_none_or(|s| d.serial_number() == Some(s))
     }

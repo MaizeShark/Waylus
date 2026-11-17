@@ -249,6 +249,26 @@ moonlight-common-c (`src/RtpVideoQueue.c`, `src/ControlStream.c`, `src/InputStre
 - Milestone 5: `camera.py` (120 fps) and `pen.py` on 5 GHz and 2.4 GHz, compared with USB
   in the README table, with method and date.
 
+### Findings so far
+
+2026-11-17, milestone 2 (paired, encrypted input channel, `--no-video --no-raw-pen`).
+Tablet on 5260 MHz, RSSI −77…−79 dBm, link 54–81 Mbit/s (a weak spot). Host on the same
+AP, −67 dBm.
+- Pairing (PIN + SPAKE2) works end to end. A wrong PIN is rejected on both sides and
+  the next attempt gets a new PIN. Rust and Kotlin both pass the RFC 9382 test vector.
+- Built-in pen→host statistic (Android event time → host, clocks synced by ping/pong)
+  with injected stylus swipes (`adb shell input stylus swipe`, ~800 samples/s):
+  **USB (AOA) p50 1.6 / p95 2.5 ms, Wi-Fi p50 3.1 / p95 33–72 ms**. This is a proxy;
+  the `pen.py` numbers with real taps are still to do.
+- The tail is the tablet's radio link at this spot, not the protocol. Ping host →
+  tablet at 250 Hz during a session (lock held): p50 3.0 / p95 13 / p99 153 ms;
+  host → AP p99 2.5 ms. The delays come in ~80 ms stall episodes every 2–3 s. Without
+  a session (no low-latency lock) they get worse (p95 90 / p99 233 ms).
+- Android also runs a Wi-Fi scan every 10–40 s at this RSSI (0.5–3.4 s each, looking
+  for a better AP), another source of stalls. A better spot (stronger RSSI) should
+  reduce both; to be checked.
+- DSCP EF (WMM voice) on pings: no clear effect in 3 alternating runs (spikes both ways).
+
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
   the plan is to write the code fresh. Any file that ends up porting their code gets a

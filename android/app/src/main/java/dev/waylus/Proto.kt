@@ -7,7 +7,7 @@ import java.nio.ByteOrder
 
 /** Wire protocol, mirrors host/src/proto.rs. Frames: [u8 type][u32 len LE][payload]. */
 object Proto {
-    const val VERSION = 4
+    const val VERSION = 5
     const val DEFAULT_PORT = 27183
 
     const val HELLO = 1
@@ -22,6 +22,25 @@ object Proto {
     const val LAYOUT = 10
     /** USB accessory only: marks the start of a session in the byte stream. */
     const val SYNC = 11
+    // Wi-Fi only (WifiLink.kt): pairing and authentication, before the session keys exist.
+    const val PAIR_REQUEST = 12
+    const val PAIR_READY = 13
+    const val PAIR_A = 14
+    const val PAIR_B = 15
+    const val PAIR_CONFIRM = 16
+    const val PAIR_DONE = 17
+    const val AUTH_C = 18
+    const val AUTH_H = 19
+    const val AUTH_FIN = 20
+    const val AUTH_FAIL = 21
+    /** Wi-Fi only, sealed UDP: tells the host our UDP address (also a keepalive). */
+    const val UDP_HELLO = 22
+
+    /** AUTH_FAIL reasons (host/src/wifi/mod.rs `fail`). */
+    const val FAIL_UNKNOWN_DEVICE = 1
+    const val FAIL_BAD_MAC = 2
+    const val FAIL_PAIRING_OFF = 3
+    const val FAIL_WRONG_PIN = 4
 
     const val VIDEO_KEY = 1
     const val VIDEO_CONFIG = 2
@@ -112,6 +131,13 @@ object Proto {
         m.put("WAYLUSYN".toByteArray(Charsets.US_ASCII))
         m.putLong(nonce)
         return m.array()
+    }
+
+    /** A framed message with the given payload parts. */
+    fun frame(type: Int, vararg parts: ByteArray): ByteArray {
+        val b = msg(type, parts.sumOf { it.size })
+        for (p in parts) b.put(p)
+        return b.array()
     }
 
     fun requestKeyframe(): ByteArray = msg(REQUEST_KEYFRAME, 0).array()

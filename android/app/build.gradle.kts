@@ -32,3 +32,9 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 }
+
+dependencies {
+    // P-256 point arithmetic for SPAKE2 pairing (Spake2.kt); MIT licence.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    testImplementation("junit:junit:4.13.2")
+}

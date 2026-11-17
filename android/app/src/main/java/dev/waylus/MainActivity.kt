@@ -19,9 +19,17 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.text.InputType
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
+import java.io.IOException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
@@ -32,6 +40,17 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     private lateinit var conn: Connection
     private var port = Proto.DEFAULT_PORT
     private var usingAccessory = false
+    private var usingWifi = false
+    private lateinit var wifiStore: WifiStore
+    private lateinit var wifiPanel: LinearLayout
+    private lateinit var wifiMsg: TextView
+    private lateinit var wifiAddr: EditText
+    private lateinit var pairButton: Button
+    private lateinit var pinRow: LinearLayout
+    private lateinit var pinEdit: EditText
+    private val pinQueue = LinkedBlockingQueue<String>()
+    /** Keeps the pairing result readable for a while instead of the connection status. */
+    @Volatile private var pairNoteUntil = 0L
     private lateinit var decoder: VideoDecoder
     private lateinit var input: InputCapture
     private lateinit var boost: ClockBoost
@@ -110,34 +129,179 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         )
         input = InputCapture({ conn.send(it) }) { videoRect }
         Log.i(TAG, "decoder: $decoderInfo, port $port")
-        startConnection(wantsAccessory(intent))
+        wifiStore = WifiStore(this)
+        WifiPower.init(this)
+        WifiPower.enabled = intent.getBooleanExtra("wifi_lock", true)
+        buildWifiPanel()
+        intent.getStringExtra("host")?.let { wifiStore.address = "$it:$port" }
+        startConnection(pickTransport(intent))
     }
+
+    private enum class Transport { USB, ADB, WIFI }
 
     /**
-     * USB accessory (AOA) when the host asked for it, or when we were opened by the
-     * accessory / a Waylus accessory is attached; otherwise TCP through `adb reverse`.
+     * What the host asked for (started over adb), else the USB accessory when we were
+     * opened by it or it is attached (USB wins whenever a cable is connected), else Wi-Fi.
      */
-    private fun wantsAccessory(i: Intent): Boolean = when (i.getStringExtra("transport")) {
-        "aoa" -> true
-        "tcp" -> false
-        else -> i.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED || Accessory.find(this) != null
+    private fun pickTransport(i: Intent): Transport = when (i.getStringExtra("transport")) {
+        "aoa" -> Transport.USB
+        "tcp" -> Transport.ADB
+        "wifi" -> Transport.WIFI
+        else -> if (i.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED || Accessory.find(this) != null) Transport.USB else Transport.WIFI
     }
 
-    private fun startConnection(accessory: Boolean) {
-        usingAccessory = accessory
-        Log.i(TAG, "transport: ${if (accessory) "USB accessory" else "TCP port $port"}")
-        val opener: () -> Connection.Link? = if (accessory) ({ Accessory.open(applicationContext) }) else Connection.tcp(port)
+    private fun startConnection(t: Transport) {
+        usingAccessory = t == Transport.USB
+        usingWifi = t == Transport.WIFI
+        Log.i(TAG, "transport: $t")
+        val opener: () -> Connection.Link? = when (t) {
+            Transport.USB -> ({ Accessory.open(applicationContext) })
+            Transport.ADB -> Connection.tcp(port)
+            Transport.WIFI -> ::openWifi
+        }
+        if (!usingWifi) runOnUiThread { wifiPanel.visibility = View.GONE }
         conn = Connection(opener, this)
         conn.start()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // The host switched the tablet into accessory mode while we were on TCP.
+        // The host switched the tablet into accessory mode while we were on TCP or Wi-Fi.
         if (intent.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED && !usingAccessory) {
             conn.stop()
-            startConnection(true)
+            startConnection(Transport.USB)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        WifiPower.foreground(true)
+    }
+
+    // --- Wi-Fi ---
+
+    /** Connection opener on the network thread: connect to the paired host, or show the pairing panel. */
+    private var lastWifiStatus = ""
+    private fun openWifi(): Connection.Link? {
+        val host = wifiStore.host()
+        val addr = wifiStore.address
+        if (host == null || addr.isNullOrBlank()) {
+            showWifiPanel(null)
+            Thread.sleep(700)
+            return null
+        }
+        return try {
+            WifiLink.connect(wifiStore, host, WifiLink.parseAddress(addr, port))
+        } catch (e: WifiLink.AuthFailed) {
+            if (e.code == Proto.FAIL_UNKNOWN_DEVICE) {
+                wifiStore.forgetPairing()
+                showWifiPanel("${host.name} no longer knows this tablet. Pair again: run `waylus --wifi --pair` on it.")
+            } else {
+                showWifiPanel("${host.name}: ${e.message}")
+            }
+            Thread.sleep(1000)
+            null
+        } catch (e: IOException) {
+            val msg = "connecting to ${host.name} at $addr… (${e.message ?: e.javaClass.simpleName})"
+            if (msg != lastWifiStatus) Log.i(TAG, msg)
+            lastWifiStatus = msg
+            showWifiPanel(msg)
+            Thread.sleep(700)
+            null
+        }
+    }
+
+    private fun showWifiPanel(msg: String?) = runOnUiThread {
+        if (!usingWifi || conn.connected) return@runOnUiThread
+        val host = wifiStore.host()
+        if (wifiAddr.text.isNullOrBlank()) wifiAddr.setText(wifiStore.address ?: "")
+        if (pinRow.visibility != View.VISIBLE && System.nanoTime() > pairNoteUntil) {
+            wifiMsg.text = msg ?: if (host != null) "Wi-Fi: paired with ${host.name}" else
+                "Wi-Fi: not paired. On the computer run `waylus --wifi --pair`, then enter its address here."
+        }
+        wifiPanel.visibility = View.VISIBLE
+    }
+
+    private fun buildWifiPanel() {
+        val dp = resources.displayMetrics.density
+        wifiMsg = TextView(this).apply { setTextColor(0xFFB0B0B0.toInt()); textSize = 15f; gravity = Gravity.CENTER }
+        wifiAddr = EditText(this).apply {
+            hint = "host address, e.g. 192.168.1.20"
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_DONE
+            setTextColor(Color.WHITE); setHintTextColor(0xFF707070.toInt())
+            minWidth = (320 * dp).toInt()
+        }
+        pairButton = Button(this).apply { text = "Pair with this host"; setOnClickListener { startPairing() } }
+        pinEdit = EditText(this).apply {
+            hint = "PIN"
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER
+            imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_DONE
+            setTextColor(Color.WHITE); setHintTextColor(0xFF707070.toInt())
+            minWidth = (160 * dp).toInt()
+            setOnEditorActionListener { _, _, _ -> submitPin(); true }
+        }
+        pinRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(pinEdit)
+            addView(Button(this@MainActivity).apply { text = "OK"; setOnClickListener { submitPin() } })
+            visibility = View.GONE
+        }
+        wifiPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding((16 * dp).toInt(), (8 * dp).toInt(), (16 * dp).toInt(), (8 * dp).toInt())
+            addView(wifiMsg); addView(wifiAddr); addView(pairButton); addView(pinRow)
+            visibility = View.GONE
+        }
+        root.addView(wifiPanel, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM).apply {
+            bottomMargin = (24 * dp).toInt()
+        })
+    }
+
+    private fun submitPin() {
+        pinQueue.offer(pinEdit.text.toString())
+        pinEdit.setText("")
+        getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(pinEdit.windowToken, 0)
+    }
+
+    private fun startPairing() {
+        val addr = wifiAddr.text.toString().trim()
+        if (addr.isEmpty()) return
+        wifiStore.address = addr
+        pairButton.isEnabled = false
+        wifiMsg.text = "asking $addr to pair…"
+        pinQueue.clear()
+        Thread({
+            val result = try {
+                val name = WifiLink.pair(wifiStore, WifiLink.parseAddress(addr, port)) { hostName ->
+                    runOnUiThread {
+                        wifiMsg.text = "Enter the PIN shown on $hostName"
+                        pinRow.visibility = View.VISIBLE
+                        pinEdit.requestFocus()
+                        getSystemService(InputMethodManager::class.java).showSoftInput(pinEdit, 0)
+                    }
+                    pinQueue.poll(170, TimeUnit.SECONDS)
+                }
+                "Paired with $name. Connecting…"
+            } catch (e: WifiLink.AuthFailed) {
+                when (e.code) {
+                    Proto.FAIL_PAIRING_OFF -> "Pairing is off on the host. Run `waylus --wifi --pair` there."
+                    Proto.FAIL_WRONG_PIN -> "Wrong PIN. Try again; the host shows a new PIN."
+                    else -> "Pairing failed: ${e.message}"
+                }
+            } catch (e: Exception) {
+                "Pairing failed: ${e.message ?: e.javaClass.simpleName}"
+            }
+            pairNoteUntil = System.nanoTime() + 15_000_000_000L
+            runOnUiThread {
+                wifiMsg.text = result
+                pinRow.visibility = View.GONE
+                pairButton.isEnabled = true
+            }
+        }, "waylus-pair").start()
     }
 
     /** Ask for the highest refresh rate at the current resolution (e.g. 120/144 Hz tablets). */
@@ -167,6 +331,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     }
 
     override fun onPause() {
+        WifiPower.foreground(false)
         boost.idle()
         super.onPause()
     }
@@ -212,7 +377,10 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     // --- Connection.Listener (network thread) ---
 
     override fun onConnected() {
-        runOnUiThread { setStatus("Waylus\nconnected") }
+        runOnUiThread {
+            wifiPanel.visibility = View.GONE
+            setStatus("Waylus\nconnected" + if (usingWifi) " (Wi-Fi)" else "")
+        }
     }
 
     override fun hello(): ByteArray {

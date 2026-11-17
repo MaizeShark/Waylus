@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const PROTO_VERSION: u16 = 4;
+pub const PROTO_VERSION: u16 = 5;
 pub const DEFAULT_PORT: u16 = 27183;
 /// Upper bound for a single message, protects against garbage on the wire.
 const MAX_LEN: u32 = 16 * 1024 * 1024;
@@ -25,6 +25,20 @@ pub mod ty {
     pub const LAYOUT: u8 = 10;
     /// AOA only: marks the start of a session in the byte stream (see aoa.rs).
     pub const SYNC: u8 = 11;
+    // Wi-Fi only (wifi/mod.rs): pairing and session handshake, in plaintext before
+    // the session keys exist.
+    pub const PAIR_REQUEST: u8 = 12;
+    pub const PAIR_READY: u8 = 13;
+    pub const PAIR_A: u8 = 14;
+    pub const PAIR_B: u8 = 15;
+    pub const PAIR_CONFIRM: u8 = 16;
+    pub const PAIR_DONE: u8 = 17;
+    pub const AUTH_C: u8 = 18;
+    pub const AUTH_H: u8 = 19;
+    pub const AUTH_FIN: u8 = 20;
+    pub const AUTH_FAIL: u8 = 21;
+    /// Wi-Fi only, sealed UDP: tells the host the tablet's UDP address.
+    pub const UDP_HELLO: u8 = 22;
 }
 
 /// Payload of a SYNC message: this magic followed by the client's u64 session nonce.
@@ -161,6 +175,19 @@ impl Cur<'_> {
     }
 }
 
+/// Reads one framed message as (type, payload), at most `max` bytes of payload.
+pub fn read_frame(r: &mut impl Read, max: u32) -> io::Result<(u8, Vec<u8>)> {
+    let mut hdr = [0u8; 5];
+    r.read_exact(&mut hdr)?;
+    let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap());
+    if len > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("message too large: {len}")));
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf)?;
+    Ok((hdr[0], buf))
+}
+
 /// Reads one framed message. Reuses `buf` for the payload.
 pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
     let mut hdr = [0u8; 5];
@@ -248,7 +275,7 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
 /// Writes one framed message with a single `write_all`. Splitting a message into
 /// several writes made adbd forward it as several small socket writes on the
 /// tablet, where Nagle + delayed ACK held a frame back for up to ~40 ms.
-fn message(w: &mut impl Write, ty: u8, parts: &[&[u8]]) -> io::Result<()> {
+pub fn message(w: &mut impl Write, ty: u8, parts: &[&[u8]]) -> io::Result<()> {
     let len: usize = parts.iter().map(|p| p.len()).sum();
     let mut buf = Vec::with_capacity(5 + len);
     buf.push(ty);

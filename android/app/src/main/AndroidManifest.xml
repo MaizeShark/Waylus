@@ -3,6 +3,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Wi-Fi transport: the low-latency Wi-Fi lock and link info. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-feature android:name="android.hardware.usb.accessory" android:required="false" />
     <!-- Only for the latency measurement overlay (tools/latency). -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />

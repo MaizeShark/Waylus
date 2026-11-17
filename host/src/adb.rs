@@ -101,11 +101,12 @@ impl Adb {
     }
 
     /// `boost_secs`: keep the tablet's CPU clocks up this long after pen/touch input (0 = off).
-    /// `aoa`: connect over the USB accessory instead of the `adb reverse` port.
-    pub fn start_app(&self, port: u16, aoa: bool, boost_secs: u32, boost_threads: u32) -> Result<()> {
-        let transport = if aoa { "aoa" } else { "tcp" };
+    /// `transport`: "aoa" (USB accessory), "tcp" (the `adb reverse` port) or "wifi"
+    /// (connect to `host` on the LAN).
+    pub fn start_app(&self, port: u16, transport: &str, host: Option<&str>, boost_secs: u32, boost_threads: u32) -> Result<()> {
+        let host = host.map(|h| format!(" --es host {h}")).unwrap_or_default();
         self.shell(&format!(
-            "am start -S -n {ACTIVITY} --es transport {transport} --ei port {port} --ei boost_secs {boost_secs} --ei boost_threads {boost_threads}"
+            "am start -S -n {ACTIVITY} --es transport {transport}{host} --ei port {port} --ei boost_secs {boost_secs} --ei boost_threads {boost_threads}"
         ))?;
         Ok(())
     }

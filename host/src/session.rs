@@ -29,11 +29,19 @@ use crate::{
 /// whose firmware reports bogus dpi values; also a typical tablet density).
 const FALLBACK_PX_PER_MM: f32 = 7.95;
 
-/// How the tablet connects.
+/// How the tablet connects. Several can be active at once (USB and Wi-Fi).
 pub enum Transport {
     /// TCP on 127.0.0.1:port, forwarded by `adb reverse`.
     Tcp(u16),
     Aoa(crate::aoa::Aoa),
+    Wifi(crate::wifi::Server),
+}
+
+/// A link from one of the transports. `done` is signalled when its session ended
+/// (AOA reuses one USB pipe, so it must not look for the next session before).
+struct Incoming {
+    link: Link,
+    done: Option<crossbeam_channel::Sender<()>>,
 }
 
 pub struct Opts {
@@ -117,34 +125,93 @@ fn send(w: &Writer, f: impl FnOnce(&mut Box<dyn Write + Send>) -> std::io::Resul
 /// sized after the tablet).
 pub type LazyCapture = Box<dyn Fn(&Hello) -> Result<Capture>>;
 
-pub fn serve(opts: Opts, transport: Transport, mut capture: Option<Capture>, lazy: Option<LazyCapture>) -> Result<()> {
-    let mut next_link: Box<dyn FnMut() -> Result<Link>> = match transport {
-        Transport::Tcp(port) => {
-            let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("bind port {port}"))?;
-            info!("waiting for the tablet on 127.0.0.1:{port} (adb reverse)");
-            Box::new(move || loop {
-                match listener.accept() {
-                    Ok((s, _)) => return Ok(Link::tcp(s)?),
-                    Err(e) => warn!("accept: {e}"),
-                }
-            })
-        }
-        Transport::Aoa(mut aoa) => {
-            if !aoa.is_connected() {
-                aoa.connect(None)?;
+pub fn serve(opts: Opts, transports: Vec<Transport>, mut capture: Option<Capture>, lazy: Option<LazyCapture>) -> Result<()> {
+    let (tx, rx) = crossbeam_channel::unbounded::<Incoming>();
+    for transport in transports {
+        let tx = tx.clone();
+        match transport {
+            Transport::Tcp(port) => {
+                let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("bind port {port}"))?;
+                info!("waiting for the tablet on 127.0.0.1:{port} (adb reverse)");
+                thread::Builder::new().name("accept-adb".into()).spawn(move || {
+                    for s in listener.incoming() {
+                        match s.and_then(Link::tcp) {
+                            Ok(link) => {
+                                if tx.send(Incoming { link, done: None }).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => warn!("accept: {e}"),
+                        }
+                    }
+                })?;
             }
-            info!("waiting for the Waylus app on the USB accessory link");
-            Box::new(move || aoa.next_link())
+            Transport::Aoa(mut aoa) => {
+                info!("waiting for the Waylus app on the USB accessory link");
+                thread::Builder::new().name("accept-aoa".into()).spawn(move || {
+                    loop {
+                        match aoa.next_link() {
+                            Ok(link) => {
+                                let (done, wait) = crossbeam_channel::bounded(1);
+                                if tx.send(Incoming { link, done: Some(done) }).is_err() {
+                                    break;
+                                }
+                                let _ = wait.recv();
+                            }
+                            Err(e) => {
+                                warn!("USB accessory: {e:#}");
+                                thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                    }
+                })?;
+            }
+            Transport::Wifi(server) => {
+                thread::Builder::new().name("accept-wifi".into()).spawn(move || {
+                    while let Ok(link) = server.next_link() {
+                        if tx.send(Incoming { link, done: None }).is_err() {
+                            break;
+                        }
+                    }
+                })?;
+            }
         }
-    };
+    }
+    drop(tx);
+
+    // A new link ends the running session: it is the same tablet reconnecting (faster
+    // than waiting for the idle timeout) or switching transport.
+    type Closer = Arc<dyn Fn() + Send + Sync>;
+    let current: Arc<Mutex<Option<Closer>>> = Default::default();
+    let (next_tx, next_rx) = crossbeam_channel::unbounded::<Incoming>();
+    {
+        let current = current.clone();
+        thread::Builder::new().name("preempt".into()).spawn(move || {
+            for inc in rx {
+                if let Some(close) = current.lock().unwrap().take() {
+                    info!("new connection from the tablet; ending the current session");
+                    close();
+                }
+                if next_tx.send(inc).is_err() {
+                    break;
+                }
+            }
+        })?;
+    }
+
     let mut inputs: Option<(Arc<Mutex<Pen>>, Touch)> = None;
     let mut last_frame: Option<Frame> = None;
     loop {
-        let link = next_link()?;
+        let Incoming { link, done } = next_rx.recv().context("no transport left")?;
+        *current.lock().unwrap() = Some(link.close.clone());
         info!("tablet connected");
         match session(&opts, &mut capture, lazy.as_deref(), link, &mut inputs, &mut last_frame) {
             Ok(()) => info!("tablet disconnected"),
             Err(e) => warn!("session ended: {e:#}"),
+        }
+        current.lock().unwrap().take();
+        if let Some(d) = done {
+            let _ = d.send(());
         }
         if let Some(sink) = &opts.raw_pen {
             sink.lock().unwrap().take();

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Waylus: use an Android tablet as a low-latency pen display on Wayland, over USB.
+//! Waylus: use an Android tablet as a low-latency pen display on Wayland, over USB or Wi-Fi.
 
 mod adb;
 mod aoa;
@@ -17,6 +17,7 @@ mod rawpen;
 mod session;
 mod slot;
 mod vaapi;
+mod wifi;
 
 use std::path::PathBuf;
 
@@ -90,6 +91,24 @@ struct Args {
     /// Don't read the stylus device directly over adb; use Android's pen events.
     #[arg(long)]
     no_raw_pen: bool,
+    /// Also accept the tablet over Wi-Fi (LAN). Only paired tablets can connect; USB
+    /// is still used when the tablet is plugged in.
+    #[arg(long)]
+    wifi: bool,
+    /// Allow one tablet to pair over Wi-Fi (for 5 minutes): the host shows a PIN that
+    /// you enter on the tablet.
+    #[arg(long, requires = "wifi")]
+    pair: bool,
+    /// Forget paired Wi-Fi tablets (a name, an id prefix, or "all") and exit.
+    #[arg(long, value_name = "NAME")]
+    unpair: Option<String>,
+    /// Wi-Fi: address to listen on (repeatable; default: every private IPv4 address).
+    #[arg(long, value_name = "ADDR", requires = "wifi")]
+    listen: Vec<std::net::IpAddr>,
+    /// Don't use USB as a transport (with --wifi; adb, if present, is still used to
+    /// install/start the app and read the raw pen).
+    #[arg(long, requires = "wifi")]
+    no_usb: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
@@ -123,11 +142,19 @@ fn main() -> Result<()> {
         },
         std::sync::atomic::Ordering::Relaxed,
     );
-    let mut aoa_mode = args.transport == TransportArg::Aoa;
+    if let Some(which) = &args.unpair {
+        return wifi::unpair(which);
+    }
+    let usb = !args.no_usb;
+    let mut aoa_mode = usb && args.transport == TransportArg::Aoa;
     let mut adb = (!args.no_adb).then(|| adb::Adb::new(args.serial.clone()));
     let mut serial = args.serial.clone();
-    if aoa_mode && adb.as_ref().is_some_and(|a| !a.is_available()) {
-        info!("no adb device; the app must be installed already and is started by the accessory");
+    if (aoa_mode || args.wifi) && adb.as_ref().is_some_and(|a| !a.is_available()) {
+        if args.wifi {
+            info!("no adb device; the app must be installed already");
+        } else {
+            info!("no adb device; the app must be installed already and is started by the accessory");
+        }
         adb = None;
     }
     if let Some(adb) = &adb {
@@ -144,12 +171,18 @@ fn main() -> Result<()> {
     let mut aoa = aoa_mode.then(|| aoa::Aoa::new(serial.clone()));
     if let Some(a) = aoa.as_mut() {
         // Switch now: the tablet re-enumerates, so adb drops out for a moment.
-        // With adb at hand, fall back to it rather than wait for an AOA tablet forever.
-        match a.connect(adb.is_some().then_some(std::time::Duration::from_secs(5))) {
+        // With adb (or Wi-Fi) at hand, fall back rather than wait for an AOA tablet forever.
+        let give_up = (adb.is_some() || args.wifi).then_some(std::time::Duration::from_secs(if adb.is_some() { 5 } else { 2 }));
+        match a.connect(give_up) {
             Ok(()) => {
                 if let Some(adb) = &adb {
                     adb.wait_for_device()?;
                 }
+            }
+            Err(e) if adb.is_none() => {
+                info!("no tablet on USB ({e:#}); Wi-Fi only");
+                aoa = None;
+                aoa_mode = false;
             }
             Err(e) => {
                 warn!("USB accessory mode unavailable ({e:#}); using adb instead");
@@ -158,11 +191,21 @@ fn main() -> Result<()> {
             }
         }
     }
-    if !aoa_mode && let Some(adb) = &adb {
+    // adb reverse when USB is wanted but AOA isn't available (needs an adb device).
+    let adb_tcp = usb && !aoa_mode && adb.is_some();
+    if adb_tcp && let Some(adb) = &adb {
         adb.reverse(args.port)?;
     }
+    let wifi = if args.wifi {
+        Some(wifi::Server::start(wifi::Opts { port: args.port, listen: args.listen.clone(), pair: args.pair })?)
+    } else {
+        None
+    };
+    if !aoa_mode && !adb_tcp && wifi.is_none() {
+        bail!("no transport: no tablet on USB and Wi-Fi is off (use --wifi)");
+    }
 
-    install_exit_handler(adb.clone(), args.port, args.keep_app)?;
+    install_exit_handler(adb.clone(), adb_tcp.then_some(args.port), args.keep_app)?;
 
     let pen_sink: rawpen::Sink = Default::default();
     let _raw_pen = match &adb {
@@ -241,7 +284,13 @@ fn main() -> Result<()> {
     let output_size = output.as_ref().map(|o| (o.mode_w, o.mode_h)).unwrap_or((1920, 1080));
 
     if let Some(adb) = &adb {
-        adb.start_app(args.port, aoa_mode, args.boost, args.boost_threads)?;
+        let wifi_host = wifi.as_ref().and_then(|w| w.addrs.first()).map(|a| a.ip().to_string());
+        match (aoa_mode, adb_tcp, &wifi_host) {
+            (true, _, _) => adb.start_app(args.port, "aoa", None, args.boost, args.boost_threads)?,
+            (_, true, _) => adb.start_app(args.port, "tcp", None, args.boost, args.boost_threads)?,
+            (_, _, Some(h)) => adb.start_app(args.port, "wifi", Some(h), args.boost, args.boost_threads)?,
+            _ => {}
+        }
     }
 
     session::serve(
@@ -262,9 +311,18 @@ fn main() -> Result<()> {
             raw_pen: _raw_pen.as_ref().map(|_| pen_sink.clone()),
             output_size,
         },
-        match aoa {
-            Some(a) => session::Transport::Aoa(a),
-            None => session::Transport::Tcp(args.port),
+        {
+            let mut t = Vec::new();
+            if let Some(a) = aoa {
+                t.push(session::Transport::Aoa(a));
+            }
+            if adb_tcp {
+                t.push(session::Transport::Tcp(args.port));
+            }
+            if let Some(w) = wifi {
+                t.push(session::Transport::Wifi(w));
+            }
+            t
         },
         capture,
         lazy,
@@ -277,7 +335,7 @@ fn main() -> Result<()> {
 /// Stylus device the raw pen reader streams on the tablet, for cleanup on Ctrl-C.
 static RAW_PEN_DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-fn install_exit_handler(adb: Option<adb::Adb>, port: u16, keep_app: bool) -> Result<()> {
+fn install_exit_handler(adb: Option<adb::Adb>, reverse_port: Option<u16>, keep_app: bool) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static STOPPING: AtomicBool = AtomicBool::new(false);
     ctrlc::set_handler(move || {
@@ -290,7 +348,9 @@ fn install_exit_handler(adb: Option<adb::Adb>, port: u16, keep_app: bool) -> Res
             unsafe { libc::_exit(1) };
         });
         if let Some(adb) = &adb {
-            adb.remove_reverse(port);
+            if let Some(port) = reverse_port {
+                adb.remove_reverse(port);
+            }
             if !keep_app {
                 adb.stop_app();
             }
