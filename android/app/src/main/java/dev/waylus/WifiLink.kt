@@ -39,6 +39,8 @@ class WifiLink private constructor(
     class AuthFailed(val code: Int, msg: String) : IOException(msg)
 
     private val chunks = LinkedBlockingQueue<ByteArray>()
+    private val assembler: VideoAssembler
+    private val framesSkipped = java.util.concurrent.atomic.AtomicInteger()
     @Volatile private var closed = false
     private val tcpOut = socket.getOutputStream()
     private val txTcp = WifiCrypto.Aead(keys.c2h)
@@ -54,12 +56,24 @@ class WifiLink private constructor(
     init {
         val rxTcp = WifiCrypto.Aead(keys.h2c)
         val rxUdp = WifiCrypto.Aead(keys.h2c)
+        assembler = VideoAssembler(
+            WifiCrypto.Aead(keys.h2c),
+            deliver = { payload, _ -> chunks.put(Proto.frame(Proto.VIDEO, payload)) },
+            lost = { first, last ->
+                sendUdp(listOf(Proto.wifiFrameLost(first, last)))
+                chunks.put(Proto.frame(Proto.FRAME_LOST))
+            },
+        )
         Thread({ tcpLoop(rxTcp) }, "waylus-wifi-tcp").apply { isDaemon = true; start() }
         Thread({ udpLoop(rxUdp) }, "waylus-wifi-udp").apply { isDaemon = true; start() }
         // Tell the host where we are; repeated so a lost one doesn't matter, then as keepalive.
         val hello = Proto.frame(Proto.UDP_HELLO)
         for (ms in longArrayOf(0, 50, 200)) timer.schedule({ sendUdp(listOf(hello)) }, ms, TimeUnit.MILLISECONDS)
-        timer.scheduleAtFixedRate({ sendUdp(listOf(hello)) }, 1000, 1000, TimeUnit.MILLISECONDS)
+        timer.scheduleAtFixedRate({
+            val (freq, rssi, link) = WifiPower.info()
+            val skipped = framesSkipped.getAndSet(0)
+            sendUdp(listOf(hello, Proto.wifiStats(assembler.takeStats(), skipped, freq, rssi, link)))
+        }, 1000, 1000, TimeUnit.MILLISECONDS)
         WifiPower.streaming(true)
     }
 
@@ -95,6 +109,7 @@ class WifiLink private constructor(
             val len = ByteBuffer.wrap(all, i + 1, 4).order(ByteOrder.LITTLE_ENDIAN).getInt()
             val end = i + 5 + len
             if (len < 0 || end > all.size) break
+            if (t == Proto.FRAME_SKIPPED) framesSkipped.incrementAndGet()
             if (t in UDP_TYPES) udpMsgs.add(all.copyOfRange(i, end)) else tcp.write(all, i, end - i)
             i = end
         }
@@ -200,12 +215,17 @@ class WifiLink private constructor(
                 p.setLength(buf.size)
                 udp.receive(p)
             } catch (_: SocketTimeoutException) {
+                assembler.tick(System.nanoTime())
                 continue
             } catch (e: IOException) {
                 if (!closed) Log.i(TAG, "Wi-Fi UDP: $e")
                 break
             }
             val n = p.length
+            if (buf[0] == VideoAssembler.KIND_VIDEO) {
+                assembler.add(buf, n, System.nanoTime())
+                continue
+            }
             if (n < UDP_HDR + WifiCrypto.TAG_LEN || buf[0] != KIND_CONTROL) { rejected++; continue }
             val seq = ByteBuffer.wrap(buf, 4, 8).order(ByteOrder.LITTLE_ENDIAN).getLong()
             val plain = try {
@@ -256,7 +276,10 @@ class WifiLink private constructor(
         private val REPEAT_MS = longArrayOf(5, 15)
         /** DSCP EF: WMM voice access category. */
         private const val TOS_EF = 46 shl 2
-        private val UDP_TYPES = setOf(Proto.PEN, Proto.TOUCH, Proto.FRAME_SHOWN, Proto.PONG, Proto.REQUEST_KEYFRAME)
+        private val UDP_TYPES = setOf(
+            Proto.PEN, Proto.TOUCH, Proto.FRAME_SHOWN, Proto.PONG, Proto.REQUEST_KEYFRAME,
+            Proto.FRAME_SKIPPED, Proto.WIFI_FRAME_LOST, Proto.WIFI_STATS,
+        )
         private const val PAIR_AAD = "waylus pairing v1"
 
         fun parseAddress(a: String, defaultPort: Int): InetSocketAddress {
@@ -313,7 +336,7 @@ class WifiLink private constructor(
                 val u = DatagramSocket()
                 u.trafficClass = TOS_EF
                 u.receiveBufferSize = 4 shl 20
-                u.soTimeout = 500
+                u.soTimeout = 20 // also the tick for resolving stalled frames
                 u.connect(InetSocketAddress(s.inetAddress, addr.port))
                 Log.i(TAG, "Wi-Fi: authenticated with ${host.name} at $addr (UDP rcvbuf ${u.receiveBufferSize})")
                 return WifiLink(s, u, keys)
@@ -370,7 +393,17 @@ object WifiPower {
     fun init(ctx: Context) {
         if (lock != null) return
         val wm = ctx.applicationContext.getSystemService(WifiManager::class.java)
+        wifi = wm
         lock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "waylus").apply { setReferenceCounted(false) }
+    }
+
+    private var wifi: WifiManager? = null
+
+    /** (frequency MHz, RSSI dBm, link speed Mbit/s) of the current Wi-Fi connection. */
+    @Suppress("DEPRECATION")
+    fun info(): Triple<Int, Int, Int> {
+        val i = runCatching { wifi?.connectionInfo }.getOrNull() ?: return Triple(0, 0, 0)
+        return Triple(i.frequency, i.rssi, i.linkSpeed)
     }
 
     @Synchronized fun streaming(on: Boolean) { streaming = on; update() }

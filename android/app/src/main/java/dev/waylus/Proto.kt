@@ -35,6 +35,14 @@ object Proto {
     const val AUTH_FAIL = 21
     /** Wi-Fi only, sealed UDP: tells the host our UDP address (also a keepalive). */
     const val UDP_HELLO = 22
+    /** Local only (WifiLink → Connection): frames were lost on the network. */
+    const val FRAME_LOST = 23
+    /** A received frame was dropped while the decoder waits for a keyframe. */
+    const val FRAME_SKIPPED = 24
+    /** Wi-Fi: frame numbers first..last could not be reassembled. */
+    const val WIFI_FRAME_LOST = 25
+    /** Wi-Fi: reception statistics, once per second. */
+    const val WIFI_STATS = 26
 
     /** AUTH_FAIL reasons (host/src/wifi/mod.rs `fail`). */
     const val FAIL_UNKNOWN_DEVICE = 1
@@ -137,6 +145,20 @@ object Proto {
     fun frame(type: Int, vararg parts: ByteArray): ByteArray {
         val b = msg(type, parts.sumOf { it.size })
         for (p in parts) b.put(p)
+        return b.array()
+    }
+
+    fun frameSkipped(captureNs: Long): ByteArray = msg(FRAME_SKIPPED, 8).putLong(captureNs).array()
+
+    fun wifiFrameLost(first: Long, last: Long): ByteArray = msg(WIFI_FRAME_LOST, 8).putInt(first.toInt()).putInt(last.toInt()).array()
+
+    /** stats: VideoAssembler.takeStats() (9 values); see host proto::WifiStats for the order. */
+    fun wifiStats(stats: IntArray, skipped: Int, freqMhz: Int, rssi: Int, linkMbps: Int): ByteArray {
+        val b = msg(WIFI_STATS, 10 * 4 + 6)
+        for (i in 0 until 6) b.putInt(stats[i])
+        b.putInt(skipped)
+        for (i in 6 until 9) b.putInt(stats[i])
+        b.putShort(freqMhz.toShort()); b.putShort(rssi.toShort()); b.putShort(linkMbps.toShort())
         return b.array()
     }
 

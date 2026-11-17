@@ -19,7 +19,6 @@ pub const TAG_LEN: usize = 16;
 pub mod stream {
     pub const TCP: u8 = b'T';
     pub const UDP: u8 = b'U';
-    #[allow(dead_code)] // video encryption, milestone 3
     pub const VIDEO: u8 = b'V';
 }
 

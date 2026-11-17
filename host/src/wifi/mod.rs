@@ -12,6 +12,7 @@
 mod crypto;
 pub mod spake2;
 mod store;
+mod video;
 
 use std::{
     io::{self, Read, Write},
@@ -60,11 +61,14 @@ mod kind {
 }
 const UDP_HDR: usize = 12;
 
-/// DSCP EF (46): WMM voice access category (RFC 8325), for input and its feedback.
-const TOS_EF: u32 = 46 << 2;
+/// DSCP AF41 (34): WMM video access category (RFC 8325), for video and pings. The
+/// tablet tags its input EF (voice).
+const TOS_AF41: u32 = 34 << 2;
 
 pub struct Opts {
     pub port: u16,
+    /// Video FEC parity, percent of data shards (at least 2 parity shards per block).
+    pub fec_percent: usize,
     /// Addresses to listen on; empty = every private IPv4 address of this machine.
     pub listen: Vec<IpAddr>,
     pub pair: bool,
@@ -97,6 +101,8 @@ struct UdpSession {
     last_pen: AtomicU64,
     last_touch: AtomicU64,
     rejected: AtomicU64,
+    /// Frame numbers of recent video frames, shared with the video sender.
+    frames: video::FrameMap,
 }
 
 type Chunk = Result<Vec<u8>, io::ErrorKind>;
@@ -115,13 +121,15 @@ impl Server {
             bail!("no LAN address to listen on (no private IPv4 address found; use --listen)");
         }
         let (tx, rx) = crossbeam_channel::unbounded();
+        let fec = opts.fec_percent;
         let mut addrs = Vec::new();
         for ip in ips {
             let addr = SocketAddr::new(ip, opts.port);
             let listener = TcpListener::bind(addr).with_context(|| format!("bind TCP {addr}"))?;
             let udp = UdpSocket::bind(addr).with_context(|| format!("bind UDP {addr}"))?;
             udp.set_read_timeout(Some(Duration::from_millis(200)))?;
-            set_tos(&udp, TOS_EF);
+            set_tos(&udp, TOS_AF41);
+            set_sndbuf(&udp, 4 << 20);
             let hub = Arc::new(Hub { udp, current: Mutex::new(None) });
             {
                 let hub = hub.clone();
@@ -140,7 +148,7 @@ impl Server {
                     let (tx, store, pairing, hub) = (tx.clone(), store.clone(), pairing.clone(), hub.clone());
                     let _ = thread::Builder::new().name("wifi-handshake".into()).spawn(move || {
                         let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                        match handshake(s, &store, &pairing, &hub) {
+                        match handshake(s, &store, &pairing, &hub, fec) {
                             Ok(Some(link)) => {
                                 let _ = tx.send(link);
                             }
@@ -216,6 +224,15 @@ fn set_tos<S: std::os::fd::AsRawFd>(s: &S, tos: u32) {
     }
 }
 
+fn set_sndbuf<S: std::os::fd::AsRawFd>(s: &S, bytes: i32) {
+    let r = unsafe {
+        libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, &bytes as *const _ as *const libc::c_void, 4)
+    };
+    if r != 0 {
+        debug!("SO_SNDBUF: {}", io::Error::last_os_error());
+    }
+}
+
 fn hostname() -> String {
     let mut buf = [0u8; 256];
     let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
@@ -232,13 +249,13 @@ fn send_fail(s: &mut TcpStream, code: u8, msg: &str) {
 
 /// Runs pairing or authentication on a new TCP connection. Returns a link for an
 /// authenticated session, None after pairing (the tablet then reconnects).
-fn handshake(mut s: TcpStream, store: &Mutex<Store>, pairing: &Mutex<Pairing>, hub: &Arc<Hub>) -> Result<Option<Link>> {
+fn handshake(mut s: TcpStream, store: &Mutex<Store>, pairing: &Mutex<Pairing>, hub: &Arc<Hub>, fec: usize) -> Result<Option<Link>> {
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (t, payload) = proto::read_frame(&mut s, HANDSHAKE_MAX)?;
     match t {
         ty::PAIR_REQUEST => pair(s, &payload, store, pairing).map(|()| None),
-        ty::AUTH_C => auth(s, &payload, store, hub).map(Some),
+        ty::AUTH_C => auth(s, &payload, store, hub, fec).map(Some),
         other => {
             send_fail(&mut s, fail::PROTOCOL, "expected pairing or authentication");
             bail!("unexpected first message {other}")
@@ -314,7 +331,7 @@ fn pair(mut s: TcpStream, req: &[u8], store: &Mutex<Store>, pairing: &Mutex<Pair
     Ok(())
 }
 
-fn auth(mut s: TcpStream, hello: &[u8], store: &Mutex<Store>, hub: &Arc<Hub>) -> Result<Link> {
+fn auth(mut s: TcpStream, hello: &[u8], store: &Mutex<Store>, hub: &Arc<Hub>, fec: usize) -> Result<Link> {
     if hello.len() != 16 + 32 + 65 {
         send_fail(&mut s, fail::PROTOCOL, "bad AUTH_C");
         bail!("bad AUTH_C length {}", hello.len());
@@ -346,10 +363,10 @@ fn auth(mut s: TcpStream, hello: &[u8], store: &Mutex<Store>, hub: &Arc<Hub>) ->
     }
     let keys = crypto::session_keys(shared.raw_secret_bytes(), &pair_key, &th);
     info!("Wi-Fi: '{name}' authenticated from {}", s.peer_addr()?);
-    Ok(make_link(s, keys, hub)?)
+    Ok(make_link(s, keys, hub, fec)?)
 }
 
-fn make_link(s: TcpStream, keys: crypto::SessionKeys, hub: &Arc<Hub>) -> io::Result<Link> {
+fn make_link(s: TcpStream, keys: crypto::SessionKeys, hub: &Arc<Hub>, fec: usize) -> io::Result<Link> {
     // Most traffic is UDP, so TCP may stay quiet for long; idleness is judged on both
     // together by WifiReader. The read ends when the link is closed (shutdown).
     s.set_read_timeout(None)?;
@@ -363,6 +380,7 @@ fn make_link(s: TcpStream, keys: crypto::SessionKeys, hub: &Arc<Hub>) -> io::Res
         last_pen: AtomicU64::new(0),
         last_touch: AtomicU64::new(0),
         rejected: AtomicU64::new(0),
+        frames: Default::default(),
     });
     // The newest session takes over UDP; an older one is about to be closed.
     *hub.current.lock().unwrap() = Some(udp.clone());
@@ -391,6 +409,7 @@ fn make_link(s: TcpStream, keys: crypto::SessionKeys, hub: &Arc<Hub>) -> io::Res
     let closed = Arc::new(AtomicBool::new(false));
     let (hub_c, udp_c, closed_c) = (hub.clone(), udp.clone(), closed.clone());
     let writer = WifiWriter {
+        video: video::Sender::new(fec, udp.frames.clone()),
         tcp: s,
         tx: Aead::new(&keys.h2c),
         tcp_ctr: 0,
@@ -488,6 +507,19 @@ fn dedup_input(sess: &UdpSession, body: &[u8]) -> Vec<u8> {
         let msg = &body[i..end];
         let keep = match t {
             ty::UDP_HELLO => false,
+            ty::WIFI_FRAME_LOST if len >= 8 => {
+                let first = u32::from_le_bytes(msg[5..9].try_into().unwrap());
+                let last = u32::from_le_bytes(msg[9..13].try_into().unwrap());
+                let frames = sess.frames.lock().unwrap();
+                // The newest of the lost frames we still know about.
+                if let Some(&(_, cap)) = frames.iter().rev().find(|(f, _)| *f >= first && *f <= last) {
+                    let n = last.wrapping_sub(first).wrapping_add(1);
+                    out.extend_from_slice(&[ty::FRAME_LOST, 12, 0, 0, 0]);
+                    out.extend_from_slice(&cap.to_le_bytes());
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+                false
+            }
             ty::PEN | ty::TOUCH if len >= 8 => {
                 let ts = u64::from_le_bytes(msg[5..13].try_into().unwrap());
                 let last = if t == ty::PEN { &sess.last_pen } else { &sess.last_touch };
@@ -538,6 +570,7 @@ impl Read for WifiReader {
 }
 
 struct WifiWriter {
+    video: video::Sender,
     tcp: TcpStream,
     tx: Aead,
     tcp_ctr: u64,
@@ -587,6 +620,15 @@ impl WifiWriter {
     fn route(&mut self, msg: &[u8]) -> io::Result<()> {
         match msg[0] {
             ty::PING => self.send_udp(msg),
+            // Codec config must not get lost: TCP. Frames: UDP with FEC.
+            ty::VIDEO if msg.len() >= 14 && msg[13] & proto::video_flags::CONFIG == 0 => {
+                // Before the tablet's UDP hello the frame can't be sent; the tablet asks for
+                // a keyframe once it is ready.
+                if let Some(peer) = *self.session.peer.lock().unwrap() {
+                    self.video.send(&self.hub.udp, peer, &self.tx, &msg[5..]);
+                }
+                Ok(())
+            }
             _ => self.send_tcp(msg),
         }
     }
@@ -638,6 +680,7 @@ mod tests {
             last_pen: AtomicU64::new(0),
             last_touch: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            frames: Default::default(),
         };
         let pen = |t: u64| frame(ty::PEN, &[&t.to_le_bytes()[..], &[0u8; 12]].concat());
         let d1 = [pen(1), pen(2), frame(ty::PONG, &[0; 16])].concat();

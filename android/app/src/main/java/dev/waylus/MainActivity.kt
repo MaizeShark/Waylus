@@ -126,6 +126,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
                 }
             },
             onNeedKeyframe = { conn.send(Proto.requestKeyframe()) },
+            onSkipped = { conn.send(Proto.frameSkipped(it)) },
         )
         input = InputCapture({ conn.send(it) }) { videoRect }
         Log.i(TAG, "decoder: $decoderInfo, port $port")
@@ -133,6 +134,13 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         WifiPower.init(this)
         WifiPower.enabled = intent.getBooleanExtra("wifi_lock", true)
         buildWifiPanel()
+        if (intent.getBooleanExtra("bench_crypto", false)) {
+            Thread({
+                WifiCrypto.bench()
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+                WifiCrypto.bench()
+            }, "waylus-bench").start()
+        }
         intent.getStringExtra("host")?.let { wifiStore.address = "$it:$port" }
         startConnection(pickTransport(intent))
     }
@@ -432,6 +440,10 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
 
     override fun onVideo(captureNs: Long, flags: Int, data: ByteArray, offset: Int, recvNs: Long) {
         decoder.submit(captureNs, flags, data, offset, recvNs)
+    }
+
+    override fun onVideoLost() {
+        decoder.dropUntilKey()
     }
 
     // --- SurfaceHolder.Callback ---

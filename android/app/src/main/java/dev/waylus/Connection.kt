@@ -26,6 +26,8 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
         /** flags: Proto.TWEAK_* bits, opt-in vendor-specific decoder tweaks. */
         fun onConfig(codec: Int, width: Int, height: Int, flags: Int)
         fun onVideo(captureNs: Long, flags: Int, data: ByteArray, offset: Int, recvNs: Long)
+        /** Wi-Fi: frames were lost; drop frames until the next keyframe. */
+        fun onVideoLost() {}
     }
 
     /** A byte stream to the host. */
@@ -161,6 +163,7 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
                         val flags = b.get().toInt() and 0xff
                         listener.onVideo(captureNs, flags, m.payload, 9, recvNs)
                     }
+                    Proto.FRAME_LOST -> listener.onVideoLost()
                     else -> Log.d(TAG, "ignoring message ${m.type}")
                 }
             }

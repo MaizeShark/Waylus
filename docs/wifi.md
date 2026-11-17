@@ -269,6 +269,29 @@ AP, −67 dBm.
   reduce both; to be checked.
 - DSCP EF (WMM voice) on pings: no clear effect in 3 alternating runs (spikes both ways).
 
+2026-11-17, milestone 3 (video over UDP, FEC, loss feedback), 1080p60 at 20 Mbit/s,
+NVENC. Tablet first on 5680 MHz −79 dBm (39–52 Mbit/s), later 5260 MHz −72 dBm
+(263–351 Mbit/s):
+- Host per frame: AES-GCM seal + RS parity 0.16–0.22 ms, sending 36 datagrams
+  0.2–0.3 ms. Tablet: reassembly + decrypt 0.5–0.6 ms per frame without loss.
+- A frame completes as soon as its data shards are in, so parity costs no latency
+  without loss. Spread first → last shard of a 51 KB frame: 7 ms at ~45 Mbit/s,
+  4–5 ms at ~300 Mbit/s.
+- Built-in stats, no loss, weak link: capture→shown p50 38–40 / p95 51 ms
+  (USB in the same session setup: 25 / 28 ms).
+- Injected loss (`WAYLUS_TEST_DROP`, test only): at 3 % of shards, FEC recovered all
+  of them (~210 shards in ~144 frames per 5 s, no frame lost, no keyframe). At 10 %,
+  ~650 shards recovered per 5 s, 11–14 frames lost, each answered by one forced IDR
+  with ~1 frame skipped before it. No stalls (48–53 fps, capture→shown p95 54–60 ms).
+  RS reconstruction in Kotlin adds ~1–1.5 ms to frames that need it.
+- Crypto cost (`--ez bench_crypto true`, 41 KB frame, MT8781): AES-GCM open
+  0.19–0.21 ms on a high-priority thread, 0.6–0.8 ms at normal priority (clock bound,
+  little cores). AES-CTR without authentication costs about the same, and
+  ChaCha20-Poly1305 is no faster. In the stream: 0.43–0.51 ms per frame. Host AES-NI:
+  negligible. Decision: **video stays encrypted; no `--insecure-video`**. An
+  authenticated-only mode would save nothing, and dropping authentication would save
+  ≤ 0.5 ms (~1 % of the latency, below what the camera can resolve) for no integrity.
+
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
   the plan is to write the code fresh. Any file that ends up porting their code gets a

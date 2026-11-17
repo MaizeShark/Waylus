@@ -105,6 +105,10 @@ struct Args {
     /// Wi-Fi: address to listen on (repeatable; default: every private IPv4 address).
     #[arg(long, value_name = "ADDR", requires = "wifi")]
     listen: Vec<std::net::IpAddr>,
+    /// Wi-Fi video FEC: parity shards as a percentage of data shards (at least 2 per
+    /// block; 0 = off).
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(0..=100), requires = "wifi")]
+    fec: u8,
     /// Don't use USB as a transport (with --wifi; adb, if present, is still used to
     /// install/start the app and read the raw pen).
     #[arg(long, requires = "wifi")]
@@ -197,7 +201,7 @@ fn main() -> Result<()> {
         adb.reverse(args.port)?;
     }
     let wifi = if args.wifi {
-        Some(wifi::Server::start(wifi::Opts { port: args.port, listen: args.listen.clone(), pair: args.pair })?)
+        Some(wifi::Server::start(wifi::Opts { port: args.port, fec_percent: args.fec as usize, listen: args.listen.clone(), pair: args.pair })?)
     } else {
         None
     };

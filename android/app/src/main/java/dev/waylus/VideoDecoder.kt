@@ -20,6 +20,8 @@ class VideoDecoder(
     private val info: Info,
     private val onShown: (captureNs: Long, recvNs: Long, renderNs: Long, queuedNs: Long, decodedNs: Long) -> Unit,
     private val onNeedKeyframe: () -> Unit,
+    /** A frame was dropped while waiting for a keyframe (releases the host's back-pressure). */
+    private val onSkipped: (captureNs: Long) -> Unit = {},
 ) {
     data class Info(
         val name: String,
@@ -42,6 +44,7 @@ class VideoDecoder(
     private var height = 0
     private var csd: ByteArray? = null
     private var waitingKey = true
+    private var lastKeyRequestNs = 0L
     private val pending = ArrayDeque<Pkt>()
     private val freeInputs = ArrayDeque<Int>()
     private val inflight = HashMap<Long, LongArray>()
@@ -73,11 +76,29 @@ class VideoDecoder(
         }
         val c = codec ?: return@post
         val key = flags and Proto.VIDEO_KEY != 0
-        if (waitingKey && !key) return@post
+        if (waitingKey && !key) {
+            onSkipped(captureNs)
+            // The keyframe request (or the keyframe) may have been lost.
+            if (System.nanoTime() - lastKeyRequestNs > KEY_RETRY_NS) requestKeyframe()
+            return@post
+        }
         waitingKey = false
         val bufFlags = if (key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
         pending.addLast(Pkt(data, off, captureNs / 1000, bufFlags, captureNs, recvNs))
         drain(c)
+    }
+
+    /** Frames were lost on the network: show nothing new until a keyframe arrives. */
+    fun dropUntilKey() = handler.post {
+        if (!waitingKey) {
+            waitingKey = true
+            lastKeyRequestNs = System.nanoTime() // the host already forces one on the loss report
+        }
+    }
+
+    private fun requestKeyframe() {
+        lastKeyRequestNs = System.nanoTime()
+        onNeedKeyframe()
     }
 
     fun release() {
@@ -122,7 +143,7 @@ class VideoDecoder(
             pending.addLast(Pkt(config, 0, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0, 0))
             waitingKey = true
             Log.i(TAG, "decoder ${info.name} started ${width}x$height (low-latency feature: ${info.lowLatency})")
-            onNeedKeyframe()
+            requestKeyframe()
         } catch (e: Exception) {
             Log.e(TAG, "decoder start failed", e)
             release()
@@ -213,6 +234,7 @@ class VideoDecoder(
 
     companion object {
         private const val TAG = "waylus"
+        private const val KEY_RETRY_NS = 300_000_000L
 
         /** Picks the best hardware AVC decoder and reports its limits. */
         fun pick(): Info {

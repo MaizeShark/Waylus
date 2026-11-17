@@ -39,6 +39,15 @@ pub mod ty {
     pub const AUTH_FAIL: u8 = 21;
     /// Wi-Fi only, sealed UDP: tells the host the tablet's UDP address.
     pub const UDP_HELLO: u8 = 22;
+    /// Host-internal (produced by the Wi-Fi layer from WIFI_FRAME_LOST): frames lost on
+    /// the network, newest capture timestamp and count.
+    pub const FRAME_LOST: u8 = 23;
+    /// Tablet: a frame was received but dropped (decoder waiting for a keyframe).
+    pub const FRAME_SKIPPED: u8 = 24;
+    /// Wi-Fi tablet → host: frame numbers first..=last could not be reassembled.
+    pub const WIFI_FRAME_LOST: u8 = 25;
+    /// Wi-Fi tablet → host, once per second: reception statistics (WifiStats).
+    pub const WIFI_STATS: u8 = 26;
 }
 
 /// Payload of a SYNC message: this magic followed by the client's u64 session nonce.
@@ -128,6 +137,27 @@ pub struct TouchPoint {
     pub y: u16,
 }
 
+/// Tablet-side Wi-Fi reception statistics for one interval (counts are deltas).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WifiStats {
+    pub shards_rx: u32,
+    /// Shards the resolved frames consisted of (data + parity).
+    pub shards_expected: u32,
+    pub fec_shards: u32,
+    pub fec_frames: u32,
+    pub frames_ok: u32,
+    pub frames_lost: u32,
+    pub frames_skipped: u32,
+    /// First → last shard of a frame, microseconds.
+    pub spread_avg_us: u32,
+    pub spread_max_us: u32,
+    /// Reassembly (FEC + decrypt) per frame, microseconds.
+    pub assemble_avg_us: u32,
+    pub freq_mhz: u16,
+    pub rssi: i16,
+    pub link_mbps: u16,
+}
+
 #[derive(Debug, Clone)]
 pub enum DeviceMsg {
     Hello(Hello),
@@ -145,6 +175,9 @@ pub enum DeviceMsg {
     Layout(Layout),
     /// The client (re)started a session on the same USB link (AOA), with this nonce.
     Sync(u64),
+    FrameLost { capture_ns: u64, frames: u32 },
+    FrameSkipped { capture_ns: u64 },
+    WifiStats(WifiStats),
     Unknown(u8),
 }
 
@@ -268,6 +301,23 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             c.take::<8>()?;
             DeviceMsg::Sync(u64::from_le_bytes(c.take()?))
         }
+        ty::FRAME_LOST => DeviceMsg::FrameLost { capture_ns: c.u64()?, frames: c.u32()? },
+        ty::FRAME_SKIPPED => DeviceMsg::FrameSkipped { capture_ns: c.u64()? },
+        ty::WIFI_STATS => DeviceMsg::WifiStats(WifiStats {
+            shards_rx: c.u32()?,
+            shards_expected: c.u32()?,
+            fec_shards: c.u32()?,
+            fec_frames: c.u32()?,
+            frames_ok: c.u32()?,
+            frames_lost: c.u32()?,
+            frames_skipped: c.u32()?,
+            spread_avg_us: c.u32()?,
+            spread_max_us: c.u32()?,
+            assemble_avg_us: c.u32()?,
+            freq_mhz: c.u16()?,
+            rssi: c.i16()?,
+            link_mbps: c.u16()?,
+        }),
         other => DeviceMsg::Unknown(other),
     })
 }

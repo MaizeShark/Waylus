@@ -463,6 +463,18 @@ fn session(
                     ids.pop_front();
                 }
             }
+            DeviceMsg::FrameLost { capture_ns, frames } => {
+                // Unrecoverable on the network (Wi-Fi): don't wait for it, recover with an IDR.
+                in_flight.shown(capture_ns);
+                keyframe.store(true, Ordering::SeqCst);
+                stats.idr_requests += 1;
+                debug!("tablet lost {frames} frame(s) up to {capture_ns}; forcing a keyframe");
+            }
+            DeviceMsg::FrameSkipped { capture_ns } => {
+                // Dropped by the tablet while waiting for a keyframe: release back-pressure.
+                in_flight.shown(capture_ns);
+            }
+            DeviceMsg::WifiStats(w) => stats.wifi(&w),
             DeviceMsg::RequestKeyframe => {
                 debug!("tablet requested keyframe");
                 keyframe.store(true, Ordering::SeqCst);
@@ -676,6 +688,12 @@ struct Stats {
     t_decode: Vec<f64>,
     t_display: Vec<f64>,
     last_report: Option<Instant>,
+    /// Wi-Fi: keyframes forced by loss reports, and the tablet's reception stats.
+    idr_requests: u32,
+    wifi: proto::WifiStats,
+    wifi_spread_sum: u64,
+    wifi_assemble_sum: u64,
+    wifi_reports: u32,
 }
 
 impl Stats {
@@ -720,6 +738,22 @@ impl Stats {
         self.t_display.push(ms(decoded, render));
     }
 
+    fn wifi(&mut self, w: &proto::WifiStats) {
+        let a = &mut self.wifi;
+        a.shards_rx += w.shards_rx;
+        a.shards_expected += w.shards_expected;
+        a.fec_shards += w.fec_shards;
+        a.fec_frames += w.fec_frames;
+        a.frames_ok += w.frames_ok;
+        a.frames_lost += w.frames_lost;
+        a.frames_skipped += w.frames_skipped;
+        a.spread_max_us = a.spread_max_us.max(w.spread_max_us);
+        (a.freq_mhz, a.rssi, a.link_mbps) = (w.freq_mhz, w.rssi, w.link_mbps);
+        self.wifi_spread_sum += w.spread_avg_us as u64 * w.frames_ok as u64;
+        self.wifi_assemble_sum += w.assemble_avg_us as u64 * w.frames_ok as u64;
+        self.wifi_reports += 1;
+    }
+
     fn pen(&mut self, s: &proto::PenSample) {
         if let Some(t) = self.to_host(s.t_ns) {
             self.pen_lat.push((now_ns() as i64 - t) as f64 / 1e6);
@@ -753,6 +787,28 @@ impl Stats {
         }
         if !self.h_send.is_empty() {
             info!("stages: capture→sent {} | sent→received {}", fmt(&mut self.h_send), fmt(&mut self.link));
+        }
+        if self.wifi_reports > 0 {
+            let w = std::mem::take(&mut self.wifi);
+            let ok = w.frames_ok.max(1) as f64;
+            let missing = w.shards_expected.saturating_sub(w.shards_rx);
+            info!(
+                "wifi: {} MHz {} dBm {} Mbit/s | shards lost {:.2}% ({missing}/{}) | FEC recovered {} shards in {} frames | frames lost {}, skipped {}, keyframes forced {} | spread avg {:.2} / max {:.1} ms | FEC+decrypt {:.2} ms",
+                w.freq_mhz,
+                w.rssi,
+                w.link_mbps,
+                missing as f64 * 100.0 / w.shards_expected.max(1) as f64,
+                w.shards_expected,
+                w.fec_shards,
+                w.fec_frames,
+                w.frames_lost,
+                w.frames_skipped,
+                self.idr_requests,
+                self.wifi_spread_sum as f64 / ok / 1e3,
+                w.spread_max_us as f64 / 1e3,
+                self.wifi_assemble_sum as f64 / ok / 1e3,
+            );
+            (self.wifi_spread_sum, self.wifi_assemble_sum, self.wifi_reports, self.idr_requests) = (0, 0, 0, 0);
         }
         if !self.t_decode.is_empty() {
             info!(

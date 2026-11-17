@@ -125,4 +125,36 @@ object WifiCrypto {
             return true
         }
     }
+
+    /**
+     * Developer benchmark (`am start ... --ez bench_crypto true`): AES-GCM open of a typical
+     * frame vs AES-CTR (no authentication) vs a plain copy, logged to logcat.
+     */
+    fun bench() {
+        val key = SecretKeySpec(ByteArray(32) { it.toByte() }, "AES")
+        val frame = ByteArray(41 * 1024) { (it * 7).toByte() }
+        val gcm = Cipher.getInstance("AES/GCM/NoPadding")
+        gcm.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(128, ByteArray(12)))
+        val sealed = gcm.doFinal(frame)
+        val ctr = Cipher.getInstance("AES/CTR/NoPadding")
+        fun time(name: String, block: () -> Unit) {
+            repeat(50) { block() }
+            val n = 300
+            val t0 = System.nanoTime()
+            repeat(n) { block() }
+            val per = (System.nanoTime() - t0) / n
+            android.util.Log.i("waylus", "bench $name: %.3f ms/frame (%.0f MB/s)".format(per / 1e6, frame.size * 1e3 / per))
+        }
+        android.util.Log.i("waylus", "bench provider: ${gcm.provider.name} ${gcm.provider.version}, priority ${android.os.Process.getThreadPriority(android.os.Process.myTid())}")
+        time("AES-GCM open") { gcm.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, ByteArray(12))); gcm.doFinal(sealed) }
+        time("AES-CTR") { ctr.init(Cipher.DECRYPT_MODE, key, javax.crypto.spec.IvParameterSpec(ByteArray(16))); ctr.doFinal(frame) }
+        runCatching {
+            val ck = SecretKeySpec(ByteArray(32) { it.toByte() }, "ChaCha20")
+            val cc = Cipher.getInstance("ChaCha20/Poly1305/NoPadding")
+            cc.init(Cipher.ENCRYPT_MODE, ck, javax.crypto.spec.IvParameterSpec(ByteArray(12)))
+            val cs = cc.doFinal(frame)
+            time("ChaCha20-Poly1305 open") { cc.init(Cipher.DECRYPT_MODE, ck, javax.crypto.spec.IvParameterSpec(ByteArray(12))); cc.doFinal(cs) }
+        }.onFailure { android.util.Log.i("waylus", "bench ChaCha20-Poly1305: $it") }
+        time("copy") { frame.copyOf() }
+    }
 }
