@@ -50,7 +50,7 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 ¹ A local build of [Weylus](https://github.com/H-M-H/Weylus): mainly [PR #560](https://github.com/H-M-H/Weylus/pull/560) (PipeWire capture), with PipeWire adjusted to work on NVIDIA (upstream does not run on this setup). Settings: NVENC, Chrome on the tablet, "Lower Latency" on, frame-rate slider at maximum (120 fps), no stretching. Connected through an `adb reverse` tunnel rather than Wi-Fi, which favours it.
 
 ² Filmed with a phone camera (Pixel 7a slow motion, 120 fps) showing [`tools/latency/barcode.html`](tools/latency) on the monitor and its mirror on the tablet in the same shot. `tools/latency/camera.py` decodes both timestamps in every frame; their difference is the lag you actually see between the two screens, including the tablet's own compositing and display panel, with no clock sync involved. Measured 2026-11-17, one clip per tool with the pen idle, same camera position: Waylus at commit 0578fdd (NVENC, AOA transport), Weylus as in ¹; 1080p75 → 60 Hz panel.
-- To reproduce: open `barcode.html` fullscreen on the mirrored monitor, film both screens in slow motion, run `python3 -I tools/latency/camera.py VIDEO --dump 100 --out frame.png` to read off the four corners of each barcode, then `camera.py VIDEO --monitor x,y x,y x,y x,y --tablet x,y x,y x,y x,y`.
+- To reproduce: open `barcode.html` fullscreen on the mirrored monitor, film both screens in slow motion, run `python3 -I tools/latency/camera.py VIDEO --dump 100 --out frame.png` to read off the four corners of each barcode, then `camera.py VIDEO --monitor x,y x,y x,y x,y --tablet x,y x,y x,y x,y`. For a hand-held camera add `--track 100` (the frame the corners came from): every frame's corners are moved by the camera shake, measured by phase correlation against that frame.
 - The rolling shutter often catches the monitor mid-refresh, so the monitor's timestamps are fitted as a line over the camera frames and every readable tablet frame counts.
 - An earlier method, `tools/latency/probe.py`, compared tablet screenshots against an overlay showing Android's expected present time. Its bias differs per tool: it read ~34 ms above the camera for Waylus (it includes the host's own render and compositing) but 21 ms *below* it for Weylus (177 vs 198 ms p50, re-measured the same day), so a screenshot apparently shows a browser client's frames before they reach the glass. It is kept for quick checks of Waylus alone, not for comparisons.
 
@@ -176,7 +176,7 @@ Other flags: `--listen ADDR` (default: every private IPv4 address of the host, n
 **Getting low latency.**
 - Use 5 GHz (or 6 GHz) with a strong signal near the access point; check with `adb shell cmd wifi status` (Frequency, RSSI).
 - At a weak spot (−78 dBm in the measurements below), Android keeps scanning for a better access point, and the link stalls for ~80–200 ms every few seconds. A wired host helps, since otherwise every packet crosses the air twice.
-- On 2.4 GHz, lower the bitrate (e.g. `--bitrate 10`).
+- Avoid 2.4 GHz if you can (measured below: freezes of 0.2–1 s). If you must, use `--bitrate 10`.
 - The raw pen reader (full tilt on the NXTPAPER) needs adb; over Wi-Fi, without adb, the pen uses Android's events.
 
 **Measured so far** (2026-11-17, built-in statistics, NXTPAPER 14 and host both on Wi-Fi via the same AP; [details](docs/wifi.md#findings-so-far)):
@@ -190,6 +190,15 @@ Other flags: `--listen ADDR` (default: every private IPv4 address of the host, n
 Photon to photon over Wi-Fi (camera, see ⁴ above): Waylus **p50 49 / p95 65 ms**, Weylus over the same Wi-Fi 183 / 248 ms, Waylus over USB 45 / 59 ms. What remains of the gap to USB is the link: sent → received p50 ~8.3 ms vs 2.7 over USB. A 51 KB frame takes ~4 ms on air at an effective ~100 Mbit/s, because the host's own Wi-Fi shares the channel. A wired host or a lower `--bitrate` should shrink it; not measured yet.
 
 With the old back-pressure default of 2 frames in flight, Wi-Fi measured 66 / 96 ms. The ~6 ms longer pipeline meant two frames no longer covered it: the encoder was held back ~800 ms/s, reached only 53–56 fps and sent captures that had already aged. Built-in stats, 3 alternating runs each, same conditions: capture → shown p50 38.3 → 32.8 ms, p95 49 → 39 ms, capture → sent 7.4 → 2.3 ms, 55 → 60 fps.
+
+**2.4 GHz** (2026-11-17, camera as in ⁴ with `--track`; tablet on 2462 MHz, 802.11n, −52 dBm, 72–78 Mbit/s; host on 5 GHz at the same access point):
+
+| Photon to photon | p50 | p95 | p99 |
+|---|---|---|---|
+| 20 Mbit/s (default) | 103 ms (112 with freezes) | 282 ms (**807** with freezes) | 331 ms (1065) |
+| `--bitrate 10` | 79 ms (81) | 134 ms (**303**) | 173 ms (461) |
+
+`camera.py` drops values far from the median as chance decodes. Here they clustered at 0.2–1.2 s: real freezes, 15 % of the frames at 20 Mbit/s and 8 % at 10 Mbit/s, so both readings are given. The tablet's loss log shows the cause: the 2.4 GHz link stalls for 100–450 ms at a time and loses bursts of half a frame, more than the parity can repair; each such loss costs a keyframe, which on 2.4 GHz takes long to send. A longer loss timeout didn't help ([details](docs/wifi.md)). Use 5 GHz.
 
 ⁵ Measured 2026-11-17 with `tools/latency/pen.py` as in ³, at commit 841f4e0. Tablet on 5260 MHz, −67 dBm, with the host on the same access point over Wi-Fi. Both runs use the app's pen events (`--no-raw-pen`); with the raw stylus reader, the pen would travel over adb rather than the transport being measured. Over Wi-Fi, one of the 30 taps hit a link stall (132 ms); the other 29 stayed under 16 ms.
 

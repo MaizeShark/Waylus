@@ -103,6 +103,45 @@ def decode(img, sample):
     return ms
 
 
+def shifted(sample, dx, dy, w, h):
+    ys, xs = sample
+    ys, xs = ys + dy, xs + dx
+    if ys.min() < 0 or xs.min() < 0 or ys.max() >= h or xs.max() >= w:
+        return None
+    return ys, xs
+
+
+class Shake:
+    """Hand-held camera: the global shift of each frame relative to a reference frame
+    (the one the corners were read from), by phase correlation on a downscaled image.
+    The desk, bezels and other static objects carry it; it doesn't depend on the
+    barcodes decoding."""
+
+    S = 4  # downscale factor
+
+    def __init__(self, ref):
+        h, w = ref.shape[0] // self.S, ref.shape[1] // self.S
+        self.win = np.outer(np.hanning(h), np.hanning(w)).astype(np.float32)
+        self.F = np.conj(np.fft.rfft2(self._prep(ref)))
+
+    def _prep(self, img):
+        h, w = self.win.shape
+        small = img[: h * self.S, : w * self.S].reshape(h, self.S, w, self.S).mean(axis=(1, 3), dtype=np.float32)
+        return (small - small.mean()) * self.win
+
+    def shift(self, img):
+        """(dx, dy) in full-resolution pixels such that img(x + dx, y + dy) ≈ ref(x, y)."""
+        r = np.fft.rfft2(self._prep(img)) * self.F
+        r /= np.abs(r) + 1e-9
+        c = np.fft.irfft2(r, s=self.win.shape)
+        py, px = np.unravel_index(np.argmax(c), c.shape)
+        if py > c.shape[0] // 2:
+            py -= c.shape[0]
+        if px > c.shape[1] // 2:
+            px -= c.shape[1]
+        return int(px * self.S), int(py * self.S)
+
+
 def quad(args):
     pts = [tuple(float(c) for c in p.split(",")) for p in args]
     if len(pts) != 4:
@@ -151,6 +190,13 @@ def fitted(rows):
     med = statistics.median(lat)
     mad = statistics.median(abs(d - med) for d in lat)
     good = [d for d in lat if abs(d - med) < max(35, 6 * mad)]
+    bad = sorted(d for d in lat if abs(d - med) >= max(35, 6 * mad))
+    if bad:
+        print(f"dropped as outliers: {len(bad)} values, {bad[0]:.0f}..{bad[-1]:.0f} ms "
+              f"(median {statistics.median(bad):.0f}; window {med:.0f} ± {max(35, 6 * mad):.0f} ms)")
+        # Clustered "outliers" are usually real freezes, not chance decodes: show both.
+        print(f"all tablet decodes, outliers kept: p50 {statistics.median(lat):.0f} / p95 {pct(lat, 95):.0f} / "
+              f"p99 {pct(lat, 99):.0f} ms (n={len(lat)})")
     print(f"fitted (all tablet decodes): p50 {statistics.median(good):.0f} / p95 {pct(good, 95):.0f} / "
           f"p5 {pct(good, 5):.0f} / p99 {pct(good, 99):.0f} / "
           f"min {min(good):.0f} / max {max(good):.0f} ms (n={len(good)}, {len(lat) - len(good)} outliers dropped)")
@@ -164,6 +210,9 @@ def main():
     ap.add_argument("--monitor", nargs=4, metavar="X,Y", help="barcode corners on the monitor (TL TR BR BL)")
     ap.add_argument("--tablet", nargs=4, metavar="X,Y", help="barcode corners on the tablet (TL TR BR BL)")
     ap.add_argument("--csv", help="write per-frame values here")
+    ap.add_argument("--track", type=int, metavar="N",
+                    help="hand-held camera: N is the frame the corners were read from (--dump N); "
+                         "every frame's corners are moved by its camera shift relative to it")
     args = ap.parse_args()
 
     w, h, fps, nb = probe(args.video)
@@ -185,10 +234,31 @@ def main():
         if ys.min() < 0 or xs.min() < 0 or ys.max() >= h or xs.max() >= w:
             raise SystemExit("corners outside the frame")
 
+    def windows():
+        """(frame index, image, monitor sample, tablet sample), following the shake if asked."""
+        if args.track is None:
+            for i, img in enumerate(frames(args.video, w, h)):
+                yield i, img, mon, tab
+            return
+        ref = next(img for i, img in enumerate(frames(args.video, w, h)) if i == args.track)
+        shake, seen = Shake(ref), []
+        dx = dy = 0
+        for i, img in enumerate(frames(args.video, w, h)):
+            # The shake changes smoothly at slow-motion frame rates: every 4th frame is enough.
+            if i % 4 == 0:
+                dx, dy = shake.shift(img)
+            seen.append((dx, dy))
+            sm, st = shifted(mon, dx, dy, w, h), shifted(tab, dx, dy, w, h)
+            if sm is None or st is None:
+                continue
+            yield i, img, sm, st
+        xs, ys = [p[0] for p in seen], [p[1] for p in seen]
+        print(f"tracking: camera shift x {min(xs)}..{max(xs)}, y {min(ys)}..{max(ys)} px", file=sys.stderr)
+
     lat, rows, total, ok_m, ok_t = [], [], 0, 0, 0
-    for i, img in enumerate(frames(args.video, w, h)):
+    for i, img, mon_s, tab_s in windows():
         total += 1
-        m, t = decode(img, mon), decode(img, tab)
+        m, t = decode(img, mon_s), decode(img, tab_s)
         ok_m += m is not None
         ok_t += t is not None
         d = None

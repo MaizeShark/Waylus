@@ -360,6 +360,18 @@ still on 5 GHz at the same AP). Built-in stats, `barcode.html`, 2 runs each:
   times. Timeout 100 vs 500 ms (`adb shell setprop debug.waylus.lostms`): p95
   109–114 vs 113–122 ms, within run-to-run noise; the default stays 100 ms.
 
+2026-11-17, 2.4 GHz camera (hand-held; `camera.py --track`), tablet 2462 MHz −52 dBm,
+host on 5 GHz at the same AP, `--max-in-flight 3`:
+- 20 Mbit/s: p50 103 / p95 282 / p99 331 ms after dropping 188 "outliers" (348–1229
+  ms); with them kept p50 112 / p95 807 / p99 1065 ms (n = 1260).
+- 10 Mbit/s: p50 79 / p95 134 / p99 173 ms; with outliers kept 81 / 303 / 461 ms
+  (n = 971; 75 dropped, 203–523 ms).
+- The dropped values cluster: they are freezes (link stalls + keyframe recovery), not
+  chance decodes. `camera.py` now prints both readings.
+- Conclusion: 5 GHz is the band for Waylus over Wi-Fi; on 2.4 GHz use `--bitrate 10`.
+  Possible future work for 2.4 GHz: intra refresh instead of keyframes (smaller
+  recovery frames), adaptive bitrate.
+
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
   the plan is to write the code fresh. Any file that ends up porting their code gets a
