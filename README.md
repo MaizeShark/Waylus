@@ -184,11 +184,14 @@ Other flags: `--listen ADDR` (default: every private IPv4 address of the host, n
 | | USB (AOA) | Wi-Fi, weak 5 GHz link (−72…−79 dBm) |
 |---|---|---|
 | Pen event → host (injected stylus input) | p50 1.6 / p95 2.5 ms | p50 3.1 / p95 33–72 ms |
+| Pen-down → host input device (`pen.py`, 30 real taps, video on, Android pen events: `--no-raw-pen`) ⁵ | p50 6.8 / p95 8.8 ms (max 9.3) | p50 9.3 / p95 15.7 ms (max 132) |
 | Capture → shown on the tablet (1080p60, 20 Mbit/s) | p50 25 / p95 28 ms | p50 35–42 / p95 51–60 ms |
 
-Photon to photon over Wi-Fi (camera, see ⁴ above): Waylus **p50 49 / p95 65 ms**, Weylus over the same Wi-Fi 183 / 248 ms, Waylus over USB 45 / 59 ms. What remains of the gap to USB is the link: sent → received p50 ~8.3 ms vs 2.7 over USB. A 51 KB frame takes ~4 ms on air at an effective ~100 Mbit/s, because the host's own Wi-Fi shares the channel. A wired host or a lower `--bitrate` should shrink it; not measured yet, nor is `pen.py` with real taps.
+Photon to photon over Wi-Fi (camera, see ⁴ above): Waylus **p50 49 / p95 65 ms**, Weylus over the same Wi-Fi 183 / 248 ms, Waylus over USB 45 / 59 ms. What remains of the gap to USB is the link: sent → received p50 ~8.3 ms vs 2.7 over USB. A 51 KB frame takes ~4 ms on air at an effective ~100 Mbit/s, because the host's own Wi-Fi shares the channel. A wired host or a lower `--bitrate` should shrink it; not measured yet.
 
 With the old back-pressure default of 2 frames in flight, Wi-Fi measured 66 / 96 ms. The ~6 ms longer pipeline meant two frames no longer covered it: the encoder was held back ~800 ms/s, reached only 53–56 fps and sent captures that had already aged. Built-in stats, 3 alternating runs each, same conditions: capture → shown p50 38.3 → 32.8 ms, p95 49 → 39 ms, capture → sent 7.4 → 2.3 ms, 55 → 60 fps.
+
+⁵ Measured 2026-11-17 with `tools/latency/pen.py` as in ³, at commit 841f4e0. Tablet on 5260 MHz, −67 dBm, with the host on the same access point over Wi-Fi. Both runs use the app's pen events (`--no-raw-pen`); with the raw stylus reader, the pen would travel over adb rather than the transport being measured. Over Wi-Fi, one of the 30 taps hit a link stall (132 ms); the other 29 stayed under 16 ms.
 
 ## Status / roadmap
 

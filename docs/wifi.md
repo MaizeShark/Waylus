@@ -340,6 +340,13 @@ runs each, 5260 MHz −67 dBm:
   vs 66 / 96 with 2; three different corner sets gave identical numbers. Within the
   target (USB: 45 / 59). Default changed to 3.
 
+2026-11-17, `pen.py`, 30 real taps each, video on, `--no-raw-pen` (app pen events),
+5260 MHz −67 dBm, host on the same AP over Wi-Fi, commit 841f4e0:
+- USB (AOA): pen-down → host input device p50 6.8 / p95 8.8 ms (min 2.6, max 9.3).
+- Wi-Fi: p50 9.3 / p95 15.7 ms (min 2.8, max 132). The 132 ms tap fell into one of the
+  link stalls seen in the ping tests; redundancy can't help when the radio is off the
+  channel. Raw pen over a USB adb cable (README): 5.1 / 7.0 ms.
+
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
   the plan is to write the code fresh. Any file that ends up porting their code gets a
