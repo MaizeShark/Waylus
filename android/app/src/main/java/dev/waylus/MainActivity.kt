@@ -47,6 +47,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     private lateinit var wifiAddr: EditText
     private lateinit var pairButton: Button
     private lateinit var pinRow: LinearLayout
+    private lateinit var hostsRow: LinearLayout
+    private lateinit var discovery: WifiDiscovery
     private lateinit var pinEdit: EditText
     private val pinQueue = LinkedBlockingQueue<String>()
     /** Keeps the pairing result readable for a while instead of the connection status. */
@@ -131,6 +133,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         input = InputCapture({ conn.send(it) }) { videoRect }
         Log.i(TAG, "decoder: $decoderInfo, port $port")
         wifiStore = WifiStore(this)
+        discovery = WifiDiscovery(this) { onHostsChanged() }
         WifiPower.init(this)
         WifiPower.enabled = intent.getBooleanExtra("wifi_lock", true)
         buildWifiPanel()
@@ -145,7 +148,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         startConnection(pickTransport(intent))
     }
 
-    private enum class Transport { USB, ADB, WIFI }
+    private enum class Transport { USB, ADB, WIFI, AUTO }
 
     /**
      * What the host asked for (started over adb), else the USB accessory when we were
@@ -155,20 +158,37 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         "aoa" -> Transport.USB
         "tcp" -> Transport.ADB
         "wifi" -> Transport.WIFI
-        else -> if (i.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED || Accessory.find(this) != null) Transport.USB else Transport.WIFI
+        else -> when {
+            i.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED -> Transport.USB
+            // Still in accessory mode, but maybe from an earlier session: try USB, then Wi-Fi.
+            Accessory.find(this) != null -> Transport.AUTO
+            else -> Transport.WIFI
+        }
     }
 
     private fun startConnection(t: Transport) {
-        usingAccessory = t == Transport.USB
-        usingWifi = t == Transport.WIFI
+        usingAccessory = t == Transport.USB || t == Transport.AUTO
+        usingWifi = t == Transport.WIFI || t == Transport.AUTO
         Log.i(TAG, "transport: $t")
+        var usbTurn = true
         val opener: () -> Connection.Link? = when (t) {
             Transport.USB -> ({ Accessory.open(applicationContext) })
             Transport.ADB -> Connection.tcp(port)
             Transport.WIFI -> ::openWifi
+            // USB first when a host reads it (a blocked probe switches over later), else Wi-Fi.
+            Transport.AUTO -> ({
+                usbTurn = !usbTurn
+                val usb = if (usbTurn) null else Accessory.open(applicationContext)?.takeIf {
+                    Accessory.probe(1500) { runOnUiThread { conn.stop(); startConnection(Transport.USB) } }
+                }
+                usb ?: openWifi()
+            })
         }
-        if (!usingWifi) runOnUiThread { wifiPanel.visibility = View.GONE }
-        conn = Connection(opener, this)
+        if (usingWifi) discovery.start() else {
+            discovery.stop()
+            runOnUiThread { wifiPanel.visibility = View.GONE }
+        }
+        conn = Connection(opener, this, syncGiveUpMs = if (t == Transport.AUTO) 3000 else 0)
         conn.start()
     }
 
@@ -192,7 +212,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     private var lastWifiStatus = ""
     private fun openWifi(): Connection.Link? {
         val host = wifiStore.host()
-        val addr = wifiStore.address
+        // Where mDNS last saw the paired host, else the stored address.
+        val addr = host?.let { discovery.hosts[WifiStore.toHex(it.id)]?.address } ?: wifiStore.address
         if (host == null || addr.isNullOrBlank()) {
             showWifiPanel(null)
             Thread.sleep(700)
@@ -209,13 +230,37 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             }
             Thread.sleep(1000)
             null
-        } catch (e: IOException) {
+        } catch (e: InterruptedException) {
+            throw e
+        } catch (e: Exception) {
             val msg = "connecting to ${host.name} at $addr… (${e.message ?: e.javaClass.simpleName})"
             if (msg != lastWifiStatus) Log.i(TAG, msg)
             lastWifiStatus = msg
             showWifiPanel(msg)
             Thread.sleep(700)
             null
+        }
+    }
+
+    /** mDNS results changed: follow the paired host's address, list the others for pairing. */
+    private fun onHostsChanged() {
+        val paired = wifiStore.host()?.let { WifiStore.toHex(it.id) }
+        discovery.hosts[paired]?.let { h ->
+            if (h.address != wifiStore.address) {
+                Log.i(TAG, "paired host ${h.name} is now at ${h.address}")
+                wifiStore.address = h.address
+            }
+        }
+        runOnUiThread {
+            hostsRow.removeAllViews()
+            for (h in discovery.hosts.values.sortedBy { it.name }) {
+                if (h.id == paired) continue
+                hostsRow.addView(Button(this).apply {
+                    text = "Pair with ${h.name}"
+                    isAllCaps = false
+                    setOnClickListener { wifiAddr.setText(h.address); startPairing() }
+                })
+            }
         }
     }
 
@@ -261,7 +306,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding((16 * dp).toInt(), (8 * dp).toInt(), (16 * dp).toInt(), (8 * dp).toInt())
-            addView(wifiMsg); addView(wifiAddr); addView(pairButton); addView(pinRow)
+            hostsRow = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
+            addView(wifiMsg); addView(hostsRow); addView(wifiAddr); addView(pairButton); addView(pinRow)
             visibility = View.GONE
         }
         root.addView(wifiPanel, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM).apply {
@@ -345,6 +391,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
+        discovery.stop()
         boost.shutdown()
         conn.stop()
         decoder.shutdown()
@@ -385,6 +432,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     // --- Connection.Listener (network thread) ---
 
     override fun onConnected() {
+        if (usingWifi) discovery.stop()
         runOnUiThread {
             wifiPanel.visibility = View.GONE
             setStatus("Waylus\nconnected" + if (usingWifi) " (Wi-Fi)" else "")
@@ -413,6 +461,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     }
 
     override fun onDisconnected() {
+        if (usingWifi) discovery.start()
         firstFrameShown = false
         decoder.configure(0, 0)
         runOnUiThread {

@@ -17,7 +17,12 @@ import kotlin.random.Random
  * reconnecting forever. Outgoing messages go through a queue so they can be posted
  * from the UI thread.
  */
-class Connection(private val opener: () -> Link?, private val listener: Listener) {
+class Connection(
+    private val opener: () -> Link?,
+    private val listener: Listener,
+    /** For links with a SYNC handshake: give up (and call the opener again) after this long; 0 = never. */
+    private val syncGiveUpMs: Long = 0,
+) {
     interface Listener {
         /** Called on the network thread when a session starts; return the hello message. */
         fun hello(): ByteArray
@@ -78,20 +83,27 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
         // Video frames arrive here; at normal priority the thread can sit on a slow
         // core or wait behind other work, which showed up as 30-40 ms transfer spikes.
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        var lastError = ""
         while (running) {
             var l: Link? = null
+            var hadSession = false
             try {
                 l = opener()
                 if (l != null) {
                     link = l
+                    hadSession = true
                     session(l)
                 }
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
-                if (connected) Log.i(TAG, "disconnected: $e")
+                // Log each new kind of failure once (not every retry).
+                val kind = "${e.javaClass.simpleName}: ${e.message?.replace(Regex("\\d+"), "#")}"
+                if (hadSession || kind != lastError) Log.i(TAG, if (hadSession) "disconnected: $e" else "connect failed: $e")
+                lastError = kind
             }
-            if (connected) {
+            // session() clears `connected` itself; report every session that started.
+            if (hadSession || connected) {
                 connected = false
                 listener.onDisconnected()
             }
@@ -111,9 +123,13 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
             val sync = Proto.sync(Random.nextLong())
             // Repeat until the host answers: it may not be running yet, or still be
             // finishing an old session.
+            val start = System.nanoTime()
             while (running) {
                 output.write(sync + hello)
                 if (l.awaitSync(sync, 1000)) break
+                if (syncGiveUpMs > 0 && System.nanoTime() - start > syncGiveUpMs * 1_000_000) {
+                    throw java.io.IOException("no host on the USB accessory link")
+                }
             }
         } else {
             output.write(hello)

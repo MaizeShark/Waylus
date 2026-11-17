@@ -4,7 +4,7 @@
 > **LLM-generated code.** Most of this project, including code and documentation, was written by an AI model (Claude, by Anthropic) working with a human maintainer. It has been tested on real hardware but not audited line by line, so review it before relying on it.
 
 *Weylus, but for Way(land).* Use an Android tablet as a **low-latency pen display** for your Linux desktop.
-It's Wayland-first, uses a native Android client and runs over USB.
+It's Wayland-first, uses a native Android client and runs over USB or, optionally, Wi-Fi.
 
 Waylus mirrors one of your monitors to the tablet using hardware H.264 encode and decode. It sends the tablet's pen and fingers back as real Linux input devices:
 - a tablet tool with pressure, tilt and both stylus buttons;
@@ -15,18 +15,19 @@ Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet t
 ```
  host (Rust)                                                        tablet (Kotlin)
  ScreenCast portal → PipeWire → NVENC / VAAPI H.264 ─┐  USB (AOA,   ┌→ MediaCodec (HW) → SurfaceView
-                                                     ├─ or adb) ────┤
+                                                     ├─ or adb;  ───┤
+                                                     │  or Wi-Fi)   │
  uinput pen + touchscreen  ← input events  ←─────────┘              └← MotionEvent (unbuffered)
 ```
 
 ## Waylus vs Weylus
 
-[Weylus](https://github.com/H-M-H/Weylus) inspired this project and is more mature and more portable. Waylus is a narrower, latency-focused take: Linux and Wayland first, Android only, USB only.
+[Weylus](https://github.com/H-M-H/Weylus) inspired this project and is more mature and more portable. Waylus is a narrower, latency-focused take: Linux and Wayland first, Android only, USB first.
 
 | | Weylus | Waylus |
 |---|---|---|
 | Tablet client | Any modern web browser | Native Android app |
-| Transport | Wi-Fi / LAN, HTTP + WebSocket | USB: raw USB with Android Open Accessory (no USB debugging needed), or an `adb reverse` tunnel |
+| Transport | Wi-Fi / LAN, HTTP + WebSocket | USB: raw USB with Android Open Accessory (no USB debugging needed), or an `adb reverse` tunnel. Optional Wi-Fi (`--wifi`): paired and encrypted, video over UDP with FEC |
 | Host OS focus | Linux (X11 first, Wayland experimental), Windows, macOS | Linux, Wayland first (xdg-desktop-portal + PipeWire) |
 | Video encode | FFmpeg; software by default, VAAPI / NVENC / VideoToolbox optional | NVENC or VAAPI, zero-copy on the GPU (compositor DMA-BUF → GL blit/scale → CUDA → NVENC, or → GL NV12 shader → VAAPI surface), low-latency tuned: no B-frames, no lookahead, small VBV, keyframes on demand |
 | Video decode | In the browser | Android `MediaCodec` hardware decoder straight to a `SurfaceView` |
@@ -145,6 +146,45 @@ Monitors larger than the tablet can show or decode (e.g. 4K) are scaled down on 
 
 Set `RUST_LOG=waylus=debug` for verbose logs.
 
+### Wi-Fi (`--wifi`)
+
+Waylus can also run over the LAN. USB stays the default: with `--wifi` the host still uses USB when the tablet is plugged in, and additionally accepts the paired tablet over Wi-Fi. Design, the Sunshine/Moonlight research behind it and all measurements: [docs/wifi.md](docs/wifi.md).
+
+**Pairing (once).** Run `waylus --wifi --pair`. In the Waylus app on the tablet, tap the host under "Pair with …" (found via mDNS), or type its address and tap "Pair with this host". The host prints a 6-digit PIN (and shows a desktop notification); enter it on the tablet. Pairing stays possible for 5 minutes or until one tablet has paired, and closes after 3 wrong PINs. After that, `waylus --wifi` is enough: open the app on the tablet and it connects.
+
+```sh
+waylus --wifi --pair          # pair a tablet (shows a PIN)
+waylus --wifi                 # USB if plugged in, else Wi-Fi
+waylus --wifi --no-usb        # Wi-Fi only (adb, if present, still installs/starts the app)
+waylus --unpair all           # forget paired tablets (or a name / id prefix)
+```
+
+Other flags: `--listen ADDR` (default: every private IPv4 address of the host, never public or VPN addresses such as Tailscale), `--fec PCT` (video parity, default 20 %, at least 2 parity packets per block). Ports: TCP and UDP 27183 (`--port`) and mDNS (UDP 5353); open them in your firewall if it blocks them. Fedora Workstation's default zone already allows them.
+
+**Security model.**
+- Only paired tablets can connect. Pairing uses SPAKE2 (RFC 9382) with the PIN: someone on the network who watches the pairing learns nothing that would let them guess the PIN offline, and each attempt tests a single PIN.
+- Each session authenticates both sides with the 256-bit pairing key and an ephemeral ECDH exchange (forward secrecy).
+- Everything after that is AES-256-GCM: input, control and video. The host drops any packet that fails authentication and never takes a peer's address on trust, so spoofed UDP source addresses or a reused DHCP address get nowhere.
+- Keys: `~/.local/state/waylus/wifi.json` (mode 0600) on the host; on the tablet, in app storage, wrapped by an Android Keystore key.
+- Video is always encrypted. Decrypting costs the tablet 0.2–0.5 ms per frame, and an unencrypted mode would save at most that, so there is none. Anyone on the LAN can still jam or flood the stream (denial of service), as with any Wi-Fi traffic.
+
+**How it works.** Pen and touch go over UDP. Each packet repeats the previous two samples and the final state is resent shortly after, so a lost packet costs no retransmission wait. Video frames are encrypted, split into 1408-byte packets and protected with Reed-Solomon parity. A frame that can't be recovered is reported at once, and the host answers with a keyframe; the tablet keeps the last good picture meanwhile. While a Wi-Fi session runs in the foreground, the app holds Android's low-latency Wi-Fi lock (no power saving).
+
+**Getting low latency.**
+- Use 5 GHz (or 6 GHz) with a strong signal near the access point; check with `adb shell cmd wifi status` (Frequency, RSSI).
+- At a weak spot (−78 dBm in the measurements below), Android keeps scanning for a better access point, and the link stalls for ~80–200 ms every few seconds. A wired host helps, since otherwise every packet crosses the air twice.
+- On 2.4 GHz, lower the bitrate (e.g. `--bitrate 10`).
+- The raw pen reader (full tilt on the NXTPAPER) needs adb; over Wi-Fi, without adb, the pen uses Android's events.
+
+**Measured so far** (2026-11-17, built-in statistics, NXTPAPER 14 and host both on Wi-Fi via the same AP; [details](docs/wifi.md#findings-so-far)):
+
+| | USB (AOA) | Wi-Fi, weak 5 GHz link (−72…−79 dBm) |
+|---|---|---|
+| Pen event → host (injected stylus input) | p50 1.6 / p95 2.5 ms | p50 3.1 / p95 33–72 ms |
+| Capture → shown on the tablet (1080p60, 20 Mbit/s) | p50 25 / p95 28 ms | p50 35–42 / p95 51–60 ms |
+
+The camera (photon-to-photon) and `pen.py` comparison on a good 5 GHz link is still to come.
+
 ## Status / roadmap
 
 - [x] Pen (pressure, tilt, hover, buttons, eraser) and multitouch over USB
@@ -159,6 +199,8 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] AOA transport (default; no adb needed)
 - [x] Virtual monitor on KDE Plasma and GNOME (`--virtual`), with automatic pen/touch mapping
 - [ ] Virtual monitor on niri (needs `RecordVirtual` in niri; use a dummy plug meanwhile)
+- [x] Wi-Fi transport (`--wifi`): PIN pairing, encrypted input and video, UDP with FEC, mDNS discovery
+- [ ] Wi-Fi photon-to-photon and pen measurements on a good 5 GHz link and on 2.4 GHz
 
 ## Licence
 

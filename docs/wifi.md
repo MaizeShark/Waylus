@@ -236,6 +236,27 @@ moonlight-common-c (`src/RtpVideoQueue.c`, `src/ControlStream.c`, `src/InputStre
 - Bitrate: 20 Mbit/s at 1080p as now (+20 % FEC on air). On 2.4 GHz (~40 Mbit/s usable)
   the README will recommend `--bitrate 10`. Adaptation is out of scope for the first version.
 
+### 2.9 Implementation notes (where the build differs from or adds to the plan)
+- QoS tags: the host's UDP socket (video, pings) uses AF41 (WMM video); the tablet's
+  input/feedback socket uses EF (WMM voice). No clear effect measured yet (§3).
+- The app, when started from the launcher while the tablet is still in USB accessory
+  mode from an earlier session, uses AUTO: it probes USB with a frame the host ignores.
+  A write to the accessory only completes while a host reads the pipe and can't be
+  cancelled, so the probe runs on its own thread with a 1.5 s timeout. If it times
+  out, the app uses Wi-Fi meanwhile and switches to USB once the stuck write completes
+  (a host appeared).
+- A newer authenticated link preempts the running session on the host (tablet
+  reconnects after a Wi-Fi drop or a host restart without waiting for the 5 s idle
+  timeout).
+- Reconnects measured 2026-11-17: host restart → tablet back ~1 s after the host is
+  up; Wi-Fi off/on on the tablet → back ~3.8 s after Wi-Fi is enabled (association +
+  DHCP; the tablet got a new address, found again via mDNS).
+- Fixed on the way: `Connection` never called `onDisconnected()` after a session
+  ended with an error (its `finally` cleared `connected` first).
+- Developer aids: `WAYLUS_TEST_DROP=<percent>` drops video shards on the host;
+  `am start ... --ez bench_crypto true` benchmarks the tablet's ciphers;
+  `--ez wifi_lock false` disables the low-latency lock for comparisons.
+
 ## 3. Measurement plan
 - Before every run: `adb shell cmd wifi status` (frequency, RSSI, link speed); record the
   host's `iw dev wlp3s0 link`.

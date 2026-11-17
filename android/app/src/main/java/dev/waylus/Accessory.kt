@@ -34,6 +34,8 @@ object Accessory : Connection.Link {
     /** The accessory driver completes reads in units of up to 16 KiB; asking for less can lose data. */
     private const val CHUNK = 16384
     private val EOF = ByteArray(0)
+    /** Frame type no host message uses; the host skips it (before SYNC) or ignores it. */
+    private const val PROBE_TYPE: Byte = 0x7e
 
     private var pfd: ParcelFileDescriptor? = null
     private var out: FileOutputStream? = null
@@ -120,6 +122,36 @@ object Accessory : Connection.Link {
             out = null
         }
         chunks.put(EOF)
+    }
+
+    /** A probe write is blocked: nobody reads the USB pipe (no host serves USB right now). */
+    @Volatile var probeStuck = false
+        private set
+
+    /**
+     * Writes a frame the host ignores and waits up to [timeoutMs] for the write to
+     * complete. A write only completes while a host reads the pipe, and it can't be
+     * cancelled; if it completes later, [onLater] runs (a host appeared on USB).
+     */
+    fun probe(timeoutMs: Long, onLater: () -> Unit): Boolean {
+        if (probeStuck) return false
+        val o = out ?: return false
+        val done = java.util.concurrent.CountDownLatch(1)
+        val late = java.util.concurrent.atomic.AtomicBoolean(false)
+        Thread({
+            val ok = try { o.write(byteArrayOf(PROBE_TYPE, 0, 0, 0, 0)); true } catch (e: IOException) { false }
+            done.countDown()
+            if (late.get()) {
+                probeStuck = false
+                if (ok) { Log.i(TAG, "a host is reading the USB accessory link now"); onLater() }
+            }
+        }, "waylus-usb-probe").apply { isDaemon = true; start() }
+        if (done.await(timeoutMs, TimeUnit.MILLISECONDS)) return true
+        probeStuck = true
+        late.set(true)
+        if (done.count == 0L) probeStuck = false // completed just now
+        Log.i(TAG, "no host reads the USB accessory link; using Wi-Fi meanwhile")
+        return false
     }
 
     // --- Connection.Link ---

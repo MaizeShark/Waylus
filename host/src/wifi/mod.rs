@@ -110,6 +110,23 @@ type Chunk = Result<Vec<u8>, io::ErrorKind>;
 pub struct Server {
     links: Receiver<Link>,
     pub addrs: Vec<SocketAddr>,
+    /// mDNS advertisement (`_waylus._tcp`), kept alive with the server.
+    _mdns: Option<mdns_sd::ServiceDaemon>,
+}
+
+pub const MDNS_TYPE: &str = "_waylus._tcp.local.";
+
+/// Advertises the listener so tablets find the host after DHCP changes. A separate
+/// host name avoids clashing with the records Avahi publishes for this machine.
+fn advertise(host_id: &str, addrs: &[SocketAddr]) -> Result<mdns_sd::ServiceDaemon> {
+    let d = mdns_sd::ServiceDaemon::new().context("start mDNS responder")?;
+    let name = hostname();
+    let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+    let props = [("id", host_id.to_owned()), ("v", proto::PROTO_VERSION.to_string()), ("name", name.clone())];
+    let info = mdns_sd::ServiceInfo::new(MDNS_TYPE, &name, &format!("waylus-{name}.local."), ips.as_slice(), addrs[0].port(), &props[..])
+        .context("mDNS service info")?;
+    d.register(info).context("register mDNS service")?;
+    Ok(d)
 }
 
 impl Server {
@@ -160,6 +177,13 @@ impl Server {
             })?;
             addrs.push(addr);
         }
+        let mdns = match advertise(&store.lock().unwrap().host_id, &addrs) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                warn!("Wi-Fi: no mDNS advertisement ({e:#}); enter the host address on the tablet");
+                None
+            }
+        };
         let paired = store.lock().unwrap().devices.len();
         info!(
             "Wi-Fi: listening on {} ({paired} paired device{})",
@@ -171,7 +195,7 @@ impl Server {
         } else if paired == 0 {
             info!("Wi-Fi: no tablet paired yet; run with --pair to pair one");
         }
-        Ok(Self { links: rx, addrs })
+        Ok(Self { links: rx, addrs, _mdns: mdns })
     }
 
     /// Blocks until a paired tablet has authenticated.
