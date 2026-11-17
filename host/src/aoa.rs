@@ -82,6 +82,12 @@ impl Aoa {
                 }
             } else if switched_at.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
                 if let Some(d) = self.pick_android(&devices) {
+                    if switched_at.is_some() {
+                        warn!(
+                            "{} ignored the switch to accessory mode; retrying (an app holding a stale accessory open causes this)",
+                            describe(&d)
+                        );
+                    }
                     match switch(&d) {
                         Ok(v) => {
                             info!("switching {} into accessory mode (AOA v{v})", describe(&d));
@@ -215,6 +221,18 @@ fn claim(d: &DeviceInfo) -> Result<(Interface, u8, u8)> {
         let bulk = |dir| alt.endpoints().find(|e| e.transfer_type() == TransferType::Bulk && e.direction() == dir).map(|e| e.address());
         if let (Some(i), Some(o)) = (bulk(Direction::In), bulk(Direction::Out)) {
             let iface = dev.claim_interface(group.interface_number()).wait().context("claim accessory interface")?;
+            // A previous host process may have died mid-transfer; reset the data toggles
+            // on both sides so the first packets aren't silently dropped as duplicates.
+            for ep in [i, o] {
+                let r = if ep & 0x80 != 0 {
+                    iface.endpoint::<Bulk, In>(ep).map(|mut e| e.clear_halt().wait())
+                } else {
+                    iface.endpoint::<Bulk, Out>(ep).map(|mut e| e.clear_halt().wait())
+                };
+                if let Ok(Err(e)) | Err(e) = r.map_err(anyhow::Error::from).map(|r| r.map_err(anyhow::Error::from)) {
+                    debug!("clear halt {ep:#x}: {e:#}");
+                }
+            }
             return Ok((iface, i, o));
         }
     }

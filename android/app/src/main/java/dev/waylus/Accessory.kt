@@ -2,8 +2,10 @@
 package dev.waylus
 
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.os.ParcelFileDescriptor
@@ -39,6 +41,34 @@ object Accessory : Connection.Link {
     @Volatile private var open = false
     private var askedFor: UsbAccessory? = null
 
+    /** From the sticky USB_STATE broadcast: the accessory function is up on a live cable. */
+    @Volatile private var active = false
+    /** Set when the link dies; cleared once USB_STATE shows the accessory gone. */
+    @Volatile private var needFreshAttach = false
+    private var receiver: BroadcastReceiver? = null
+
+    /**
+     * Never open the accessory unless the USB state says it is really there. Right after
+     * an unplug Android still lists it for a moment; opening it then leaves a read that
+     * blocks until the accessory comes back, and since the driver allows one open at a
+     * time, Android itself can no longer open it to accept the next switch request
+     * ("could not open /dev/usb_accessory"): the tablet then ignores the host for good.
+     */
+    private fun watchUsbState(ctx: Context) {
+        if (receiver != null) return
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                val on = i.getBooleanExtra("connected", false) && i.getBooleanExtra("configured", false) &&
+                    i.getBooleanExtra("accessory", false)
+                if (!on) needFreshAttach = false
+                active = on
+            }
+        }
+        receiver = r
+        // Sticky: the current state is delivered right away.
+        ctx.registerReceiver(r, IntentFilter("android.hardware.usb.action.USB_STATE"), Context.RECEIVER_EXPORTED)
+    }
+
     fun find(ctx: Context): UsbAccessory? =
         ctx.getSystemService(UsbManager::class.java).accessoryList?.firstOrNull { it.manufacturer == "Waylus" && it.model == "Waylus" }
 
@@ -46,6 +76,8 @@ object Accessory : Connection.Link {
     @Synchronized
     fun open(ctx: Context): Connection.Link? {
         if (open) return this
+        watchUsbState(ctx)
+        if (!active || needFreshAttach) return null
         val usb = ctx.getSystemService(UsbManager::class.java)
         val acc = find(ctx) ?: return null
         if (!usb.hasPermission(acc)) {
@@ -81,6 +113,7 @@ object Accessory : Connection.Link {
             Log.i(TAG, "USB accessory closed: $e")
         }
         synchronized(this) {
+            needFreshAttach = true
             open = false
             try { p.close() } catch (_: IOException) {}
             pfd = null

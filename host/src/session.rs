@@ -402,7 +402,11 @@ fn session(
             }
             DeviceMsg::Hello(_) if repeats > 0 => repeats -= 1,
             DeviceMsg::Hello(_) => warn!("duplicate hello"),
-            DeviceMsg::Sync(n) if Some(n) == sync => repeats += 1,
+            DeviceMsg::Sync(n) if Some(n) == sync => {
+                // The app is still waiting for our answer (it may have missed the first).
+                repeats += 1;
+                send(&writer, |w| proto::write_sync(w, n))?;
+            }
             DeviceMsg::Sync(_) => {
                 info!("tablet restarted the session");
                 return Ok(());
