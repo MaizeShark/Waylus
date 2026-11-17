@@ -131,7 +131,7 @@ pub fn serve(opts: Opts, transport: Transport, mut capture: Option<Capture>, laz
         }
         Transport::Aoa(mut aoa) => {
             if !aoa.is_connected() {
-                aoa.connect()?;
+                aoa.connect(None)?;
             }
             info!("waiting for the Waylus app on the USB accessory link");
             Box::new(move || aoa.next_link())
@@ -208,7 +208,9 @@ fn session(
     inputs: &mut Option<(Arc<Mutex<Pen>>, Touch)>,
     last_frame: &mut Option<Frame>,
 ) -> Result<()> {
-    let Link { mut reader, writer, close } = link;
+    let Link { mut reader, writer, close, sync } = link;
+    // The app repeats SYNC + hello until it sees our answer; extra copies may follow.
+    let mut repeats = 0u32;
     let mut buf = Vec::new();
     let hello = match proto::read_msg(&mut reader, &mut buf).context("waiting for hello")? {
         DeviceMsg::Hello(h) => h,
@@ -398,8 +400,10 @@ fn session(
                 debug!("tablet requested keyframe");
                 keyframe.store(true, Ordering::SeqCst);
             }
+            DeviceMsg::Hello(_) if repeats > 0 => repeats -= 1,
             DeviceMsg::Hello(_) => warn!("duplicate hello"),
-            DeviceMsg::Sync => {
+            DeviceMsg::Sync(n) if Some(n) == sync => repeats += 1,
+            DeviceMsg::Sync(_) => {
                 info!("tablet restarted the session");
                 return Ok(());
             }

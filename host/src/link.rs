@@ -17,6 +17,8 @@ pub struct Link {
     pub writer: Box<dyn Write + Send>,
     /// Unblocks the reader and fails further I/O (callable from any thread).
     pub close: Arc<dyn Fn() + Send + Sync>,
+    /// AOA: the nonce of the SYNC this session started with.
+    pub sync: Option<u64>,
 }
 
 impl Link {
@@ -30,6 +32,7 @@ impl Link {
             close: Arc::new(move || {
                 let _ = closer.shutdown(Shutdown::Both);
             }),
+            sync: None,
         })
     }
 }

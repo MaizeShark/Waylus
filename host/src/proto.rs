@@ -129,8 +129,8 @@ pub enum DeviceMsg {
     FrameShown { capture_ns: u64, recv_ns: u64, render_ns: u64, queued_ns: u64, decoded_ns: u64 },
     RequestKeyframe,
     Layout(Layout),
-    /// The client (re)started a session on the same USB link (AOA).
-    Sync,
+    /// The client (re)started a session on the same USB link (AOA), with this nonce.
+    Sync(u64),
     Unknown(u8),
 }
 
@@ -237,7 +237,10 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             right: c.i16()?,
             bottom: c.i16()?,
         }),
-        ty::SYNC => DeviceMsg::Sync,
+        ty::SYNC => {
+            c.take::<8>()?;
+            DeviceMsg::Sync(u64::from_le_bytes(c.take()?))
+        }
         other => DeviceMsg::Unknown(other),
     })
 }

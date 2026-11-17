@@ -26,7 +26,7 @@ Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet t
 | | Weylus | Waylus |
 |---|---|---|
 | Tablet client | Any modern web browser | Native Android app |
-| Transport | Wi-Fi / LAN, HTTP + WebSocket | USB: `adb reverse` tunnel, or raw USB with Android Open Accessory (`--transport aoa`, no USB debugging needed) |
+| Transport | Wi-Fi / LAN, HTTP + WebSocket | USB: raw USB with Android Open Accessory (no USB debugging needed), or an `adb reverse` tunnel |
 | Host OS focus | Linux (X11 first, Wayland experimental), Windows, macOS | Linux, Wayland first (xdg-desktop-portal + PipeWire) |
 | Video encode | FFmpeg; software by default, VAAPI / NVENC / VideoToolbox optional | NVENC, zero-copy on the GPU (compositor DMA-BUF → GL blit/scale → CUDA → NVENC), low-latency tuned: no B-frames, no lookahead, small VBV, keyframes on demand; VAAPI planned |
 | Video decode | In the browser | Android `MediaCodec` hardware decoder straight to a `SurfaceView` |
@@ -71,7 +71,7 @@ The Waylus probe numbers were re-measured on 2026-11-16 (commit 994ec89: zero-co
 
 **Host**
 - Linux with a Wayland compositor that implements the ScreenCast portal. Tested on niri (xdg-desktop-portal-gnome), KDE Plasma 6.8 and GNOME 51. Hyprland should work.
-- PipeWire, FFmpeg ≥ 9 with `h264_nvenc` (an NVIDIA GPU), and `adb`.
+- PipeWire, FFmpeg ≥ 9 with `h264_nvenc` (an NVIDIA GPU). `adb` is optional: it installs and starts the app and enables raw pen input.
 - Write access to `/dev/uinput`, for example:
   ```sh
   sudo groupadd -r uinput; sudo usermod -aG uinput $USER
@@ -80,7 +80,7 @@ The Waylus probe numbers were re-measured on 2026-11-16 (commit 994ec89: zero-co
 - Build dependencies (Fedora): `pipewire-devel ffmpeg-devel clang-devel`, a Rust toolchain, and the Android SDK for the client.
 
 **Tablet**
-- Android 11 or newer with USB debugging enabled and authorised for this computer.
+- Android 11 or newer. USB debugging is optional: without it, install the APK once by other means; the app opens when the host connects.
 
 ## Build
 
@@ -98,7 +98,7 @@ waylus --no-video -o DP-2   # input only: use the tablet as a plain graphics tab
 
 `waylus` does the setup for you:
 - installs or updates the APK when it has changed;
-- sets up `adb reverse`;
+- switches the tablet into USB accessory mode (or sets up `adb reverse`);
 - launches the app on the tablet;
 - serves reconnects until you press Ctrl-C.
 
@@ -124,13 +124,13 @@ Useful flags:
 - `--boost <s>`: keep the tablet's CPU clocks up for this long after pen/touch input (default 20, 0 = off). Decoding on MediaTek tablets is much faster at high clocks, which Android only grants while you touch the screen. Costs some tablet battery while active
 - `--max-in-flight <n>`: back-pressure, max frames sent but not yet shown (default 2, 0 = off)
 - `--vendor-tweaks mtk-cpu-boost,mtk-vpp-off`: **opt-in, device-specific** MediaTek decoder settings. `mtk-cpu-boost` saved ~1.9 ms of decode on the MT8781; `mtk-vpp-off` made no measurable difference. Never used for the published comparison numbers
-- `--transport aoa`: see below
+- `--transport adb`: use the `adb reverse` tunnel instead of USB accessory mode (see below)
 - `--keep-app`
 - `--no-adb`
 
-### USB accessory mode (`--transport aoa`)
+### USB accessory mode (default) and `--transport adb`
 
-By default the app talks to the host through an `adb reverse` TCP tunnel. With `--transport aoa` the host switches the tablet into Android Open Accessory mode instead and exchanges data over raw USB bulk transfers, skipping adbd and both TCP stacks:
+By default the host switches the tablet into Android Open Accessory (AOA) mode and exchanges data over raw USB bulk transfers, skipping adbd and both TCP stacks. With `--transport adb`, or automatically when the tablet doesn't support AOA, it uses an `adb reverse` TCP tunnel instead:
 - **No USB debugging needed.** Without adb, the app must already be installed, and Android offers to open it when the host connects; tick "always" in that dialog. If adb is available it is still used to install and start the app and to read the raw stylus device.
 - The first time, Android asks for permission to access the accessory.
 - The tablet stays in accessory mode (USB ID 18d1:2d00/2d01) until it is unplugged, so MTP file transfer is unavailable meanwhile; adb keeps working.
@@ -156,7 +156,7 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] Raw stylus input over adb (full tilt on devices whose Android config drops it, e.g. NXTPAPER 14)
 - [ ] VAAPI encoder fallback (AMD / Intel)
 - [x] Zero-copy GPU path (DMA-BUF → GL → CUDA → NVENC) and GPU downscaling to fit the tablet
-- [x] AOA transport (`--transport aoa`, no adb needed)
+- [x] AOA transport (default; no adb needed)
 - [x] Virtual monitor on KDE Plasma and GNOME (`--virtual`), with automatic pen/touch mapping
 - [ ] Virtual monitor on niri (needs `RecordVirtual` in niri; use a dummy plug meanwhile)
 

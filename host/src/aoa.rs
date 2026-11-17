@@ -63,8 +63,10 @@ impl Aoa {
     }
 
     /// Puts the tablet into accessory mode (if it isn't already) and claims the
-    /// accessory interface. Waits for a tablet to be plugged in.
-    pub fn connect(&mut self) -> Result<()> {
+    /// accessory interface. Waits for a tablet to be plugged in, or with `give_up`,
+    /// fails after that long or as soon as the tablet turns out not to support AOA.
+    pub fn connect(&mut self, give_up: Option<Duration>) -> Result<()> {
+        let start = Instant::now();
         let mut said_waiting = false;
         let mut switched_at: Option<Instant> = None;
         loop {
@@ -85,12 +87,16 @@ impl Aoa {
                             info!("switching {} into accessory mode (AOA v{v})", describe(&d));
                             switched_at = Some(Instant::now());
                         }
+                        Err(e) if give_up.is_some() => bail!("{}: no AOA ({e:#})", describe(&d)),
                         Err(e) => debug!("{}: no AOA ({e:#})", describe(&d)),
                     }
                 } else if !said_waiting {
                     info!("waiting for the tablet on USB...");
                     said_waiting = true;
                 }
+            }
+            if give_up.is_some_and(|t| start.elapsed() > t) {
+                bail!("no tablet in accessory mode after {:?}", start.elapsed());
             }
             thread::sleep(Duration::from_millis(200));
         }
@@ -138,7 +144,7 @@ impl Aoa {
     pub fn next_link(&mut self) -> Result<Link> {
         loop {
             if self.iface.is_none() {
-                self.connect()?;
+                self.connect(None)?;
             }
             let (iface, ep_in, ep_out) = self.iface.clone().unwrap();
             match open_link(&iface, ep_in, ep_out) {
@@ -238,6 +244,7 @@ fn open_link(iface: &Interface, ep_in: u8, ep_out: u8) -> Result<Link> {
         reader: Box::new(UsbRead { inner: reader, stop: stop.clone(), last: Instant::now() }),
         writer: Box::new(writer),
         close: Arc::new(move || stop.store(true, Ordering::SeqCst)),
+        sync: Some(nonce),
     })
 }
 

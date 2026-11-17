@@ -49,10 +49,11 @@ struct Args {
     /// Frame rate (default: the tablet's display refresh rate, within decoder limits).
     #[arg(long)]
     fps: Option<u32>,
-    /// How the tablet talks to the host: `adb` (TCP through `adb reverse`) or `aoa`
-    /// (Android Open Accessory: raw USB, works without USB debugging; adb is still
-    /// used, if available, to install/start the app and read the raw pen).
-    #[arg(long, value_enum, default_value_t = TransportArg::Adb)]
+    /// How the tablet talks to the host: `aoa` (Android Open Accessory: raw USB, works
+    /// without USB debugging; adb is still used, if available, to install/start the app
+    /// and read the raw pen; falls back to `adb` if the tablet lacks AOA) or `adb`
+    /// (TCP through `adb reverse`).
+    #[arg(long, value_enum, default_value_t = TransportArg::Aoa)]
     transport: TransportArg,
     /// TCP port tunnelled through adb.
     #[arg(long, default_value_t = proto::DEFAULT_PORT)]
@@ -103,7 +104,7 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let aoa_mode = args.transport == TransportArg::Aoa;
+    let mut aoa_mode = args.transport == TransportArg::Aoa;
     let mut adb = (!args.no_adb).then(|| adb::Adb::new(args.serial.clone()));
     let mut serial = args.serial.clone();
     if aoa_mode && adb.as_ref().is_some_and(|a| !a.is_available()) {
@@ -119,17 +120,27 @@ fn main() -> Result<()> {
         }
         if aoa_mode {
             serial = serial.or_else(|| adb.serial_no());
-        } else {
-            adb.reverse(args.port)?;
         }
     }
     let mut aoa = aoa_mode.then(|| aoa::Aoa::new(serial.clone()));
-    if let Some(aoa) = aoa.as_mut() {
+    if let Some(a) = aoa.as_mut() {
         // Switch now: the tablet re-enumerates, so adb drops out for a moment.
-        aoa.connect()?;
-        if let Some(adb) = &adb {
-            adb.wait_for_device()?;
+        // With adb at hand, fall back to it rather than wait for an AOA tablet forever.
+        match a.connect(adb.is_some().then_some(std::time::Duration::from_secs(5))) {
+            Ok(()) => {
+                if let Some(adb) = &adb {
+                    adb.wait_for_device()?;
+                }
+            }
+            Err(e) => {
+                warn!("USB accessory mode unavailable ({e:#}); using adb instead");
+                aoa = None;
+                aoa_mode = false;
+            }
         }
+    }
+    if !aoa_mode && let Some(adb) = &adb {
+        adb.reverse(args.port)?;
     }
 
     install_exit_handler(adb.clone(), args.port, args.keep_app)?;
