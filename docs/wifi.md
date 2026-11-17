@@ -329,6 +329,17 @@ NVENC. Tablet first on 5680 MHz −79 dBm (39–52 Mbit/s), later 5260 MHz −72
 - Next: `--max-in-flight 3`, a lower bitrate, a wired host; `pen.py` with real taps;
   2.4 GHz.
 
+2026-11-17, back-pressure (`--max-in-flight`): with 2, the longer Wi-Fi pipeline held
+the encoder back ~800 ms/s. A/B with built-in stats, `barcode.html`, 3 alternating
+runs each, 5260 MHz −67 dBm:
+- Wi-Fi: 2 → capture→shown p50 37.4–39.0 / p95 48.8–50.1, capture→sent 6.5–8.2 / ~17,
+  53–56 fps; 3 → p50 32.6–32.9 / p95 38.0–39.2, capture→sent 2.3 / 4.6, ~60 fps.
+  Sent→received unchanged (~8.3), no queueing at the decoder (wait 0.5 ms).
+- USB: 2 → p50 27.4 / p95 32–34; 3 → p50 26.7–26.9 / p95 30.5–30.9.
+- Camera (hand-held), Wi-Fi with 3: **p50 49 / p95 65 ms** (p5 26, p99 69; n = 552),
+  vs 66 / 96 with 2; three different corner sets gave identical numbers. Within the
+  target (USB: 45 / 59). Default changed to 3.
+
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
   the plan is to write the code fresh. Any file that ends up porting their code gets a

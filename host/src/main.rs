@@ -86,7 +86,7 @@ struct Args {
     #[arg(long, default_value_t = 1, hide = true)]
     boost_threads: u32,
     /// Back-pressure: max frames sent but not yet shown on the tablet (0 = off).
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 3)]
     max_in_flight: usize,
     /// Don't read the stylus device directly over adb; use Android's pen events.
     #[arg(long)]

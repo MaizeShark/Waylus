@@ -44,7 +44,7 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 | Metric | Weylus ¹ | Waylus |
 |---|---|---|
 | **Tablet behind the real monitor, photon to photon** ² | p50 **198 ms** / p95 **278 ms** (p5 139, p99 311; n = 1149) | p50 **45 ms** / p95 **59 ms** (p5 25, p99 64; n = 305) |
-| **Same, both over Wi-Fi (5 GHz)** ⁴ | p50 **183 ms** / p95 **248 ms** (p5 123, p99 273; n = 1574) | p50 **66 ms** / p95 **96 ms** (p5 30, p99 104; n = 310) |
+| **Same, both over Wi-Fi (5 GHz)** ⁴ | p50 **183 ms** / p95 **248 ms** (p5 123, p99 273; n = 1574) | p50 **49 ms** / p95 **65 ms** (p5 26, p99 69; n = 552) |
 | **Pen-down on the tablet → event on the host's input device** ³ | p50 **12.9 ms** / p95 **15.5 ms** (n = 30) | p50 **5.1 ms** / p95 **7.0 ms** (n = 30) |
 
 ¹ A local build of [Weylus](https://github.com/H-M-H/Weylus): mainly [PR #560](https://github.com/H-M-H/Weylus/pull/560) (PipeWire capture), with PipeWire adjusted to work on NVIDIA (upstream does not run on this setup). Settings: NVENC, Chrome on the tablet, "Lower Latency" on, frame-rate slider at maximum (120 fps), no stretching. Connected through an `adb reverse` tunnel rather than Wi-Fi, which favours it.
@@ -56,7 +56,7 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 
 ³ Measured with `tools/latency/pen.py` while each tool was mirroring DP-2 with video: it reads the tablet's stylus device over adb and the tool's virtual pen device on the host, both with kernel event timestamps, syncs the two clocks over a persistent adb shell (±0.4 ms), and matches 30 pen taps. Everything after the host input device (compositor, app, monitor) is the same for both tools. Waylus reads the stylus device directly (raw pen over adb); Weylus goes through Chrome's pointer events and a WebSocket. To reproduce: `python3 -I tools/latency/pen.py --host-device "Waylus Pen"` (or `"Weylus Stylus"`), then tap.
 
-⁴ Measured 2026-11-17 with `camera.py` as in ², one clip per tool, pen idle, nearly the same camera position. Tablet on 5260 MHz (channel 52, 802.11ac), RSSI −66…−69 dBm, link 351 Mbit/s. The host was also on Wi-Fi via the same access point (5260 MHz, −69 dBm), so every packet crossed the air twice. Waylus at commit 5845ba5, `waylus --wifi --no-usb` (NVENC, 20 Mbit/s, 20 % FEC; no packet lost during the clip). Weylus as in ¹, with Chrome connecting to the host's LAN address instead of the tunnel.
+⁴ Measured 2026-11-17 with `camera.py` as in ², one clip per tool, pen idle, nearly the same camera position. Tablet on 5260 MHz (channel 52, 802.11ac), RSSI −66…−69 dBm, link 351 Mbit/s. The host was also on Wi-Fi via the same access point (5260 MHz, −69 dBm), so every packet crossed the air twice. Waylus at commit c5eed34, `waylus --wifi --no-usb --max-in-flight 3` (now the default; NVENC, 20 Mbit/s, 20 % FEC). With the old default of 2 it measured p50 66 / p95 96 ms (p5 30, p99 104; n = 310; no packet lost during the clip). The camera was hand-held, so the corner points come from two frames; three corner sets gave identical results. Weylus as in ¹, with Chrome connecting to the host's LAN address instead of the tunnel.
 
 #### Where Waylus's time goes
 
@@ -69,7 +69,7 @@ Waylus logs its own per-stage timings every 5 s (clocks synced by ping/pong). Th
 
 Decode is by far the largest stage, so the tablet's chip matters most: a Pixel 7a (Tensor G2) decodes in 6–9 ms and reaches capture → shown p50 12–14 ms.
 
-Back-pressure (`--max-in-flight`, default 2) keeps a slow decoder from building a queue: the host waits and then encodes the newest frame instead of a backlog.
+Back-pressure (`--max-in-flight`, default 3; 2 until 2026-11-17, used for the numbers above) keeps a slow decoder from building a queue: the host waits and then encodes the newest frame instead of a backlog. With 2, the encoder was held back about half the time over USB and sent a capture that had already aged; 3 still never queued frames at the decoder (built-in stats, USB, 3 alternating runs each: capture → shown p50 27.4 → 26.8 ms, p95 32–34 → 30.5–31 ms).
 
 ## Requirements
 
@@ -126,7 +126,7 @@ Useful flags:
 - `--virtual[=WxH]`: create a virtual monitor instead of mirroring (GNOME / KDE). The size defaults to the tablet's screen within its decoder limits
 - `--no-raw-pen`: use Android's pen events instead of reading the stylus device over adb
 - `--boost <s>`: keep the tablet's CPU clocks up for this long after pen/touch input (default 20, 0 = off). Decoding on MediaTek tablets is much faster at high clocks, which Android only grants while you touch the screen. Costs some tablet battery while active
-- `--max-in-flight <n>`: back-pressure, max frames sent but not yet shown (default 2, 0 = off)
+- `--max-in-flight <n>`: back-pressure, max frames sent but not yet shown (default 3, 0 = off)
 - `--vendor-tweaks mtk-cpu-boost,mtk-vpp-off`: **opt-in, device-specific** MediaTek decoder settings. `mtk-cpu-boost` saved ~1.9 ms of decode on the MT8781; `mtk-vpp-off` made no measurable difference. Never used for the published comparison numbers
 - `--transport adb`: use the `adb reverse` tunnel instead of USB accessory mode (see below)
 - `--keep-app`
@@ -186,11 +186,9 @@ Other flags: `--listen ADDR` (default: every private IPv4 address of the host, n
 | Pen event → host (injected stylus input) | p50 1.6 / p95 2.5 ms | p50 3.1 / p95 33–72 ms |
 | Capture → shown on the tablet (1080p60, 20 Mbit/s) | p50 25 / p95 28 ms | p50 35–42 / p95 51–60 ms |
 
-Photon to photon over Wi-Fi (camera, see ⁴ above): Waylus p50 66 / p95 96 ms, Weylus over the same Wi-Fi 183 / 248 ms. Compared with Waylus over USB (45 / 59 ms), the built-in stats put the extra ~20 ms at p50 in two places:
-- the link (sent → received p50 8.5–9 ms vs 2.5 over USB; a 51 KB frame takes ~4 ms on air at an effective ~100 Mbit/s, because the host's own Wi-Fi shares the channel);
-- back-pressure (capture → sent 6–9 ms vs 2.5): with the longer pipeline, two frames in flight no longer cover it, and the encoder waits and then sends an already-aged capture.
+Photon to photon over Wi-Fi (camera, see ⁴ above): Waylus **p50 49 / p95 65 ms**, Weylus over the same Wi-Fi 183 / 248 ms, Waylus over USB 45 / 59 ms. What remains of the gap to USB is the link: sent → received p50 ~8.3 ms vs 2.7 over USB. A 51 KB frame takes ~4 ms on air at an effective ~100 Mbit/s, because the host's own Wi-Fi shares the channel. A wired host or a lower `--bitrate` should shrink it; not measured yet, nor is `pen.py` with real taps.
 
-A wired host, a lower `--bitrate` or `--max-in-flight 3` should each recover part of that; still to be measured, as is `pen.py` with real taps.
+With the old back-pressure default of 2 frames in flight, Wi-Fi measured 66 / 96 ms. The ~6 ms longer pipeline meant two frames no longer covered it: the encoder was held back ~800 ms/s, reached only 53–56 fps and sent captures that had already aged. Built-in stats, 3 alternating runs each, same conditions: capture → shown p50 38.3 → 32.8 ms, p95 49 → 39 ms, capture → sent 7.4 → 2.3 ms, 55 → 60 fps.
 
 ## Status / roadmap
 
