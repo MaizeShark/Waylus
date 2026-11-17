@@ -17,12 +17,7 @@ import kotlin.random.Random
  * reconnecting forever. Outgoing messages go through a queue so they can be posted
  * from the UI thread.
  */
-class Connection(
-    private val opener: () -> Link?,
-    private val listener: Listener,
-    /** For links with a SYNC handshake: give up (and call the opener again) after this long; 0 = never. */
-    private val syncGiveUpMs: Long = 0,
-) {
+class Connection(private val opener: () -> Link?, private val listener: Listener) {
     interface Listener {
         /** Called on the network thread when a session starts; return the hello message. */
         fun hello(): ByteArray
@@ -123,13 +118,9 @@ class Connection(
             val sync = Proto.sync(Random.nextLong())
             // Repeat until the host answers: it may not be running yet, or still be
             // finishing an old session.
-            val start = System.nanoTime()
             while (running) {
                 output.write(sync + hello)
                 if (l.awaitSync(sync, 1000)) break
-                if (syncGiveUpMs > 0 && System.nanoTime() - start > syncGiveUpMs * 1_000_000) {
-                    throw java.io.IOException("no host on the USB accessory link")
-                }
             }
         } else {
             output.write(hello)

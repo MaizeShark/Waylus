@@ -167,28 +167,22 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     }
 
     private fun startConnection(t: Transport) {
-        usingAccessory = t == Transport.USB || t == Transport.AUTO
+        usingAccessory = t == Transport.USB
         usingWifi = t == Transport.WIFI || t == Transport.AUTO
         Log.i(TAG, "transport: $t")
-        var usbTurn = true
         val opener: () -> Connection.Link? = when (t) {
             Transport.USB -> ({ Accessory.open(applicationContext) })
             Transport.ADB -> Connection.tcp(port)
             Transport.WIFI -> ::openWifi
-            // USB first when a host reads it (a blocked probe switches over later), else Wi-Fi.
-            Transport.AUTO -> ({
-                usbTurn = !usbTurn
-                val usb = if (usbTurn) null else Accessory.open(applicationContext)?.takeIf {
-                    Accessory.probe(1500) { runOnUiThread { conn.stop(); startConnection(Transport.USB) } }
-                }
-                usb ?: openWifi()
-            })
+            // Wi-Fi; a watcher switches to USB once a host answers there.
+            Transport.AUTO -> ::openWifi
         }
+        if (t == Transport.AUTO) watchUsb()
         if (usingWifi) discovery.start() else {
             discovery.stop()
             runOnUiThread { wifiPanel.visibility = View.GONE }
         }
-        conn = Connection(opener, this, syncGiveUpMs = if (t == Transport.AUTO) 3000 else 0)
+        conn = Connection(opener, this)
         conn.start()
     }
 
@@ -207,6 +201,37 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     }
 
     // --- Wi-Fi ---
+
+    @Volatile private var destroyed = false
+
+    /**
+     * AUTO: the tablet is still in USB accessory mode (maybe from an earlier session) but
+     * no host may serve USB. Writes to the accessory block while no host reads it and
+     * can't be cancelled, so they never happen on the connection thread: this watcher
+     * sends a SYNC and switches to USB only when a host echoes it.
+     */
+    private fun watchUsb() {
+        Thread({
+            while (!destroyed && !usingAccessory) {
+                val acc = Accessory.open(applicationContext)
+                if (acc == null) { Thread.sleep(1000); continue }
+                try {
+                    val sync = Proto.sync(kotlin.random.Random.nextLong())
+                    acc.drain()
+                    acc.output.write(sync) // blocks until a host reads the pipe
+                    if (acc.awaitSync(sync, 1500)) {
+                        Log.i(TAG, "a host answers on USB; switching from Wi-Fi to USB")
+                        runOnUiThread {
+                            if (!destroyed && !usingAccessory) { conn.stop(); startConnection(Transport.USB) }
+                        }
+                        return@Thread
+                    }
+                } catch (e: Exception) {
+                    Thread.sleep(1000)
+                }
+            }
+        }, "waylus-usb-watch").apply { isDaemon = true; start() }
+    }
 
     /** Connection opener on the network thread: connect to the paired host, or show the pairing panel. */
     private var lastWifiStatus = ""
@@ -269,9 +294,11 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         val host = wifiStore.host()
         if (wifiAddr.text.isNullOrBlank()) wifiAddr.setText(wifiStore.address ?: "")
         if (pinRow.visibility != View.VISIBLE && System.nanoTime() > pairNoteUntil) {
-            wifiMsg.text = msg ?: if (host != null) "Wi-Fi: paired with ${host.name}" else
+            wifiMsg.text = msg ?: if (host != null) "Wi-Fi: waiting for ${host.name} (run `waylus --wifi` there)" else
                 "Wi-Fi: not paired. On the computer run `waylus --wifi --pair`, then enter its address here."
         }
+        // Paired: connecting is automatic; pairing again is only needed if the host forgot us.
+        pairButton.text = if (host != null) "Pair again" else "Pair with this host"
         wifiPanel.visibility = View.VISIBLE
     }
 
@@ -342,7 +369,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
                 "Paired with $name. Connecting…"
             } catch (e: WifiLink.AuthFailed) {
                 when (e.code) {
-                    Proto.FAIL_PAIRING_OFF -> "Pairing is off on the host. Run `waylus --wifi --pair` there."
+                    Proto.FAIL_PAIRING_OFF -> "Host: ${e.message?.takeIf { it.isNotBlank() } ?: "pairing is off; run `waylus --wifi --pair` there"}"
                     Proto.FAIL_WRONG_PIN -> "Wrong PIN. Try again; the host shows a new PIN."
                     else -> "Pairing failed: ${e.message}"
                 }
@@ -391,6 +418,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
+        destroyed = true
         discovery.stop()
         boost.shutdown()
         conn.stop()

@@ -295,6 +295,10 @@ fn pair(mut s: TcpStream, req: &[u8], store: &Mutex<Store>, pairing: &Mutex<Pair
     let n = req[16] as usize;
     let name = String::from_utf8_lossy(req.get(17..17 + n).unwrap_or_default()).into_owned();
     if !pairing.lock().unwrap().open() {
+        if store.lock().unwrap().key_for(device_id).is_some() {
+            send_fail(&mut s, fail::PAIRING_OFF, "already paired; it connects by itself. To pair again, run waylus with --wifi --pair");
+            bail!("'{name}' asked to pair again, but it is already paired and connects without it (use --pair to re-pair)");
+        }
         send_fail(&mut s, fail::PAIRING_OFF, "pairing is off; run waylus with --wifi --pair");
         bail!("pairing request from '{name}', but pairing is off (start waylus with --pair to allow it)");
     }

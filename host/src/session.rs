@@ -281,6 +281,12 @@ fn session(
     let mut buf = Vec::new();
     let hello = match proto::read_msg(&mut reader, &mut buf).context("waiting for hello")? {
         DeviceMsg::Hello(h) => h,
+        // AOA: a SYNC the app sent without hello (its USB watcher while it was on Wi-Fi);
+        // its real session follows with a fresh SYNC.
+        DeviceMsg::Sync(_) => {
+            debug!("USB probe from the app; waiting for its session");
+            return Ok(());
+        }
         m => bail!("expected hello, got {m:?}"),
     };
     info!(

@@ -240,11 +240,13 @@ moonlight-common-c (`src/RtpVideoQueue.c`, `src/ControlStream.c`, `src/InputStre
 - QoS tags: the host's UDP socket (video, pings) uses AF41 (WMM video); the tablet's
   input/feedback socket uses EF (WMM voice). No clear effect measured yet (§3).
 - The app, when started from the launcher while the tablet is still in USB accessory
-  mode from an earlier session, uses AUTO: it probes USB with a frame the host ignores.
-  A write to the accessory only completes while a host reads the pipe and can't be
-  cancelled, so the probe runs on its own thread with a 1.5 s timeout. If it times
-  out, the app uses Wi-Fi meanwhile and switches to USB once the stuck write completes
-  (a host appeared).
+  mode from an earlier session, uses AUTO: Wi-Fi for the connection, plus a watcher
+  thread that sends a SYNC over USB and switches to USB once a host echoes it (~1.3 s
+  after the host starts serving USB). A write to the accessory blocks while no host
+  reads the pipe and can't be cancelled, so it must never happen on the connection
+  thread. A first version probed with a small write and a timeout, but the driver
+  buffers a few writes, so the probe passed and the real handshake then blocked
+  forever (the app never reconnected; reported by the user 2026-11-17).
 - A newer authenticated link preempts the running session on the host (tablet
   reconnects after a Wi-Fi drop or a host restart without waiting for the 5 s idle
   timeout).
