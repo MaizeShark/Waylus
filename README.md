@@ -43,8 +43,7 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 | Metric | Weylus ¹ | Waylus |
 |---|---|---|
 | **Tablet behind the real monitor, photon to photon** ² | p50 **198 ms** / p95 **278 ms** (p5 139, p99 311; n = 1149) | p50 **45 ms** / p95 **59 ms** (p5 25, p99 64; n = 305) |
-| Capture → frame shown (built-in stats) ³ | – | p50 ~17 ms (while drawing) / ~21 ms (pen idle), full-screen motion |
-| Pen-down on the tablet → event on the host's input device ⁴ | p50 **12.9 ms** / p95 **15.5 ms** (n = 30) | p50 **5.1 ms** / p95 **7.0 ms** (n = 30) |
+| **Pen-down on the tablet → event on the host's input device** ³ | p50 **12.9 ms** / p95 **15.5 ms** (n = 30) | p50 **5.1 ms** / p95 **7.0 ms** (n = 30) |
 
 ¹ A local build of [Weylus](https://github.com/H-M-H/Weylus) with niri/NVIDIA fixes (upstream does not run on this setup). Settings: NVENC, Chrome on the tablet, "Lower Latency" on, frame-rate slider at maximum (120 fps), no stretching. Connected through an `adb reverse` tunnel rather than Wi-Fi, which favours it.
 
@@ -53,14 +52,18 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 - The rolling shutter often catches the monitor mid-refresh, so the monitor's timestamps are fitted as a line over the camera frames and every readable tablet frame counts.
 - An earlier method, `tools/latency/probe.py`, compared tablet screenshots against an overlay showing Android's expected present time. Its bias differs per tool: it read ~34 ms above the camera for Waylus (it includes the host's own render and compositing) but 21 ms *below* it for Weylus (177 vs 198 ms p50, re-measured the same day), so a screenshot apparently shows a browser client's frames before they reach the glass. It is kept for quick checks of Waylus alone, not for comparisons.
 
-⁴ Measured with `tools/latency/pen.py` while each tool was mirroring DP-2 with video: it reads the tablet's stylus device over adb and the tool's virtual pen device on the host, both with kernel event timestamps, syncs the two clocks over a persistent adb shell (±0.4 ms), and matches 30 pen taps. Everything after the host input device (compositor, app, monitor) is the same for both tools. Waylus reads the stylus device directly (raw pen over adb); Weylus goes through Chrome's pointer events and a WebSocket. To reproduce: `python3 -I tools/latency/pen.py --host-device "Waylus Pen"` (or `"Weylus Stylus"`), then tap.
+³ Measured with `tools/latency/pen.py` while each tool was mirroring DP-2 with video: it reads the tablet's stylus device over adb and the tool's virtual pen device on the host, both with kernel event timestamps, syncs the two clocks over a persistent adb shell (±0.4 ms), and matches 30 pen taps. Everything after the host input device (compositor, app, monitor) is the same for both tools. Waylus reads the stylus device directly (raw pen over adb); Weylus goes through Chrome's pointer events and a WebSocket. To reproduce: `python3 -I tools/latency/pen.py --host-device "Waylus Pen"` (or `"Weylus Stylus"`), then tap.
 
-³ Waylus logs these every 5 s, split into stages. It syncs the clocks with ping/pong. "Shown" is the decoder's render callback, so it excludes scan-out. Typical breakdown at 1080p with the whole screen changing every frame (barcode page), capture→shown p50 ~21 / p95 ~25 ms:
+#### Where Waylus's time goes
+
+Waylus logs its own per-stage timings every 5 s (clocks synced by ping/pong). They cover capture → the decoded frame being handed to the tablet's compositor, so they leave out what the camera sees on top: the tablet's compositing and refresh (~1–2 frames at 60 Hz), minus the real monitor's own delay. Typical values at 1080p with the whole screen changing every frame (barcode page), capture → shown p50 ~21 / p95 ~25 ms with the pen idle, ~17 ms while drawing:
 - capture → sent (GPU blit/scale + CUDA copy + NVENC): p50 ~2.5 / p95 ~4 ms
-- sent → received (USB via adb): p50 ~2 / p95 ~3.5 ms
+- sent → received (USB): p50 ~2.5 / p95 ~3 ms
 - waiting for the decoder: ~0.5 ms
-- hardware decode on the MT8781: ~19 ms with the pen idle, **~11.5 ms while drawing**. MediaTek's decoder speed follows the CPU clock, and Android only raises the clocks while there is touch/pen input (the same effect is discussed in [moonlight-android#1241](https://github.com/moonlight-stream/moonlight-android/issues/1241)). With the pen in use, capture→shown is p50 ~17 ms. `--boost` (on by default) keeps the clocks up for 20 s after the last input, so this also holds between strokes
+- hardware decode on the MT8781: ~19 ms with the pen idle, **~11.5 ms while drawing**. MediaTek's decoder speed follows the CPU clock, and Android only raises the clocks while there is touch/pen input (the same effect is discussed in [moonlight-android#1241](https://github.com/moonlight-stream/moonlight-android/issues/1241)). `--boost` (on by default) keeps the clocks up for 20 s after the last input, so the faster decode also holds between strokes
 - decoded → shown: ~1.5 ms
+
+Decode is by far the largest stage, so the tablet's chip matters most: a Pixel 7a (Tensor G2) decodes in 6–9 ms and reaches capture → shown p50 12–14 ms.
 
 Back-pressure (`--max-in-flight`, default 2) keeps a slow decoder from building a queue: the host waits and then encodes the newest frame instead of a backlog.
 
