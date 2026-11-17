@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Hardware H.264 encoding through FFmpeg (NVENC first, VAAPI fallback later).
+//! Hardware H.264 encoding through FFmpeg: NVENC (NVIDIA) or VAAPI (Intel / AMD).
 //!
-//! RGB frames from PipeWire go straight into NVENC, which does the colour
-//! conversion on the GPU. Low-latency settings: no B-frames, no lookahead,
-//! one-frame VBV, infinite GOP with keyframes only on request.
+//! RGB frames go straight into NVENC, which does the colour conversion on the GPU.
+//! VAAPI encoders want NV12: frames are converted with swscale and uploaded to a
+//! VAAPI surface. Low-latency settings: no B-frames, no lookahead, a short VBV,
+//! infinite GOP with keyframes only on request.
 
 use anyhow::{Context, Result, anyhow, bail};
 use ffmpeg_next as ff;
 use ff::{codec, format::Pixel, frame, picture};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::capture::{Frame, PixFmt};
 
@@ -36,6 +37,98 @@ pub struct Encoder {
     pending_ns: std::collections::VecDeque<(i64, u64)>,
     pkt: ff::Packet,
     force_key: bool,
+    vaapi: Option<Vaapi>,
+}
+
+/// Picks the encoder for `auto`: NVENC when the NVIDIA driver is present, else VAAPI.
+pub fn auto_encoder() -> &'static str {
+    let nvidia = unsafe { libloading::Library::new("libcuda.so.1") }.is_ok();
+    if nvidia { "h264_nvenc" } else { "h264_vaapi" }
+}
+
+/// CPU frames → NV12 VAAPI surfaces.
+struct Vaapi {
+    frames_ctx: *mut ff::ffi::AVBufferRef,
+    sws: *mut ff::ffi::SwsContext,
+    nv12: frame::Video,
+}
+
+impl Vaapi {
+    fn new(width: u32, height: u32, format: PixFmt) -> Result<Self> {
+        use ff::ffi;
+        unsafe {
+            let dev_path = std::env::var("WAYLUS_VAAPI_DEVICE").ok().map(|p| std::ffi::CString::new(p).unwrap());
+            let mut dev = std::ptr::null_mut();
+            let r = ffi::av_hwdevice_ctx_create(
+                &mut dev,
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                dev_path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                std::ptr::null_mut(),
+                0,
+            );
+            if r < 0 {
+                bail!("VAAPI device: {}", ff::Error::from(r));
+            }
+            let mut fr = ffi::av_hwframe_ctx_alloc(dev);
+            ffi::av_buffer_unref(&mut dev);
+            if fr.is_null() {
+                bail!("av_hwframe_ctx_alloc failed");
+            }
+            let fc = (*fr).data as *mut ffi::AVHWFramesContext;
+            (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*fc).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*fc).width = width as i32;
+            (*fc).height = height as i32;
+            (*fc).initial_pool_size = 8;
+            let r = ffi::av_hwframe_ctx_init(fr);
+            if r < 0 {
+                ffi::av_buffer_unref(&mut fr);
+                bail!("VAAPI frames context: {}", ff::Error::from(r));
+            }
+            let (w, h) = (width as i32, height as i32);
+            let src: ffi::AVPixelFormat = pixel(format).into();
+            const SWS_BILINEAR: i32 = 2;
+            let sws = ffi::sws_getContext(w, h, src, w, h, ffi::AVPixelFormat::AV_PIX_FMT_NV12, SWS_BILINEAR, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            if sws.is_null() {
+                ffi::av_buffer_unref(&mut fr);
+                bail!("sws_getContext failed");
+            }
+            // Full-range RGB → limited-range BT.709, matching what the stream signals.
+            let bt709 = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
+            ffi::sws_setColorspaceDetails(sws, bt709, 1, bt709, 0, 0, 1 << 16, 1 << 16);
+            Ok(Self { frames_ctx: fr, sws, nv12: frame::Video::new(Pixel::NV12, width, height) })
+        }
+    }
+
+    /// Converts and uploads one frame; returns the VAAPI frame.
+    fn upload(&mut self, f: &Frame) -> Result<frame::Video> {
+        use ff::ffi;
+        unsafe {
+            let src = [f.data.as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null()];
+            let stride = [f.stride as i32, 0, 0, 0];
+            let dst = self.nv12.as_mut_ptr();
+            ffi::sws_scale(self.sws, src.as_ptr(), stride.as_ptr(), 0, f.height as i32, (*dst).data.as_ptr(), (*dst).linesize.as_ptr());
+            let mut hw = frame::Video::empty();
+            let r = ffi::av_hwframe_get_buffer(self.frames_ctx, hw.as_mut_ptr(), 0);
+            if r < 0 {
+                bail!("VAAPI surface: {}", ff::Error::from(r));
+            }
+            let r = ffi::av_hwframe_transfer_data(hw.as_mut_ptr(), dst, 0);
+            if r < 0 {
+                bail!("upload to VAAPI surface: {}", ff::Error::from(r));
+            }
+            Ok(hw)
+        }
+    }
+}
+
+impl Drop for Vaapi {
+    fn drop(&mut self) {
+        unsafe {
+            ff::ffi::sws_freeContext(self.sws);
+            ff::ffi::av_buffer_unref(&mut self.frames_ctx);
+        }
+    }
 }
 
 fn pixel(f: PixFmt) -> Pixel {
@@ -66,54 +159,108 @@ impl Encoder {
             let scaled = 20e6 * (width * height) as f64 / (1920.0 * 1080.0);
             scaled.clamp(8e6, 60e6) as usize
         });
-        let mut ctx = codec::context::Context::new_with_codec(codec);
-        ctx.set_flags(codec::Flags::GLOBAL_HEADER | codec::Flags::LOW_DELAY);
-        let mut enc = ctx.encoder().video()?;
-        enc.set_width(width);
-        enc.set_height(height);
-        enc.set_format(pixel(format));
-        if let Some(hw) = hw_frames {
-            unsafe {
-                let c = enc.as_mut_ptr();
-                (*c).pix_fmt = ff::ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
-                (*c).hw_frames_ctx = ff::ffi::av_buffer_ref(hw);
+        let hw_format = hw_frames.map(|h| unsafe { (*((*h).data as *mut ff::ffi::AVHWFramesContext)).format });
+        let vaapi = if opts.encoder.contains("vaapi") && hw_frames.is_none() {
+            Some(Vaapi::new(width, height, format)?)
+        } else {
+            None
+        };
+        let vaapi_ref = vaapi.as_ref();
+        // cqp: constant quantiser instead of CBR, for VAAPI drivers without rate control.
+        let open = |cqp: bool| -> Result<ff::encoder::video::Encoder> {
+            let vaapi = vaapi_ref;
+            let mut ctx = codec::context::Context::new_with_codec(codec);
+            ctx.set_flags(codec::Flags::GLOBAL_HEADER | codec::Flags::LOW_DELAY);
+            let mut enc = ctx.encoder().video()?;
+            enc.set_width(width);
+            enc.set_height(height);
+            enc.set_format(pixel(format));
+            if let Some(hw) = hw_frames {
+                unsafe {
+                    let c = enc.as_mut_ptr();
+                    (*c).pix_fmt = hw_format.unwrap();
+                    (*c).hw_frames_ctx = ff::ffi::av_buffer_ref(hw);
+                }
             }
-        }
-        enc.set_time_base((1, 1_000_000));
-        enc.set_frame_rate(Some((opts.fps as i32, 1)));
-        enc.set_bit_rate(bitrate);
-        enc.set_max_bit_rate(bitrate);
-        enc.set_max_b_frames(0);
-        enc.set_gop(i32::MAX as u32);
-        enc.set_colorspace(ff::color::Space::BT709);
-        enc.set_color_primaries(ff::color::Primaries::BT709);
-        enc.set_color_transfer_characteristic(ff::color::TransferCharacteristic::BT709);
-        enc.set_color_range(ff::color::Range::MPEG);
-        unsafe {
-            // A few frames of VBV: lets keyframes reach usable quality while keeping the
-            // worst-case frame small (~170 KB at 20 Mbit/s, ~5 ms over USB 2.0).
-            (*enc.as_mut_ptr()).rc_buffer_size = (bitrate / opts.fps.max(1) as usize * 4) as i32;
-        }
+            if let Some(v) = vaapi {
+                unsafe {
+                    let c = enc.as_mut_ptr();
+                    (*c).pix_fmt = ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                    (*c).hw_frames_ctx = ff::ffi::av_buffer_ref(v.frames_ctx);
+                }
+            }
+            enc.set_time_base((1, 1_000_000));
+            enc.set_frame_rate(Some((opts.fps as i32, 1)));
+            if !cqp {
+                enc.set_bit_rate(bitrate);
+                enc.set_max_bit_rate(bitrate);
+            }
+            enc.set_max_b_frames(0);
+            enc.set_gop(i32::MAX as u32);
+            enc.set_colorspace(ff::color::Space::BT709);
+            enc.set_color_primaries(ff::color::Primaries::BT709);
+            enc.set_color_transfer_characteristic(ff::color::TransferCharacteristic::BT709);
+            enc.set_color_range(ff::color::Range::MPEG);
+            unsafe {
+                // A few frames of VBV: lets keyframes reach usable quality while keeping the
+                // worst-case frame small (~170 KB at 20 Mbit/s, ~5 ms over USB 2.0).
+                if !cqp {
+                    (*enc.as_mut_ptr()).rc_buffer_size = (bitrate / opts.fps.max(1) as usize * 4) as i32;
+                }
+            }
 
-        let mut dict = ff::Dictionary::new();
-        if opts.encoder.contains("nvenc") {
-            dict.set("preset", "p1");
-            dict.set("tune", "ull");
-            dict.set("zerolatency", "1");
-            dict.set("delay", "0");
-            dict.set("rc", "cbr");
-            dict.set("rc-lookahead", "0");
-            dict.set("forced-idr", "1");
-            dict.set("profile", "high");
-        }
-        let enc = enc.open_as_with(codec, dict).with_context(|| format!("open {}", opts.encoder))?;
+            let mut dict = ff::Dictionary::new();
+            if opts.encoder.contains("nvenc") {
+                dict.set("preset", "p1");
+                dict.set("tune", "ull");
+                dict.set("zerolatency", "1");
+                dict.set("delay", "0");
+                dict.set("rc", "cbr");
+                dict.set("rc-lookahead", "0");
+                dict.set("forced-idr", "1");
+                dict.set("profile", "high");
+            } else if opts.encoder.contains("vaapi") {
+                // Default depth 2 keeps a frame queued in the driver: one frame of latency.
+                dict.set("async_depth", "1");
+                if cqp {
+                    dict.set("rc_mode", "CQP");
+                    dict.set("qp", "24");
+                } else {
+                    dict.set("rc_mode", "CBR");
+                }
+                dict.set("profile", "high");
+            }
+            enc.open_as_with(codec, dict).with_context(|| format!("open {}", opts.encoder))
+        };
+        let mut cqp = false;
+        let enc = match open(false) {
+            Ok(e) => e,
+            Err(e) if opts.encoder.contains("vaapi") => {
+                // Debian's free intel-media-va-driver only offers CQP on older Intel GPUs.
+                warn!(
+                    "{e:#}: this VAAPI driver has no bitrate control, using constant QP. For CBR, \
+                     try LIBVA_DRIVER_NAME=i965 (older Intel) or intel-media-va-driver-non-free"
+                );
+                cqp = true;
+                open(true)?
+            }
+            Err(e) => return Err(e),
+        };
         info!(
-            "encoder {} {}x{} {} {} kbit/s",
+            "encoder {} {}x{} {} {}",
             opts.encoder,
             width,
             height,
-            if hw_frames.is_some() { "CUDA (zero-copy)".to_string() } else { format!("{format:?}") },
-            bitrate / 1000
+            if hw_format == Some(ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI) {
+                "NV12 VAAPI surfaces (zero-copy)".to_string()
+            } else if hw_frames.is_some() {
+                "CUDA (zero-copy)".to_string()
+            } else if vaapi.is_some() {
+                format!("{format:?} → NV12 (CPU) → VAAPI")
+            } else {
+                format!("{format:?}")
+            },
+            if cqp { "CQP 24".to_string() } else { format!("{} kbit/s", bitrate / 1000) }
         );
         let frame = frame::Video::new(pixel(format), width, height);
         Ok(Self {
@@ -126,6 +273,7 @@ impl Encoder {
             pending_ns: Default::default(),
             pkt: ff::Packet::empty(),
             force_key: true,
+            vaapi,
         })
     }
 
@@ -159,12 +307,17 @@ impl Encoder {
         self.force_key = false;
         self.pending_ns.push_back((pts, capture_ns));
         if let Some(gpu) = &f.gpu {
-            // New reference to the same CUDA buffer. (ffmpeg-next's clone() would try
+            // New reference to the same GPU buffer. (ffmpeg-next's clone() would try
             // a deep CPU copy, which fails for hardware frames.)
             let mut fr = unsafe { frame::Video::wrap(ff::ffi::av_frame_clone(gpu.as_ptr())) };
             fr.set_pts(Some(pts));
             fr.set_kind(kind);
-            self.enc.send_frame(&fr).context("send CUDA frame to encoder")?;
+            self.enc.send_frame(&fr).context("send GPU frame to encoder")?;
+        } else if let Some(v) = self.vaapi.as_mut() {
+            let mut fr = v.upload(f)?;
+            fr.set_pts(Some(pts));
+            fr.set_kind(kind);
+            self.enc.send_frame(&fr).context("send VAAPI frame to encoder")?;
         } else {
             let row = self.width as usize * 4;
             let dst_stride = self.frame.stride(0);

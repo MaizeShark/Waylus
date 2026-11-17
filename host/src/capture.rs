@@ -86,6 +86,12 @@ fn token_path() -> PathBuf {
 /// tablet's rate happens on our side (see [`Capture::pace_ns`]).
 /// `virtual_size`: instead of mirroring a monitor, ask the compositor for a new
 /// virtual monitor of that size (portal source type VIRTUAL).
+/// Which GPU path frames take to the encoder (set from the chosen encoder).
+pub static ZERO_COPY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(ZERO_COPY_CUDA);
+pub const ZERO_COPY_NONE: u8 = 0;
+pub const ZERO_COPY_CUDA: u8 = 1;
+pub const ZERO_COPY_VAAPI: u8 = 2;
+
 pub fn start(source_max_fps: u32, choose_again: bool, virtual_size: Option<(u32, u32)>) -> Result<Capture> {
     let (geo_tx, geo_rx) = crossbeam_channel::bounded::<Result<(StreamGeometry, u32, std::os::fd::OwnedFd)>>(1);
     let frames = Arc::new(LatestSlot::new());
@@ -187,7 +193,7 @@ struct UserData {
     format: Option<PixFmt>,
     dmabuf: bool,
     importer: Option<Importer>,
-    interop: Option<crate::cuda::Interop>,
+    interop: Option<crate::dmabuf::Interop>,
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
     source_size: Arc<AtomicU64>,
@@ -387,7 +393,12 @@ fn run_pipewire(
         format: None,
         dmabuf: false,
         interop: if importer.is_some() && std::env::var_os("WAYLUS_NO_ZEROCOPY").is_none() {
-            crate::cuda::Interop::new().map_err(|e| info!("zero-copy unavailable ({e:#}); using readback")).ok()
+            let r = match ZERO_COPY.load(Ordering::Relaxed) {
+                ZERO_COPY_CUDA => crate::cuda::Interop::new().map(crate::dmabuf::Interop::Cuda),
+                ZERO_COPY_VAAPI => crate::vaapi::Interop::new().map(crate::dmabuf::Interop::Vaapi),
+                _ => Err(anyhow::anyhow!("not supported for this encoder")),
+            };
+            r.map_err(|e| info!("zero-copy unavailable ({e:#}); using readback")).ok()
         } else {
             None
         },

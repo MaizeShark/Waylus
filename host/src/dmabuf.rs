@@ -2,9 +2,9 @@
 //! DMA-BUF import via EGL + OpenGL.
 //!
 //! Compositors such as niri only hand out GPU buffers (DMA-BUF) for
-//! screencasts. We import them as EGLImages, attach them to a framebuffer and
-//! read them back into system memory for the encoder.
-//! TODO: zero-copy path (CUDA/GL interop or Vulkan) straight into NVENC.
+//! screencasts. We import them as EGLImages and blit (and scale) them into our own
+//! texture, then either read that back into system memory, hand it to NVENC through
+//! CUDA, or convert it to NV12 straight into VAAPI encoder surfaces.
 
 use std::{collections::HashMap, ffi::c_void, os::fd::RawFd};
 
@@ -66,7 +66,44 @@ pub struct Importer {
     /// Bumped whenever `pbo` is recreated. GL reuses object names, so the name
     /// alone can't tell CUDA that its registration now points at freed memory.
     pbo_generation: u64,
+    /// VAAPI path: render targets per surface (VASurfaceID → luma, chroma), for
+    /// pool generation `.0`.
+    nv12_targets: (u64, HashMap<usize, (Imported, Imported)>),
+    nv12_prog: Option<(glow::Program, glow::VertexArray)>,
 }
+
+/// GPU encoder the zero-copy path feeds.
+pub enum Interop {
+    Cuda(crate::cuda::Interop),
+    Vaapi(crate::vaapi::Interop),
+}
+
+const NV12_VS: &str = "#version 330 core
+void main() {
+    // Full-screen triangle.
+    vec2 p = vec2(float((gl_VertexID & 1) << 2), float((gl_VertexID & 2) << 1)) - 1.0;
+    gl_Position = vec4(p, 0.0, 1.0);
+}";
+
+// BT.709, limited range (what the stream signals). Texture row 0 is the top image row,
+// and so is row 0 of each target: no flips.
+const NV12_FS: &str = "#version 330 core
+uniform sampler2D src;
+uniform int chroma;
+out vec4 o;
+void main() {
+    if (chroma == 0) {
+        vec3 c = texelFetch(src, ivec2(gl_FragCoord.xy), 0).rgb;
+        o = vec4(16.0 / 255.0 + dot(c, vec3(0.2126, 0.7152, 0.0722)) * (219.0 / 255.0), 0.0, 0.0, 1.0);
+    } else {
+        // Bilinear sample at the centre of the 2x2 block = its average.
+        vec2 size = vec2(textureSize(src, 0));
+        vec3 c = texture(src, floor(gl_FragCoord.xy) * 2.0 / size + 1.0 / size).rgb;
+        float u = 128.0 / 255.0 + dot(c, vec3(-0.1146, -0.3854, 0.5)) * (224.0 / 255.0);
+        float v = 128.0 / 255.0 + dot(c, vec3(0.5, -0.4542, -0.0458)) * (224.0 / 255.0);
+        o = vec4(u, v, 0.0, 1.0);
+    }
+}";
 
 impl Importer {
     /// Creates a surfaceless EGL/OpenGL context on the first DRM GPU.
@@ -101,7 +138,7 @@ impl Importer {
             .flatten()
             .map(|p| unsafe { std::mem::transmute::<extern "system" fn(), QueryModifiers>(p) });
         info!("EGL importer: {}", unsafe { gl.get_parameter_string(glow::RENDERER) });
-        Ok(Self { egl, display, _ctx: ctx, gl, image_target, query_modifiers, cache: HashMap::new(), staging: None, pbo: None, pbo_generation: 0 })
+        Ok(Self { egl, display, _ctx: ctx, gl, image_target, query_modifiers, cache: HashMap::new(), staging: None, pbo: None, pbo_generation: 0, nv12_targets: (0, HashMap::new()), nv12_prog: None })
     }
 
     fn open_display(egl: &Egl) -> Result<egl::Display> {
@@ -232,6 +269,8 @@ impl Importer {
                 let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                 gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, ow as i32, oh as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
                 let fbo = gl.create_framebuffer().map_err(|e| anyhow!(e))?;
                 gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
                 gl.framebuffer_texture_2d(glow::DRAW_FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
@@ -286,9 +325,123 @@ impl Importer {
         Ok(())
     }
 
-    /// Zero-copy variant: the scaled frame stays on the GPU as an FFmpeg CUDA frame.
+    /// Zero-copy variant: the scaled frame stays on the GPU as an FFmpeg hardware
+    /// frame (CUDA RGB0 or VAAPI NV12) for the encoder.
     #[allow(clippy::too_many_arguments)]
     pub fn read_gpu(
+        &mut self,
+        w: u32,
+        h: u32,
+        ow: u32,
+        oh: u32,
+        format: u32,
+        modifier: u64,
+        planes: &[Plane],
+        interop: &mut Interop,
+    ) -> Result<ffmpeg_next::frame::Video> {
+        match interop {
+            Interop::Cuda(i) => self.read_cuda(w, h, ow, oh, format, modifier, planes, i),
+            Interop::Vaapi(i) => self.read_vaapi(w, h, ow, oh, format, modifier, planes, i),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_vaapi(
+        &mut self,
+        w: u32,
+        h: u32,
+        ow: u32,
+        oh: u32,
+        format: u32,
+        modifier: u64,
+        planes: &[Plane],
+        interop: &mut crate::vaapi::Interop,
+    ) -> Result<ffmpeg_next::frame::Video> {
+        let src = self.blit(w, h, ow, oh, format, modifier, planes)?;
+        let (frame, surface) = interop.get(ow, oh)?;
+        if self.nv12_targets.0 != interop.generation {
+            for (_, (y, uv)) in std::mem::take(&mut self.nv12_targets.1) {
+                self.release(y);
+                self.release(uv);
+            }
+            self.nv12_targets.0 = interop.generation;
+        }
+        if !self.nv12_targets.1.contains_key(&surface) {
+            let exp = interop.export(&frame)?;
+            let (l0, l1) = (&exp.layers[0], &exp.layers[1]);
+            let y = self.import(ow, oh, l0.drm_format, l0.modifier, &[l0.plane]).context("import luma surface")?;
+            let uv = self.import(ow.div_ceil(2), oh.div_ceil(2), l1.drm_format, l1.modifier, &[l1.plane]).context("import chroma surface")?;
+            debug!("VAAPI surface {surface:#x}: luma {:#x}/{:#x}, chroma {:#x}", l0.drm_format, l0.modifier, l1.drm_format);
+            self.nv12_targets.1.insert(surface, (y, uv));
+        }
+        let (prog, vao) = match self.nv12_prog {
+            Some(p) => p,
+            None => {
+                let p = self.nv12_program()?;
+                self.nv12_prog = Some(p);
+                p
+            }
+        };
+        let (y_fbo, uv_fbo) = {
+            let (y, uv) = &self.nv12_targets.1[&surface];
+            (y.fbo, uv.fbo)
+        };
+        unsafe {
+            let gl = &self.gl;
+            gl.use_program(Some(prog));
+            gl.bind_vertex_array(Some(vao));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(glow::NativeTexture(std::num::NonZeroU32::new(src).unwrap())));
+            gl.uniform_1_i32(gl.get_uniform_location(prog, "src").as_ref(), 0);
+            let chroma = gl.get_uniform_location(prog, "chroma");
+            for (fbo, vw, vh, c) in [(y_fbo, ow, oh, 0), (uv_fbo, ow.div_ceil(2), oh.div_ceil(2), 1)] {
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
+                gl.viewport(0, 0, vw as i32, vh as i32);
+                gl.uniform_1_i32(chroma.as_ref(), c);
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            }
+            // The encoder reads the surface right away: wait until it's written.
+            gl.finish();
+            let err = gl.get_error();
+            if err != glow::NO_ERROR {
+                bail!("GL error {err:#x} converting to NV12");
+            }
+        }
+        Ok(frame)
+    }
+
+    fn nv12_program(&self) -> Result<(glow::Program, glow::VertexArray)> {
+        unsafe {
+            let gl = &self.gl;
+            let prog = gl.create_program().map_err(|e| anyhow!(e))?;
+            for (kind, src) in [(glow::VERTEX_SHADER, NV12_VS), (glow::FRAGMENT_SHADER, NV12_FS)] {
+                let sh = gl.create_shader(kind).map_err(|e| anyhow!(e))?;
+                gl.shader_source(sh, src);
+                gl.compile_shader(sh);
+                if !gl.get_shader_compile_status(sh) {
+                    bail!("NV12 shader: {}", gl.get_shader_info_log(sh));
+                }
+                gl.attach_shader(prog, sh);
+            }
+            gl.link_program(prog);
+            if !gl.get_program_link_status(prog) {
+                bail!("NV12 program: {}", gl.get_program_info_log(prog));
+            }
+            let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
+            Ok((prog, vao))
+        }
+    }
+
+    fn release(&self, imp: Imported) {
+        unsafe {
+            self.gl.delete_framebuffer(imp.fbo);
+            self.gl.delete_texture(imp.tex);
+        }
+        let _ = self.egl.destroy_image(self.display, imp.image);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_cuda(
         &mut self,
         w: u32,
         h: u32,
@@ -330,12 +483,9 @@ impl Importer {
 
     /// Forget imported buffers (after renegotiation / buffer removal).
     pub fn clear(&mut self) {
-        for (_, imp) in self.cache.drain() {
-            unsafe {
-                self.gl.delete_framebuffer(imp.fbo);
-                self.gl.delete_texture(imp.tex);
-            }
-            let _ = self.egl.destroy_image(self.display, imp.image);
+        let cache: Vec<_> = self.cache.drain().map(|(_, i)| i).collect();
+        for imp in cache {
+            self.release(imp);
         }
     }
 }

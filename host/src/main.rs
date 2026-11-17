@@ -16,6 +16,7 @@ mod proto;
 mod rawpen;
 mod session;
 mod slot;
+mod vaapi;
 
 use std::path::PathBuf;
 
@@ -33,8 +34,9 @@ struct Args {
     /// mapping hint and, with --no-video, for the aspect ratio.
     #[arg(long, short)]
     output: Option<String>,
-    /// FFmpeg encoder to use.
-    #[arg(long, default_value = "h264_nvenc")]
+    /// FFmpeg encoder: h264_nvenc, h264_vaapi, or auto (NVENC if an NVIDIA driver is
+    /// present, else VAAPI).
+    #[arg(long, default_value = "auto")]
     encoder: String,
     /// Video bitrate in Mbit/s (default: 20 at 1080p, scaled with resolution).
     #[arg(long)]
@@ -104,6 +106,23 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
+    let encoder = match args.encoder.as_str() {
+        "auto" => encode::auto_encoder().to_owned(),
+        e => e.to_owned(),
+    };
+    if !args.no_video {
+        info!("encoder: {encoder}");
+    }
+    capture::ZERO_COPY.store(
+        if encoder.contains("nvenc") {
+            capture::ZERO_COPY_CUDA
+        } else if encoder.contains("vaapi") {
+            capture::ZERO_COPY_VAAPI
+        } else {
+            capture::ZERO_COPY_NONE
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut aoa_mode = args.transport == TransportArg::Aoa;
     let mut adb = (!args.no_adb).then(|| adb::Adb::new(args.serial.clone()));
     let mut serial = args.serial.clone();
@@ -228,7 +247,7 @@ fn main() -> Result<()> {
     session::serve(
         session::Opts {
             enc: encode::EncoderOpts {
-                encoder: args.encoder.clone(),
+                encoder: encoder.clone(),
                 bitrate: args.bitrate.map(|b| (b * 1e6) as usize),
                 fps: args.fps.unwrap_or(60),
             },

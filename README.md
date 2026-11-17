@@ -13,10 +13,10 @@ Waylus mirrors one of your monitors to the tablet using hardware H.264 encode an
 Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet through libinput and the Wayland tablet protocol.
 
 ```
- host (Rust)                                                   tablet (Kotlin)
- ScreenCast portal → PipeWire → NVENC H.264 ─┐   adb reverse   ┌→ MediaCodec (HW) → SurfaceView
-                                             ├── USB / TCP ────┤
- uinput pen + touchscreen  ← input events  ←─┘                 └← MotionEvent (unbuffered)
+ host (Rust)                                                        tablet (Kotlin)
+ ScreenCast portal → PipeWire → NVENC / VAAPI H.264 ─┐  USB (AOA,   ┌→ MediaCodec (HW) → SurfaceView
+                                                     ├─ or adb) ────┤
+ uinput pen + touchscreen  ← input events  ←─────────┘              └← MotionEvent (unbuffered)
 ```
 
 ## Waylus vs Weylus
@@ -28,7 +28,7 @@ Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet t
 | Tablet client | Any modern web browser | Native Android app |
 | Transport | Wi-Fi / LAN, HTTP + WebSocket | USB: raw USB with Android Open Accessory (no USB debugging needed), or an `adb reverse` tunnel |
 | Host OS focus | Linux (X11 first, Wayland experimental), Windows, macOS | Linux, Wayland first (xdg-desktop-portal + PipeWire) |
-| Video encode | FFmpeg; software by default, VAAPI / NVENC / VideoToolbox optional | NVENC, zero-copy on the GPU (compositor DMA-BUF → GL blit/scale → CUDA → NVENC), low-latency tuned: no B-frames, no lookahead, small VBV, keyframes on demand; VAAPI planned |
+| Video encode | FFmpeg; software by default, VAAPI / NVENC / VideoToolbox optional | NVENC or VAAPI, zero-copy on the GPU (compositor DMA-BUF → GL blit/scale → CUDA → NVENC, or → GL NV12 shader → VAAPI surface), low-latency tuned: no B-frames, no lookahead, small VBV, keyframes on demand |
 | Video decode | In the browser | Android `MediaCodec` hardware decoder straight to a `SurfaceView` |
 | Pen input | Browser PointerEvents: pressure and tilt | The tablet's raw stylus evdev device, read over adb: full sensor resolution, pressure, both tilt axes, hover, buttons, eraser. Falls back to unbuffered `MotionEvent`s |
 | Touch | Multitouch | Multitouch, with palm rejection while the pen is near |
@@ -71,7 +71,7 @@ The Waylus probe numbers were re-measured on 2026-11-16 (commit 994ec89: zero-co
 
 **Host**
 - Linux with a Wayland compositor that implements the ScreenCast portal. Tested on niri (xdg-desktop-portal-gnome), KDE Plasma 6.8 and GNOME 51. Hyprland should work.
-- PipeWire, FFmpeg ≥ 9 with `h264_nvenc` (an NVIDIA GPU). `adb` is optional: it installs and starts the app and enables raw pen input.
+- PipeWire, FFmpeg ≥ 7.1 with `h264_nvenc` (NVIDIA) or `h264_vaapi` (Intel / AMD; tested on Intel UHD 620 with Debian 13). `adb` is optional: it installs and starts the app and enables raw pen input.
 - Write access to `/dev/uinput`, for example:
   ```sh
   sudo groupadd -r uinput; sudo usermod -aG uinput $USER
@@ -117,7 +117,7 @@ Useful flags:
 - `--choose`: show the monitor picker again (switch the mirrored monitor)
 - `--bitrate <Mbit/s>` (default: 20 at 1080p, scaled with resolution)
 - `--fps` (default: the tablet's refresh rate)
-- `--encoder h264_nvenc`
+- `--encoder auto|h264_nvenc|h264_vaapi` (default `auto`: NVENC if the NVIDIA driver is present, else VAAPI). Both use a zero-copy GPU path. If a VAAPI driver offers no bitrate control (Debian's free `intel-media-va-driver` on older Intel GPUs only does constant QP), Waylus falls back to CQP and says so; `LIBVA_DRIVER_NAME=i965` or `intel-media-va-driver-non-free` give CBR. `WAYLUS_VAAPI_DEVICE=/dev/dri/renderD129` picks another GPU
 - `--serial <adb serial>`
 - `--virtual[=WxH]`: create a virtual monitor instead of mirroring (GNOME / KDE). The size defaults to the tablet's screen within its decoder limits
 - `--no-raw-pen`: use Android's pen events instead of reading the stylus device over adb
@@ -154,7 +154,7 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] Per-stage latency stats, back-pressure, and a fix for 30–40 ms transfer stalls (messages are now written in one piece; split writes hit Nagle + delayed ACK in adbd's socket on the tablet)
 - [ ] Hardware decode is the largest stage: on the MT8781 it is CPU-clock-bound (19 ms idle, 11.5 ms while drawing thanks to Android's input boost, 9 ms with all cores clocked up). `--boost` keeps clocks up for 20 s after input
 - [x] Raw stylus input over adb (full tilt on devices whose Android config drops it, e.g. NXTPAPER 14)
-- [ ] VAAPI encoder fallback (AMD / Intel)
+- [x] VAAPI encoder (Intel / AMD), zero-copy: GL renders NV12 straight into exported VAAPI surfaces. On an i5-8350U (UHD 620): encode 3.3 ms/frame, capture→sent p50 ~5 ms, capture→shown p50 ~17 ms (pen in use)
 - [x] Zero-copy GPU path (DMA-BUF → GL → CUDA → NVENC) and GPU downscaling to fit the tablet
 - [x] AOA transport (default; no adb needed)
 - [x] Virtual monitor on KDE Plasma and GNOME (`--virtual`), with automatic pen/touch mapping
