@@ -58,6 +58,8 @@ pub struct Hello {
     /// Display refresh rate in Hz (0 = unknown).
     pub refresh_hz: f32,
     pub decoder: String,
+    /// Physical pixel density of the panel (0 = unknown, older clients).
+    pub px_per_mm: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -166,6 +168,8 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             let refresh_hz = c.u16()? as f32 / 100.0;
             let n = c.u8()? as usize;
             let name = c.0.get(..n).unwrap_or(c.0);
+            c.0 = c.0.get(n..).unwrap_or(&[]);
+            let px_per_mm = c.u16().map(|v| v as f32 / 100.0).unwrap_or(0.0);
             DeviceMsg::Hello(Hello {
                 version,
                 surface_w,
@@ -176,6 +180,7 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
                 max_mb_per_sec,
                 refresh_hz,
                 decoder: String::from_utf8_lossy(name).into_owned(),
+                px_per_mm,
             })
         }
         ty::PEN => DeviceMsg::Pen(PenSample {

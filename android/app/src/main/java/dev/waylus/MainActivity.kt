@@ -187,7 +187,20 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         val h = minOf(bounds.width(), bounds.height())
         val d = decoderInfo
         runOnUiThread { setStatus("Waylus\nconnected") }
-        return Proto.hello(w, h, d.maxW, d.maxH, d.mbPerFrame, d.mbPerSec, refreshHz, d.name + if (d.lowLatency) " (low-latency)" else "")
+        return Proto.hello(w, h, d.maxW, d.maxH, d.mbPerFrame, d.mbPerSec, refreshHz, d.name + if (d.lowLatency) " (low-latency)" else "", pxPerMm())
+    }
+
+    /**
+     * Physical panel density in px/mm, or 0 if unknown. Vendors sometimes report nonsense
+     * (the NXTPAPER 14 claims 134.5 x 303.6 dpi for a ~202 dpi panel), so only trust
+     * xdpi/ydpi when they roughly agree: real panels have square pixels. densityDpi is a
+     * UI scale bucket, not a physical value, so it's no fallback.
+     */
+    private fun pxPerMm(): Float {
+        val m = resources.displayMetrics
+        val square = m.xdpi > 0 && m.ydpi > 0 && maxOf(m.xdpi, m.ydpi) / minOf(m.xdpi, m.ydpi) < 1.15f
+        val dpi = (m.xdpi + m.ydpi) / 2
+        return if (square && dpi in 80f..1000f) dpi / 25.4f else 0f
     }
 
     override fun onDisconnected() {

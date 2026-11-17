@@ -46,15 +46,17 @@ object Proto {
         return b
     }
 
-    fun hello(surfaceW: Int, surfaceH: Int, maxW: Int, maxH: Int, mbFrame: Int, mbSec: Int, refreshHz: Float, decoder: String): ByteArray {
+    /** pxPerMm: physical pixel density of the panel (appended field; 0 = unknown). */
+    fun hello(surfaceW: Int, surfaceH: Int, maxW: Int, maxH: Int, mbFrame: Int, mbSec: Int, refreshHz: Float, decoder: String, pxPerMm: Float): ByteArray {
         val name = decoder.toByteArray().take(255).toByteArray()
-        val b = msg(HELLO, 2 + 2 + 2 + 2 + 2 + 4 + 4 + 2 + 1 + name.size)
+        val b = msg(HELLO, 2 + 2 + 2 + 2 + 2 + 4 + 4 + 2 + 1 + name.size + 2)
         b.putShort(VERSION.toShort())
         b.putShort(surfaceW.toShort()); b.putShort(surfaceH.toShort())
         b.putShort(maxW.toShort()); b.putShort(maxH.toShort())
         b.putInt(mbFrame); b.putInt(mbSec)
         b.putShort((refreshHz * 100).toInt().coerceIn(0, 65535).toShort())
         b.put(name.size.toByte()); b.put(name)
+        b.putShort((pxPerMm * 100).toInt().coerceIn(0, 65535).toShort())
         return b.array()
     }
 

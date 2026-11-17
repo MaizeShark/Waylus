@@ -25,7 +25,9 @@ use crate::{
 
 /// Approximate pixel density of the tablet panel (NXTPAPER 14: 2400 px over ~302 mm).
 /// Only used for the axis resolution libinput reports; mapping is resolution-independent.
-const TABLET_PX_PER_MM: f32 = 7.95;
+/// Pixel density assumed when the client can't report a plausible one (TCL NXTPAPER 14,
+/// whose firmware reports bogus dpi values; also a typical tablet density).
+const FALLBACK_PX_PER_MM: f32 = 7.95;
 
 pub struct Opts {
     pub port: u16,
@@ -227,8 +229,14 @@ fn session(
     };
     if inputs.is_none() {
         let (w, h) = fit(video_size, (hello.surface_w as u32, hello.surface_h as u32));
-        let area = AreaMm { width: w / TABLET_PX_PER_MM, height: h / TABLET_PX_PER_MM };
-        info!("creating virtual pen + touchscreen ({:.0}x{:.0} mm)", area.width, area.height);
+        let ppmm = if (2.0..=60.0).contains(&hello.px_per_mm) { hello.px_per_mm } else { FALLBACK_PX_PER_MM };
+        let area = AreaMm { width: w / ppmm, height: h / ppmm };
+        info!(
+            "creating virtual pen + touchscreen ({:.0}x{:.0} mm, {})",
+            area.width,
+            area.height,
+            if ppmm == hello.px_per_mm { format!("{ppmm:.2} px/mm reported by the tablet") } else { format!("assumed {ppmm} px/mm") }
+        );
         *inputs = Some((Arc::new(Mutex::new(Pen::new(area)?)), Touch::new(area)?));
     }
     let (pen, touch) = inputs.as_mut().unwrap();
@@ -678,6 +686,7 @@ mod tests {
             max_mb_per_sec: 864000,
             refresh_hz: 60.0,
             decoder: "c2.mtk.avc.decoder".into(),
+            px_per_mm: 8.1,
         }
     }
 
