@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Matches the strings the host sends when it switches the tablet into accessory mode (host/src/aoa.rs). -->
+<resources>
+    <usb-accessory manufacturer="Waylus" model="Waylus" />
+</resources>

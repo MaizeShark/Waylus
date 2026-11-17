@@ -2,6 +2,7 @@
 //! Waylus: use an Android tablet as a low-latency pen display on Wayland, over USB.
 
 mod adb;
+mod aoa;
 mod capture;
 mod cuda;
 mod dmabuf;
@@ -9,6 +10,7 @@ mod encode;
 mod gnome;
 mod input;
 mod kde;
+mod link;
 mod niri;
 mod proto;
 mod rawpen;
@@ -47,6 +49,11 @@ struct Args {
     /// Frame rate (default: the tablet's display refresh rate, within decoder limits).
     #[arg(long)]
     fps: Option<u32>,
+    /// How the tablet talks to the host: `adb` (TCP through `adb reverse`) or `aoa`
+    /// (Android Open Accessory: raw USB, works without USB debugging; adb is still
+    /// used, if available, to install/start the app and read the raw pen).
+    #[arg(long, value_enum, default_value_t = TransportArg::Adb)]
+    transport: TransportArg,
     /// TCP port tunnelled through adb.
     #[arg(long, default_value_t = proto::DEFAULT_PORT)]
     port: u16,
@@ -82,6 +89,12 @@ struct Args {
     no_raw_pen: bool,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+enum TransportArg {
+    Adb,
+    Aoa,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -90,7 +103,13 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let adb = (!args.no_adb).then(|| adb::Adb::new(args.serial.clone()));
+    let aoa_mode = args.transport == TransportArg::Aoa;
+    let mut adb = (!args.no_adb).then(|| adb::Adb::new(args.serial.clone()));
+    let mut serial = args.serial.clone();
+    if aoa_mode && adb.as_ref().is_some_and(|a| !a.is_available()) {
+        info!("no adb device; the app must be installed already and is started by the accessory");
+        adb = None;
+    }
     if let Some(adb) = &adb {
         adb.wait_for_device()?;
         match args.apk.clone().or_else(adb::find_apk) {
@@ -98,7 +117,19 @@ fn main() -> Result<()> {
             None if adb.is_installed() => warn!("client APK not found locally, using the installed one"),
             None => bail!("client APK not found; build it with `cd android && ./gradlew assembleDebug` or pass --apk"),
         }
-        adb.reverse(args.port)?;
+        if aoa_mode {
+            serial = serial.or_else(|| adb.serial_no());
+        } else {
+            adb.reverse(args.port)?;
+        }
+    }
+    let mut aoa = aoa_mode.then(|| aoa::Aoa::new(serial.clone()));
+    if let Some(aoa) = aoa.as_mut() {
+        // Switch now: the tablet re-enumerates, so adb drops out for a moment.
+        aoa.connect()?;
+        if let Some(adb) = &adb {
+            adb.wait_for_device()?;
+        }
     }
 
     install_exit_handler(adb.clone(), args.port, args.keep_app)?;
@@ -180,12 +211,11 @@ fn main() -> Result<()> {
     let output_size = output.as_ref().map(|o| (o.mode_w, o.mode_h)).unwrap_or((1920, 1080));
 
     if let Some(adb) = &adb {
-        adb.start_app(args.port, args.boost, args.boost_threads)?;
+        adb.start_app(args.port, aoa_mode, args.boost, args.boost_threads)?;
     }
 
     session::serve(
         session::Opts {
-            port: args.port,
             enc: encode::EncoderOpts {
                 encoder: args.encoder.clone(),
                 bitrate: args.bitrate.map(|b| (b * 1e6) as usize),
@@ -201,6 +231,10 @@ fn main() -> Result<()> {
             output_name: args.output.clone(),
             raw_pen: _raw_pen.as_ref().map(|_| pen_sink.clone()),
             output_size,
+        },
+        match aoa {
+            Some(a) => session::Transport::Aoa(a),
+            None => session::Transport::Tcp(args.port),
         },
         capture,
         lazy,

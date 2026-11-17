@@ -23,7 +23,22 @@ pub mod ty {
     pub const FRAME_SHOWN: u8 = 8;
     pub const REQUEST_KEYFRAME: u8 = 9;
     pub const LAYOUT: u8 = 10;
+    /// AOA only: marks the start of a session in the byte stream (see aoa.rs).
+    pub const SYNC: u8 = 11;
 }
+
+/// Payload of a SYNC message: this magic followed by the client's u64 session nonce.
+pub const SYNC_MAGIC: [u8; 8] = *b"WAYLUSYN";
+/// Header plus magic of a SYNC message, the byte pattern searched for in the stream.
+pub const SYNC_PREFIX: [u8; 13] = {
+    let mut p = [ty::SYNC, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut i = 0;
+    while i < 8 {
+        p[5 + i] = SYNC_MAGIC[i];
+        i += 1;
+    }
+    p
+};
 
 pub mod video_flags {
     pub const KEY: u8 = 1;
@@ -114,6 +129,8 @@ pub enum DeviceMsg {
     FrameShown { capture_ns: u64, recv_ns: u64, render_ns: u64, queued_ns: u64, decoded_ns: u64 },
     RequestKeyframe,
     Layout(Layout),
+    /// The client (re)started a session on the same USB link (AOA).
+    Sync,
     Unknown(u8),
 }
 
@@ -220,6 +237,7 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             right: c.i16()?,
             bottom: c.i16()?,
         }),
+        ty::SYNC => DeviceMsg::Sync,
         other => DeviceMsg::Unknown(other),
     })
 }
@@ -235,7 +253,9 @@ fn message(w: &mut impl Write, ty: u8, parts: &[&[u8]]) -> io::Result<()> {
     for p in parts {
         buf.extend_from_slice(p);
     }
-    w.write_all(&buf)
+    w.write_all(&buf)?;
+    // No-op on TCP; on USB this submits the transfer (ending it with a short packet).
+    w.flush()
 }
 
 pub mod codec {
@@ -264,6 +284,10 @@ pub fn write_video(w: &mut impl Write, capture_ns: u64, flags: u8, data: &[u8]) 
     p[..8].copy_from_slice(&capture_ns.to_le_bytes());
     p[8] = flags;
     message(w, ty::VIDEO, &[&p, data])
+}
+
+pub fn write_sync(w: &mut impl Write, nonce: u64) -> io::Result<()> {
+    message(w, ty::SYNC, &[&SYNC_MAGIC, &nonce.to_le_bytes()])
 }
 
 pub fn write_ping(w: &mut impl Write, host_ns: u64) -> io::Result<()> {

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Connection handling: one TCP connection per tablet session (tunnelled over
-//! USB by `adb reverse`). Video flows host→tablet, input and stats flow back.
+//! Connection handling: one link per tablet session (TCP tunnelled over USB by
+//! `adb reverse`, or AOA bulk endpoints). Video flows host→tablet, input and stats
+//! flow back.
 
 use std::{
-    io::{BufReader, Write},
-    net::{Shutdown, TcpListener, TcpStream},
+    io::Write,
+    net::TcpListener,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -20,17 +21,22 @@ use crate::{
     capture::{Capture, Frame},
     encode::{Encoder, EncoderOpts, Packet},
     input::{AreaMm, Pen, Touch},
+    link::Link,
     proto::{self, DeviceMsg, Hello, codec, now_ns, video_flags},
 };
 
-/// Approximate pixel density of the tablet panel (NXTPAPER 14: 2400 px over ~302 mm).
-/// Only used for the axis resolution libinput reports; mapping is resolution-independent.
 /// Pixel density assumed when the client can't report a plausible one (TCL NXTPAPER 14,
 /// whose firmware reports bogus dpi values; also a typical tablet density).
 const FALLBACK_PX_PER_MM: f32 = 7.95;
 
+/// How the tablet connects.
+pub enum Transport {
+    /// TCP on 127.0.0.1:port, forwarded by `adb reverse`.
+    Tcp(u16),
+    Aoa(crate::aoa::Aoa),
+}
+
 pub struct Opts {
-    pub port: u16,
     pub enc: EncoderOpts,
     /// Forced frame rate; None = follow the tablet's refresh rate.
     pub fps: Option<u32>,
@@ -46,7 +52,7 @@ pub struct Opts {
     pub output_size: (u32, u32),
 }
 
-type Writer = Arc<Mutex<TcpStream>>;
+type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Capture timestamps of refresh frames, so they can be excluded from latency stats.
 type RefreshIds = Arc<Mutex<std::collections::VecDeque<u64>>>;
 
@@ -102,7 +108,7 @@ impl InFlight {
 }
 const REFRESH_FRAMES: u32 = 3;
 
-fn send(w: &Writer, f: impl FnOnce(&mut TcpStream) -> std::io::Result<()>) -> std::io::Result<()> {
+fn send(w: &Writer, f: impl FnOnce(&mut Box<dyn Write + Send>) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut g = w.lock().unwrap();
     f(&mut g)
 }
@@ -111,21 +117,32 @@ fn send(w: &Writer, f: impl FnOnce(&mut TcpStream) -> std::io::Result<()>) -> st
 /// sized after the tablet).
 pub type LazyCapture = Box<dyn Fn(&Hello) -> Result<Capture>>;
 
-pub fn serve(opts: Opts, mut capture: Option<Capture>, lazy: Option<LazyCapture>) -> Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", opts.port)).with_context(|| format!("bind port {}", opts.port))?;
-    info!("waiting for the tablet on 127.0.0.1:{} (adb reverse)", opts.port);
+pub fn serve(opts: Opts, transport: Transport, mut capture: Option<Capture>, lazy: Option<LazyCapture>) -> Result<()> {
+    let mut next_link: Box<dyn FnMut() -> Result<Link>> = match transport {
+        Transport::Tcp(port) => {
+            let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("bind port {port}"))?;
+            info!("waiting for the tablet on 127.0.0.1:{port} (adb reverse)");
+            Box::new(move || loop {
+                match listener.accept() {
+                    Ok((s, _)) => return Ok(Link::tcp(s)?),
+                    Err(e) => warn!("accept: {e}"),
+                }
+            })
+        }
+        Transport::Aoa(mut aoa) => {
+            if !aoa.is_connected() {
+                aoa.connect()?;
+            }
+            info!("waiting for the Waylus app on the USB accessory link");
+            Box::new(move || aoa.next_link())
+        }
+    };
     let mut inputs: Option<(Arc<Mutex<Pen>>, Touch)> = None;
     let mut last_frame: Option<Frame> = None;
-    for conn in listener.incoming() {
-        let stream = match conn {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("accept: {e}");
-                continue;
-            }
-        };
+    loop {
+        let link = next_link()?;
         info!("tablet connected");
-        match session(&opts, &mut capture, lazy.as_deref(), stream, &mut inputs, &mut last_frame) {
+        match session(&opts, &mut capture, lazy.as_deref(), link, &mut inputs, &mut last_frame) {
             Ok(()) => info!("tablet disconnected"),
             Err(e) => warn!("session ended: {e:#}"),
         }
@@ -140,7 +157,6 @@ pub fn serve(opts: Opts, mut capture: Option<Capture>, lazy: Option<LazyCapture>
             bail!("screen capture stopped");
         }
     }
-    Ok(())
 }
 
 fn wait_source_size(cap: &Capture) -> Option<(u32, u32)> {
@@ -188,13 +204,11 @@ fn session(
     opts: &Opts,
     capture_slot: &mut Option<Capture>,
     lazy: Option<&dyn Fn(&Hello) -> Result<Capture>>,
-    stream: TcpStream,
+    link: Link,
     inputs: &mut Option<(Arc<Mutex<Pen>>, Touch)>,
     last_frame: &mut Option<Frame>,
 ) -> Result<()> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut reader = BufReader::with_capacity(64 * 1024, stream.try_clone()?);
+    let Link { mut reader, writer, close } = link;
     let mut buf = Vec::new();
     let hello = match proto::read_msg(&mut reader, &mut buf).context("waiting for hello")? {
         DeviceMsg::Hello(h) => h,
@@ -215,7 +229,6 @@ fn session(
     if hello.version != proto::PROTO_VERSION {
         bail!("protocol mismatch: host {} client {}", proto::PROTO_VERSION, hello.version);
     }
-    stream.set_read_timeout(None)?;
     if capture_slot.is_none()
         && let Some(make) = lazy
     {
@@ -265,7 +278,7 @@ fn session(
         });
     }
 
-    let writer: Writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let writer: Writer = Arc::new(Mutex::new(writer));
     let stop = Arc::new(AtomicBool::new(false));
     let keyframe = Arc::new(AtomicBool::new(false));
     let refresh_ids: RefreshIds = Default::default();
@@ -278,7 +291,7 @@ fn session(
     }
 
     let video = capture.map(|cap| {
-        let (writer, stop, keyframe) = (writer.clone(), stop.clone(), keyframe.clone());
+        let (writer, stop, keyframe, close) = (writer.clone(), stop.clone(), keyframe.clone(), close.clone());
         let frames = cap.frames.clone();
         let recycle = cap.recycle.clone();
         let capture_running = cap.running.clone();
@@ -313,7 +326,7 @@ fn session(
             .spawn(move || {
                 let r = video_loop(&mut enc_opts, &pace, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids, &in_flight, max_in_flight, vendor_tweaks);
                 stop.store(true, Ordering::SeqCst);
-                let _ = writer.lock().unwrap().shutdown(Shutdown::Both);
+                close();
                 r
             })
             .expect("spawn video thread")
@@ -386,6 +399,10 @@ fn session(
                 keyframe.store(true, Ordering::SeqCst);
             }
             DeviceMsg::Hello(_) => warn!("duplicate hello"),
+            DeviceMsg::Sync => {
+                info!("tablet restarted the session");
+                return Ok(());
+            }
             DeviceMsg::Unknown(t) => debug!("ignoring message type {t}"),
         }
         if stop.load(Ordering::Relaxed) {
@@ -395,7 +412,7 @@ fn session(
     })();
 
     stop.store(true, Ordering::SeqCst);
-    let _ = stream.shutdown(Shutdown::Both);
+    close();
     let _ = pinger.join();
     if let Some(v) = video {
         match v.join() {
@@ -418,6 +435,8 @@ fn is_disconnect(e: &anyhow::Error) -> bool {
                 | std::io::ErrorKind::ConnectionReset
                 | std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
         )
     })
 }

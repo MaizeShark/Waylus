@@ -26,7 +26,7 @@ Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet t
 | | Weylus | Waylus |
 |---|---|---|
 | Tablet client | Any modern web browser | Native Android app |
-| Transport | Wi-Fi / LAN, HTTP + WebSocket | USB (`adb reverse` tunnel); AOA planned |
+| Transport | Wi-Fi / LAN, HTTP + WebSocket | USB: `adb reverse` tunnel, or raw USB with Android Open Accessory (`--transport aoa`, no USB debugging needed) |
 | Host OS focus | Linux (X11 first, Wayland experimental), Windows, macOS | Linux, Wayland first (xdg-desktop-portal + PipeWire) |
 | Video encode | FFmpeg; software by default, VAAPI / NVENC / VideoToolbox optional | NVENC, zero-copy on the GPU (compositor DMA-BUF → GL blit/scale → CUDA → NVENC), low-latency tuned: no B-frames, no lookahead, small VBV, keyframes on demand; VAAPI planned |
 | Video decode | In the browser | Android `MediaCodec` hardware decoder straight to a `SurfaceView` |
@@ -124,8 +124,22 @@ Useful flags:
 - `--boost <s>`: keep the tablet's CPU clocks up for this long after pen/touch input (default 20, 0 = off). Decoding on MediaTek tablets is much faster at high clocks, which Android only grants while you touch the screen. Costs some tablet battery while active
 - `--max-in-flight <n>`: back-pressure, max frames sent but not yet shown (default 2, 0 = off)
 - `--vendor-tweaks mtk-cpu-boost,mtk-vpp-off`: **opt-in, device-specific** MediaTek decoder settings. `mtk-cpu-boost` saved ~1.9 ms of decode on the MT8781; `mtk-vpp-off` made no measurable difference. Never used for the published comparison numbers
+- `--transport aoa`: see below
 - `--keep-app`
 - `--no-adb`
+
+### USB accessory mode (`--transport aoa`)
+
+By default the app talks to the host through an `adb reverse` TCP tunnel. With `--transport aoa` the host switches the tablet into Android Open Accessory mode instead and exchanges data over raw USB bulk transfers, skipping adbd and both TCP stacks:
+- **No USB debugging needed.** Without adb, the app must already be installed, and Android offers to open it when the host connects; tick "always" in that dialog. If adb is available it is still used to install and start the app and to read the raw stylus device.
+- The first time, Android asks for permission to access the accessory.
+- The tablet stays in accessory mode (USB ID 18d1:2d00/2d01) until it is unplugged, so MTP file transfer is unavailable meanwhile; adb keeps working.
+- The USB hop is no faster on average (p50 ~2.5 ms either way, measured on the NXTPAPER 14), but over 2 × 2 alternating runs AOA had no tail spikes (p95 ≤ 5.6 ms), while adb showed ~18–20 ms p95 windows in two of three runs.
+- The link outlives the host and app processes. Each session therefore starts with a SYNC handshake, and a restarted host is picked up by a running app within ~5 s.
+- The host needs access to the USB device. With USB debugging on, systemd's `70-uaccess.rules` already grants it (the accessory still exposes adb). Without adb, the tablet comes up as 18d1:2d00, which may need a rule like this in `/etc/udev/rules.d/70-waylus.rules`:
+  ```
+  SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00|2d01", TAG+="uaccess"
+  ```
 
 Monitors larger than the tablet can show or decode (e.g. 4K) are scaled down on the GPU automatically. Set `WAYLUS_NO_ZEROCOPY=1` to force the CPU readback path.
 
@@ -142,7 +156,7 @@ Set `RUST_LOG=waylus=debug` for verbose logs.
 - [x] Raw stylus input over adb (full tilt on devices whose Android config drops it, e.g. NXTPAPER 14)
 - [ ] VAAPI encoder fallback (AMD / Intel)
 - [x] Zero-copy GPU path (DMA-BUF → GL → CUDA → NVENC) and GPU downscaling to fit the tablet
-- [ ] AOA transport (no adb needed)
+- [x] AOA transport (`--transport aoa`, no adb needed)
 - [x] Virtual monitor on KDE Plasma and GNOME (`--virtual`), with automatic pen/touch mapping
 - [ ] Virtual monitor on niri (needs `RecordVirtual` in niri; use a dummy plug meanwhile)
 

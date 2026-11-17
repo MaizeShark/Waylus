@@ -20,6 +20,8 @@ object Proto {
     const val FRAME_SHOWN = 8
     const val REQUEST_KEYFRAME = 9
     const val LAYOUT = 10
+    /** USB accessory only: marks the start of a session in the byte stream. */
+    const val SYNC = 11
 
     const val VIDEO_KEY = 1
     const val VIDEO_CONFIG = 2
@@ -101,6 +103,14 @@ object Proto {
         m.put(rotation.toByte())
         m.putShort(naturalW.toShort()); m.putShort(naturalH.toShort())
         m.putShort(l.toShort()); m.putShort(t.toShort()); m.putShort(r.toShort()); m.putShort(b.toShort())
+        return m.array()
+    }
+
+    /** "WAYLUSYN" + nonce; the host echoes it back (host/src/proto.rs SYNC_MAGIC). */
+    fun sync(nonce: Long): ByteArray {
+        val m = msg(SYNC, 16)
+        m.put("WAYLUSYN".toByteArray(Charsets.US_ASCII))
+        m.putLong(nonce)
         return m.array()
     }
 

@@ -4,29 +4,57 @@ package dev.waylus
 import android.util.Log
 import java.io.BufferedInputStream
 import java.io.DataInputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 /**
- * Connects to the host through the `adb reverse` tunnel (127.0.0.1:port on the
- * tablet ends up on the host), reconnecting forever. Outgoing messages go
- * through a queue so they can be posted from the UI thread.
+ * Talks to the host over a [Link] (TCP through `adb reverse`, or the USB accessory),
+ * reconnecting forever. Outgoing messages go through a queue so they can be posted
+ * from the UI thread.
  */
-class Connection(private val port: Int, private val listener: Listener) {
+class Connection(private val opener: () -> Link?, private val listener: Listener) {
     interface Listener {
-        /** Called on the network thread right after connecting; return the hello message. */
-        fun onConnected(): ByteArray
+        /** Called on the network thread when a session starts; return the hello message. */
+        fun hello(): ByteArray
+        fun onConnected()
         fun onDisconnected()
         /** flags: Proto.TWEAK_* bits, opt-in vendor-specific decoder tweaks. */
         fun onConfig(codec: Int, width: Int, height: Int, flags: Int)
         fun onVideo(captureNs: Long, flags: Int, data: ByteArray, offset: Int, recvNs: Long)
     }
 
+    /** A byte stream to the host. */
+    interface Link {
+        val input: InputStream
+        /** Each write() call must carry whole messages. */
+        val output: OutputStream
+        /**
+         * The stream outlives sessions (USB accessory): sessions start with a SYNC
+         * handshake (see host/src/aoa.rs) instead of a fresh connection.
+         */
+        val needsSync: Boolean
+        fun close()
+        /** Drops data received before this session. */
+        fun drain() {}
+        /** Skips input up to [pattern]; false if it didn't arrive within the timeout. */
+        fun awaitSync(pattern: ByteArray, timeoutMs: Long): Boolean = true
+    }
+
+    private class TcpLink(val socket: Socket) : Link {
+        override val input = BufferedInputStream(socket.getInputStream(), 256 * 1024)
+        override val output: OutputStream = socket.getOutputStream()
+        override val needsSync = false
+        override fun close() { try { socket.close() } catch (_: Exception) {} }
+    }
+
     private val out = LinkedBlockingQueue<ByteArray>()
     @Volatile private var running = true
-    @Volatile private var socket: Socket? = null
+    @Volatile private var link: Link? = null
     @Volatile var connected = false
         private set
     private val thread = Thread(::loop, "waylus-net")
@@ -35,7 +63,7 @@ class Connection(private val port: Int, private val listener: Listener) {
 
     fun stop() {
         running = false
-        try { socket?.close() } catch (_: Exception) {}
+        link?.close()
         thread.interrupt()
     }
 
@@ -49,13 +77,15 @@ class Connection(private val port: Int, private val listener: Listener) {
         // core or wait behind other work, which showed up as 30-40 ms transfer spikes.
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
         while (running) {
+            var l: Link? = null
             try {
-                val s = Socket()
-                s.tcpNoDelay = true
-                s.receiveBufferSize = 1 shl 20
-                s.connect(InetSocketAddress("127.0.0.1", port), 1000)
-                socket = s
-                session(s)
+                l = opener()
+                if (l != null) {
+                    link = l
+                    session(l)
+                }
+            } catch (e: InterruptedException) {
+                break
             } catch (e: Exception) {
                 if (connected) Log.i(TAG, "disconnected: $e")
             }
@@ -63,19 +93,32 @@ class Connection(private val port: Int, private val listener: Listener) {
                 connected = false
                 listener.onDisconnected()
             }
-            try { socket?.close() } catch (_: Exception) {}
-            socket = null
+            if (l != null && !l.needsSync) l.close()
+            link = null
             if (running) try { Thread.sleep(300) } catch (_: InterruptedException) {}
         }
     }
 
-    private fun session(s: Socket) {
-        val input = DataInputStream(BufferedInputStream(s.getInputStream(), 256 * 1024))
-        val output = s.getOutputStream()
+    private fun session(l: Link) {
+        val input = DataInputStream(l.input)
+        val output = l.output
         out.clear()
-        output.write(listener.onConnected())
-        output.flush()
+        val hello = listener.hello()
+        if (l.needsSync) {
+            l.drain()
+            val sync = Proto.sync(Random.nextLong())
+            // Repeat until the host answers: it may not be running yet, or still be
+            // finishing an old session.
+            while (running) {
+                output.write(sync + hello)
+                if (l.awaitSync(sync, 1000)) break
+            }
+        } else {
+            output.write(hello)
+            output.flush()
+        }
         connected = true
+        listener.onConnected()
         Log.i(TAG, "connected to host")
 
         val writer = Thread({
@@ -90,7 +133,7 @@ class Connection(private val port: Int, private val listener: Listener) {
                 }
             } catch (e: Exception) {
                 Log.i(TAG, "writer: $e")
-                try { s.close() } catch (_: Exception) {}
+                if (!l.needsSync) l.close()
             }
         }, "waylus-writer")
         writer.start()
@@ -123,10 +166,23 @@ class Connection(private val port: Int, private val listener: Listener) {
             }
         } finally {
             connected = false
-            try { s.close() } catch (_: Exception) {}
+            if (!l.needsSync) l.close()
             writer.join(500)
         }
     }
 
-    companion object { private const val TAG = "waylus" }
+    companion object {
+        private const val TAG = "waylus"
+        /** The host pings at 2 Hz; this much silence means it's gone. Matches host/src/link.rs. */
+        const val IDLE_TIMEOUT_MS = 5000L
+
+        fun tcp(port: Int): () -> Link = {
+            val s = Socket()
+            s.tcpNoDelay = true
+            s.receiveBufferSize = 1 shl 20
+            s.soTimeout = IDLE_TIMEOUT_MS.toInt()
+            s.connect(InetSocketAddress("127.0.0.1", port), 1000)
+            TcpLink(s)
+        }
+    }
 }

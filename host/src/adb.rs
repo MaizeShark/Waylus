@@ -49,6 +49,15 @@ impl Adb {
         self.run(&["shell", cmd])
     }
 
+    /// A device is attached and authorized.
+    pub fn is_available(&self) -> bool {
+        self.run(&["get-state"]).is_ok_and(|s| s.trim() == "device")
+    }
+
+    pub fn serial_no(&self) -> Option<String> {
+        self.run(&["get-serialno"]).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+    }
+
     pub fn wait_for_device(&self) -> Result<()> {
         let state = self.run(&["get-state"]).unwrap_or_default();
         if state.trim() != "device" {
@@ -92,9 +101,11 @@ impl Adb {
     }
 
     /// `boost_secs`: keep the tablet's CPU clocks up this long after pen/touch input (0 = off).
-    pub fn start_app(&self, port: u16, boost_secs: u32, boost_threads: u32) -> Result<()> {
+    /// `aoa`: connect over the USB accessory instead of the `adb reverse` port.
+    pub fn start_app(&self, port: u16, aoa: bool, boost_secs: u32, boost_threads: u32) -> Result<()> {
+        let transport = if aoa { "aoa" } else { "tcp" };
         self.shell(&format!(
-            "am start -S -n {ACTIVITY} --ei port {port} --ei boost_secs {boost_secs} --ei boost_threads {boost_threads}"
+            "am start -S -n {ACTIVITY} --es transport {transport} --ei port {port} --ei boost_secs {boost_secs} --ei boost_threads {boost_threads}"
         ))?;
         Ok(())
     }

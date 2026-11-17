@@ -3,6 +3,8 @@ package dev.waylus
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.hardware.usb.UsbManager
 import android.graphics.Color
 import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
@@ -28,6 +30,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     private lateinit var frame: View
     private lateinit var status: TextView
     private lateinit var conn: Connection
+    private var port = Proto.DEFAULT_PORT
+    private var usingAccessory = false
     private lateinit var decoder: VideoDecoder
     private lateinit var input: InputCapture
     private lateinit var boost: ClockBoost
@@ -66,7 +70,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         if (pm.isSustainedPerformanceModeSupported) window.setSustainedPerformanceMode(true)
         android.util.Log.i("waylus", "sustained performance mode supported: ${pm.isSustainedPerformanceModeSupported}")
         window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        val port = intent.getIntExtra("port", Proto.DEFAULT_PORT)
+        port = intent.getIntExtra("port", Proto.DEFAULT_PORT)
         boost = ClockBoost(
             intent.getIntExtra("boost_secs", 20) * 1000L,
             intent.getIntExtra("boost_threads", 1).coerceIn(1, 4),
@@ -93,7 +97,6 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         // Deliver every pen/touch sample as it arrives instead of batching to vsync.
         root.requestUnbufferedDispatch(InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN)
 
-        conn = Connection(port, this)
         decoder = VideoDecoder(
             decoderInfo,
             onShown = { c, r, n, q, d ->
@@ -105,9 +108,36 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             },
             onNeedKeyframe = { conn.send(Proto.requestKeyframe()) },
         )
-        input = InputCapture(conn::send) { videoRect }
+        input = InputCapture({ conn.send(it) }) { videoRect }
         Log.i(TAG, "decoder: $decoderInfo, port $port")
+        startConnection(wantsAccessory(intent))
+    }
+
+    /**
+     * USB accessory (AOA) when the host asked for it, or when we were opened by the
+     * accessory / a Waylus accessory is attached; otherwise TCP through `adb reverse`.
+     */
+    private fun wantsAccessory(i: Intent): Boolean = when (i.getStringExtra("transport")) {
+        "aoa" -> true
+        "tcp" -> false
+        else -> i.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED || Accessory.find(this) != null
+    }
+
+    private fun startConnection(accessory: Boolean) {
+        usingAccessory = accessory
+        Log.i(TAG, "transport: ${if (accessory) "USB accessory" else "TCP port $port"}")
+        val opener: () -> Connection.Link? = if (accessory) ({ Accessory.open(applicationContext) }) else Connection.tcp(port)
+        conn = Connection(opener, this)
         conn.start()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // The host switched the tablet into accessory mode while we were on TCP.
+        if (intent.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED && !usingAccessory) {
+            conn.stop()
+            startConnection(true)
+        }
     }
 
     /** Ask for the highest refresh rate at the current resolution (e.g. 120/144 Hz tablets). */
@@ -181,12 +211,15 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
 
     // --- Connection.Listener (network thread) ---
 
-    override fun onConnected(): ByteArray {
+    override fun onConnected() {
+        runOnUiThread { setStatus("Waylus\nconnected") }
+    }
+
+    override fun hello(): ByteArray {
         val bounds = windowManager.currentWindowMetrics.bounds
         val w = maxOf(bounds.width(), bounds.height())
         val h = minOf(bounds.width(), bounds.height())
         val d = decoderInfo
-        runOnUiThread { setStatus("Waylus\nconnected") }
         return Proto.hello(w, h, d.maxW, d.maxH, d.mbPerFrame, d.mbPerSec, refreshHz, d.name + if (d.lowLatency) " (low-latency)" else "", pxPerMm())
     }
 
