@@ -146,8 +146,11 @@ def fitted(rows):
             lat.append(d)
     if not lat:
         return
+    # Chance checksum passes land far off; scale the window with the spread so a
+    # tool with a wide (but real) latency distribution keeps its tails.
     med = statistics.median(lat)
-    good = [d for d in lat if abs(d - med) < 35]
+    mad = statistics.median(abs(d - med) for d in lat)
+    good = [d for d in lat if abs(d - med) < max(35, 6 * mad)]
     print(f"fitted (all tablet decodes): p50 {statistics.median(good):.0f} / p95 {pct(good, 95):.0f} / "
           f"min {min(good):.0f} / max {max(good):.0f} ms (n={len(good)}, {len(lat) - len(good)} outliers dropped)")
 

@@ -43,11 +43,11 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 | Metric | Weylus ¹ | Waylus |
 |---|---|---|
 | Host page frame → presented on tablet ² | p50 **166 ms** / p95 **229 ms** | p50 **74–84 ms** / p95 **106–116 ms** (pen idle); p50 72 / p95 83 ms right after pen input (`--boost`) |
-| **Tablet behind the real monitor, photon to photon** (camera) ⁴ | – | p50 **46 ms** / p95 **59 ms** (p5 26, p99 64; n = 303) |
+| **Tablet behind the real monitor, photon to photon** (camera) ⁴ | p50 **198 ms** / p95 **278 ms** (p5 139, p99 311; n = 1149) | p50 **45 ms** / p95 **59 ms** (p5 25, p99 64; n = 305) |
 | Capture → frame shown (built-in stats) ³ | – | p50 ~17 ms (while drawing) / ~21 ms (pen idle), full-screen motion |
 | Pen event → host input device ³ | – | p50 **2 ms** / p95 3 ms |
 
-⁴ Filmed with a phone camera (Pixel 7a slow motion, 120 fps) showing `barcode.html` on DP-2 and its mirror on the tablet in the same shot; `tools/latency/camera.py` decodes both timestamps in every frame. This is the lag you actually see between the two screens, including the tablet's own compositing and display; no clock sync is involved. Measured 2026-11-17 (commit 0578fdd, NVENC, AOA transport, 1080p75 → 60 Hz panel). Weylus not yet measured this way.
+⁴ Filmed with a phone camera (Pixel 7a slow motion, 120 fps) showing `barcode.html` on DP-2 and its mirror on the tablet in the same shot; `tools/latency/camera.py` decodes both timestamps in every frame. This is the lag you actually see between the two screens, including the tablet's own compositing and display; no clock sync is involved. Measured 2026-11-17, one clip per tool with the pen idle, same camera position: Waylus at commit 0578fdd (NVENC, AOA transport), Weylus with the settings in ¹ over an `adb reverse` tunnel; 1080p75 → 60 Hz panel. This is the comparison to go by: unlike ², it involves no screenshots on the tablet.
 
 ¹ A local build of [Weylus](https://github.com/H-M-H/Weylus) with niri/NVIDIA fixes (upstream does not run on this setup). Settings: NVENC, Chrome on the tablet, "Lower Latency" on, frame-rate slider at maximum, no stretching.
 
