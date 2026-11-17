@@ -62,8 +62,6 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 
 Back-pressure (`--max-in-flight`, default 2) keeps a slow decoder from building a queue: the host waits and then encodes the newest frame instead of a backlog.
 
-The Waylus probe numbers were re-measured on 2026-11-16 (commit 994ec89: zero-copy, single-write transfer fix, back-pressure, clock boost); the Weylus numbers are from the earlier session with the same setup and method. The probe takes `adb screencap`s over the same USB link while it runs, which loads the tablet and inflates both tools' numbers somewhat.
-
 ## Requirements
 
 **Host**
