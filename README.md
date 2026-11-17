@@ -71,6 +71,26 @@ Decode is by far the largest stage, so the tablet's chip matters most: a Pixel 7
 
 Back-pressure (`--max-in-flight`, default 3; 2 until 2026-11-17, used for the numbers above) keeps a slow decoder from building a queue: the host waits and then encodes the newest frame instead of a backlog. With 2, the encoder was held back about half the time over USB and sent a capture that had already aged; 3 still never queued frames at the decoder (built-in stats, USB, 3 alternating runs each: capture → shown p50 27.4 → 26.8 ms, p95 32–34 → 30.5–31 ms).
 
+### Other Linux tablet-as-monitor tools
+
+Measured 2026-11-18 on the same desktop, tablet and USB cable as above, in a KDE Plasma 6.8.3 session (UScreen and MoreSpace create their monitor through the EVDI kernel module, which niri can't drive while it renders on an NVIDIA GPU: `NoSupportedRendererFormat`, see [niri#3625](https://github.com/niri-wm/niri/issues/3625)). Both of them only extend the desktop, so their extra monitor was set to mirror DP-2 (`kscreen-doctor output.<name>.mirror.DP-2`) and filmed against DP-2 exactly as in ². To compare the same path, Waylus streamed a KDE virtual monitor mirroring DP-2 the same way. Defaults were kept except where noted.
+
+| | Waylus | [UScreen](https://github.com/majmichu1/UScreen) 1.2.15 | [MoreSpace](https://morespaceapp.com/) 0.6.7 |
+|---|---|---|---|
+| **Tablet behind the real monitor, photon to photon** ² | p50 **50 ms** / p95 **60 ms** (p5 31, p99 70; n = 517) | p50 **65 ms** / p95 **79 ms** (p5 45, p99 82; n = 544) ⁵ | p50 **103 ms** / p95 **117 ms** (p5 84, p99 123; n = 999) ⁶ |
+| **Pen-down on the tablet → event on the host's input device** ³ | p50 **4.9 ms** / p95 **6.5 ms** (max 6.8; n = 30) | p50 **8.5 ms** / p95 **11.9 ms** (max 12.3; n = 30) | p50 **8.0 ms** / p95 **63.5 ms** (max 241; n = 31) |
+| Stream | 1920×1080, 60 fps, 20 Mbit/s, NVENC H.264 | 1920×1080 (set by hand ⁵), 60 fps, 20 Mbit/s, NVENC H.264 | 1920×1280 (width set to 1920; it keeps the tablet's 3:2), 60 Hz, ~8.8 Mbit/s (its automatic value), **software** H.264 ⁶ |
+| Transport | USB accessory (AOA) | `adb` port forwarding | USB |
+| Licence | GPL-3.0-or-later | MIT | Proprietary; Google sign-in, €17 after a 48 h trial |
+
+Waylus mirroring DP-2 directly (its normal mode, no extra monitor) measured p50 46 / p95 59 ms (p5 22, p99 69; n = 503) in the same session, the same as on niri: the KDE copy into a separate output costs it ~4 ms, and the compositor makes no difference.
+
+⁵ UScreen sizes its monitor to the tablet's native resolution by default (2400×1600 here, `auto_resolution`). That measured p50 93 / p95 123 ms (p5 58, p99 134; n = 906): 2400×1600 is above what this tablet's decoder is rated for (15 000 vs 14 400 macroblocks per frame), and decode time grows with resolution (Waylus logs ~14 ms at 1080p and ~23 ms at 2160×1440 on this tablet). The table uses 1920×1080 so that both tools decode the same amount. The pen was measured at 2400×1600; pen latency doesn't depend on the stream.
+
+⁶ MoreSpace encodes in hardware only through VAAPI, which NVIDIA doesn't provide, so on this machine it falls back to Cisco's OpenH264 software encoder (`morespace codec install-openh264`). It would hardware-encode on an Intel or AMD GPU with VAAPI H.264 CBR support. The test laptop's Kaby Lake iGPU has none (constant-QP only), so that comparison is still open. Its default codec preference is HEVC, which also needs VAAPI. On niri it doesn't start (the EVDI limitation above; it also needs `wlr-randr`). The pen's long tail was real: the two clocks drifted by 0.04 ms during the run.
+
+[Moreland](https://github.com/adiimanav/moreland) was not measured: it has no pen or touch input, and on niri it has no capture path (it needs `ext-image-copy-capture-v1` or KWin's own screencast protocol).
+
 ## Requirements
 
 **Host**
