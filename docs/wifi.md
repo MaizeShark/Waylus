@@ -347,6 +347,19 @@ runs each, 5260 MHz −67 dBm:
   link stalls seen in the ping tests; redundancy can't help when the radio is off the
   channel. Raw pen over a USB adb cable (README): 5.1 / 7.0 ms.
 
+2026-11-17, 2.4 GHz (tablet on 2462 MHz, 802.11n, −52…−56 dBm, 72–78 Mbit/s; host
+still on 5 GHz at the same AP). Built-in stats, `barcode.html`, 2 runs each:
+- 20 Mbit/s: capture→shown p50 46–47 / p95 103–105 ms, sent→received p50 16–18 / p95
+  76 ms, 41–42 fps, 7–13 frames lost per 35 s (FEC recovered almost nothing).
+  10 Mbit/s: p50 40–42 / p95 91–101 ms, 44–47 fps, 1–5 frames lost; a frame takes
+  ~5 ms on air instead of ~11.
+- Loss diagnostics (logged by the tablet per lost frame): some "losses" were only late
+  (declared lost by the 100 ms timeout, the next shard arrived 1–4 ms later), and
+  others were real bursts (about half a frame missing while the next frame was
+  complete, beyond what 20 % parity can repair). The link stalls for 100–450 ms at
+  times. Timeout 100 vs 500 ms (`adb shell setprop debug.waylus.lostms`): p95
+  109–114 vs 113–122 ms, within run-to-run noise; the default stays 100 ms.
+
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
   the plan is to write the code fresh. Any file that ends up porting their code gets a

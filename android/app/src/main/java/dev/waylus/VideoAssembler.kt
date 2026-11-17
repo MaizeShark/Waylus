@@ -34,6 +34,8 @@ class VideoAssembler(
     }
 
     private val frames = HashMap<Long, Frame>()
+    /** Diagnostics: when recent frames were declared lost (to spot shards that were only late). */
+    private val lostAt = HashMap<Long, Long>()
     private var next = -1L
     private var newest = -1L
 
@@ -67,6 +69,9 @@ class VideoAssembler(
         if (no < next) {
             // Typically parity of a frame that was already complete without it.
             if (next - no <= 8) shardsRx++
+            lostAt.remove(no)?.let { t ->
+                android.util.Log.i("waylus", "video: frame $no declared lost, but a shard arrived %.0f ms later".format((nowNs - t) / 1e6))
+            }
             return
         }
         if (no - next > 64) {
@@ -154,6 +159,18 @@ class VideoAssembler(
                 (f != null && nowNs - f.firstNs > LOST_AFTER_NS) ||
                 (f == null && after != null && nowNs - after.firstNs > LOST_AFTER_NS)
             if (!gone) break
+            val why = when {
+                f?.failed == true -> "failed"
+                newest >= next + 2 -> "frame ${newest} arrived"
+                after?.payload != null -> "next frame complete"
+                else -> "timeout"
+            }
+            val have = f?.blocks?.sumOf { it?.have ?: 0 } ?: 0
+            val need = f?.blocks?.sumOf { it?.d ?: 0 } ?: 0
+            android.util.Log.i("waylus", "video: frame $next lost ($why): $have/$need+ shards, first %s".format(
+                if (f != null) "%.0f ms ago".format((nowNs - f.firstNs) / 1e6) else "never seen"))
+            lostAt[next] = nowNs
+            if (lostAt.size > 64) lostAt.remove(lostAt.keys.min())
             if (f != null) shardsExpected += f.blocks.sumOf { (it?.d ?: 0) + (it?.p ?: 0) }
             frames.remove(next)
             framesLost++
@@ -189,7 +206,12 @@ class VideoAssembler(
         const val KIND_VIDEO: Byte = 2
         const val HDR = 16
         const val SHARD = 1408
-        private const val LOST_AFTER_NS = 100_000_000L
+        /** Developer hook: `adb shell setprop debug.waylus.lostms N` (default 100), read at start. */
+        @android.annotation.SuppressLint("PrivateApi")
+        private val LOST_AFTER_NS = runCatching {
+            (Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
+                .invoke(null, "debug.waylus.lostms") as String).toLong()
+        }.getOrDefault(100L) * 1_000_000L
         private val EMPTY = ByteArray(0)
     }
 }
