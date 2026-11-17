@@ -315,6 +315,20 @@ NVENC. Tablet first on 5680 MHz −79 dBm (39–52 Mbit/s), later 5260 MHz −72
   authenticated-only mode would save nothing, and dropping authentication would save
   ≤ 0.5 ms (~1 % of the latency, below what the camera can resolve) for no integrity.
 
+2026-11-17, camera (`camera.py`, 120 fps, pen idle). Tablet 5260 MHz, −66…−69 dBm,
+351 Mbit/s; host on the same AP over Wi-Fi (−69 dBm):
+- Waylus `--wifi --no-usb`: **p50 66 / p95 96 ms** (p5 30, p99 104; n = 310). No
+  shard lost during the clip. Weylus over the same Wi-Fi (Chrome → LAN address):
+  **p50 183 / p95 248 ms** (p5 123, p99 273; n = 1574). Waylus USB for reference:
+  45 / 59 ms. Target was p50 ≤ ~55 / p95 ≤ ~80: missed by ~10 / ~16 ms on this setup.
+- Built-in stats during the clip: capture→sent p50 6–9 ms (USB 2.5; back-pressure,
+  the encoder was held ~820 ms/s and sent 42–53 fps), sent→received 8.5–9 ms (p95
+  12–17, USB 2.5), decode 18.5–20 ms (pen idle, same as USB), FEC+decrypt 0.7 ms,
+  capture→shown p50 ~39 ms (USB ~21–25). The camera adds the same ~25 ms on top as
+  for USB (the tablet's compositing and panel).
+- Next: `--max-in-flight 3`, a lower bitrate, a wired host; `pen.py` with real taps;
+  2.4 GHz.
+
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
   the plan is to write the code fresh. Any file that ends up porting their code gets a

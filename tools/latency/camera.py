@@ -152,6 +152,7 @@ def fitted(rows):
     mad = statistics.median(abs(d - med) for d in lat)
     good = [d for d in lat if abs(d - med) < max(35, 6 * mad)]
     print(f"fitted (all tablet decodes): p50 {statistics.median(good):.0f} / p95 {pct(good, 95):.0f} / "
+          f"p5 {pct(good, 5):.0f} / p99 {pct(good, 99):.0f} / "
           f"min {min(good):.0f} / max {max(good):.0f} ms (n={len(good)}, {len(lat) - len(good)} outliers dropped)")
 
 
