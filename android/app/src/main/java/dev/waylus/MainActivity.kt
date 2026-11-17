@@ -258,7 +258,14 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         } catch (e: InterruptedException) {
             throw e
         } catch (e: Exception) {
-            val msg = "connecting to ${host.name} at $addr… (${e.message ?: e.javaClass.simpleName})"
+            val why = when {
+                e is java.net.ConnectException && e.message?.contains("ECONNREFUSED") == true ->
+                    "Waylus isn't running there; start `waylus --wifi`"
+                e is java.net.SocketTimeoutException || e.message?.contains("EHOSTUNREACH") == true ->
+                    "no answer; is the computer on and on the same network?"
+                else -> e.message ?: e.javaClass.simpleName
+            }
+            val msg = "Waiting for ${host.name} at $addr: $why"
             if (msg != lastWifiStatus) Log.i(TAG, msg)
             lastWifiStatus = msg
             showWifiPanel(msg)
@@ -495,6 +502,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         runOnUiThread {
             input.reset()
             frame.visibility = View.VISIBLE
+            // Cover the last decoded picture, which the SurfaceView keeps showing.
+            status.setBackgroundColor(Color.BLACK)
             setStatus("Waylus\nwaiting for host…")
         }
     }
@@ -506,6 +515,7 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             relayout()
             if (codec == Proto.CODEC_NONE) {
                 frame.visibility = View.VISIBLE
+                status.background = null // keep the video-area border visible
                 setStatus("Waylus — input only\n${width}×$height")
             }
         }
