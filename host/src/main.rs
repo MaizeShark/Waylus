@@ -31,6 +31,10 @@ struct Args {
     /// Only forward pen/touch input, do not stream the screen.
     #[arg(long)]
     no_video: bool,
+    /// Add `include optional=true "config.d/90-waylus.kdl"` to the niri config and
+    /// exit. Waylus writes its pen/touch mapping to that file while it runs.
+    #[arg(long)]
+    niri_setup: bool,
     /// Output (connector name) being mirrored, e.g. DP-2. Used for the niri
     /// mapping hint and, with --no-video, for the aspect ratio.
     #[arg(long, short)]
@@ -128,6 +132,9 @@ fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    if args.niri_setup {
+        return niri::setup();
+    }
 
     let encoder = match args.encoder.as_str() {
         "auto" => encode::auto_encoder().to_owned(),
@@ -279,7 +286,19 @@ fn main() -> Result<()> {
         Some(o) => {
             info!("mirroring {} ({}x{})", o.name, o.mode_w, o.mode_h);
             if niri::is_niri() {
-                info!("make sure your niri config maps the pen/touch to it:\n{}", niri::config_hint(&o.name));
+                match niri::write_mapping(&o.name) {
+                    Ok(_) if niri::is_included() => info!("niri: pen/touch mapped to {} while Waylus runs", o.name),
+                    Ok(p) => warn!(
+                        "niri: wrote the pen/touch mapping to {}, but your niri config doesn't include it; \
+                         run `waylus --niri-setup` once, or add this line at the end of your config:\n{}",
+                        p.display(),
+                        niri::include_line()
+                    ),
+                    Err(e) => warn!(
+                        "niri: {e:#}; map the pen/touch yourself:\n{}",
+                        niri::config_hint(&o.name)
+                    ),
+                }
             }
         }
         None if args.no_video => warn!("no --output given, assuming 16:9"),
@@ -297,7 +316,7 @@ fn main() -> Result<()> {
         }
     }
 
-    session::serve(
+    let result = session::serve(
         session::Opts {
             enc: encode::EncoderOpts {
                 encoder: encoder.clone(),
@@ -330,7 +349,9 @@ fn main() -> Result<()> {
         },
         capture,
         lazy,
-    )
+    );
+    niri::remove_mapping();
+    result
 }
 
 /// Ctrl-C: undo the adb setup, then leave with `_exit`. A normal `exit` runs
@@ -347,6 +368,7 @@ fn install_exit_handler(adb: Option<adb::Adb>, reverse_port: Option<u16>, keep_a
             unsafe { libc::_exit(130) };
         }
         eprintln!("\nstopping…");
+        niri::remove_mapping();
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(3));
             unsafe { libc::_exit(1) };

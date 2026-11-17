@@ -108,14 +108,13 @@ waylus --no-video -o DP-2   # input only: use the tablet as a plain graphics tab
 
 The monitor you pick is remembered via a portal restore token stored in `~/.local/state/waylus/`.
 
-The pen and touchscreen must be mapped to the output shown on the tablet. **On KDE Plasma and GNOME Waylus does this automatically**, for both mirrored and virtual monitors: through KWin's input-device D-Bus settings on KDE, and through the per-device GSettings that Settings → Wacom Tablet uses on GNOME (keyed by the monitor's EDID). On GNOME this matters beyond convenience: an unmapped direct touchscreen crashed gnome-shell 51 when a touch started a window move. Elsewhere, map them in your compositor's settings. For niri, Waylus prints this snippet on startup:
+The pen and touchscreen must be mapped to the output shown on the tablet. **On KDE Plasma and GNOME Waylus does this automatically**, for both mirrored and virtual monitors: through KWin's input-device D-Bus settings on KDE, and through the per-device GSettings that Settings → Wacom Tablet uses on GNOME (keyed by the monitor's EDID). On GNOME this matters beyond convenience: an unmapped direct touchscreen crashed gnome-shell 51 when a touch started a window move. **On niri** Waylus writes the mapping to `~/.config/niri/config.d/90-waylus.kdl` while it runs and deletes it on exit, so niri goes back to your own tablet/touch settings (`map-to-output` applies to every tablet, so this also keeps a second drawing tablet where you put it). Your config has to include that file once, at the end; `waylus --niri-setup` appends the line, or add it yourself:
 
 ```kdl
-input {
-    tablet { map-to-output "DP-2"; }
-    touch  { map-to-output "DP-2"; }
-}
+include optional=true "config.d/90-waylus.kdl"
 ```
+
+`optional=true` keeps the config valid while the file doesn't exist. Elsewhere, map the pen and touch in your compositor's settings.
 
 Useful flags:
 - `--choose`: show the monitor picker again (switch the mirrored monitor)
