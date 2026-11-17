@@ -43,8 +43,11 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 | Metric | Weylus ¹ | Waylus |
 |---|---|---|
 | Host page frame → presented on tablet ² | p50 **166 ms** / p95 **229 ms** | p50 **74–84 ms** / p95 **106–116 ms** (pen idle); p50 72 / p95 83 ms right after pen input (`--boost`) |
+| **Tablet behind the real monitor, photon to photon** (camera) ⁴ | – | p50 **46 ms** / p95 **59 ms** (p5 26, p99 64; n = 303) |
 | Capture → frame shown (built-in stats) ³ | – | p50 ~17 ms (while drawing) / ~21 ms (pen idle), full-screen motion |
 | Pen event → host input device ³ | – | p50 **2 ms** / p95 3 ms |
+
+⁴ Filmed with a phone camera (Pixel 7a slow motion, 120 fps) showing `barcode.html` on DP-2 and its mirror on the tablet in the same shot; `tools/latency/camera.py` decodes both timestamps in every frame. This is the lag you actually see between the two screens, including the tablet's own compositing and display; no clock sync is involved. Measured 2026-11-17 (commit 0578fdd, NVENC, AOA transport, 1080p75 → 60 Hz panel). Weylus not yet measured this way.
 
 ¹ A local build of [Weylus](https://github.com/H-M-H/Weylus) with niri/NVIDIA fixes (upstream does not run on this setup). Settings: NVENC, Chrome on the tablet, "Lower Latency" on, frame-rate slider at maximum, no stretching.
 
@@ -55,6 +58,7 @@ Measured on one machine (RTX 4060, niri, mirroring a 1920×1080 output at 75 Hz)
 - The number includes Chrome on the host rendering the page and niri compositing it (roughly 40–60 ms, the same for both tools). It is therefore higher than what you perceive relative to the real monitor.
 - 40–60 samples per run. Each tool was measured with the other one stopped.
 - To reproduce: open `tools/latency/barcode.html` fullscreen on the mirrored monitor, start the mirroring tool, then run `python3 -I tools/latency/probe.py --label <name>` (needs Pillow and the Waylus APK installed).
+- Camera variant (⁴): film both screens in slow motion, then `python3 -I tools/latency/camera.py VIDEO --dump 100 --out frame.png` to read off the barcode corners, and `camera.py VIDEO --monitor x,y x,y x,y x,y --tablet x,y x,y x,y x,y`. The rolling shutter often catches the monitor mid-refresh, so the monitor's timestamps are fitted as a line over the camera frames and every readable tablet frame is used.
 
 ³ Waylus logs these every 5 s, split into stages. It syncs the clocks with ping/pong. "Shown" is the decoder's render callback, so it excludes scan-out. Typical breakdown at 1080p with the whole screen changing every frame (barcode page), capture→shown p50 ~21 / p95 ~25 ms:
 - capture → sent (GPU blit/scale + CUDA copy + NVENC): p50 ~2.5 / p95 ~4 ms
