@@ -306,7 +306,19 @@ Waylus can't create a monitor on Windows (that takes a display driver), but an I
 
 ### Measured on Windows
 
-(numbers follow)
+Setup: the same desktop as the Linux numbers, booted into Windows 11 (RTX 4060, driver 32.0.16.1088, NVENC), mirroring a 1920×1080 60 Hz monitor with `tools/latency/barcode.html` full screen in a browser (so the picture changes every frame), the TCL NXTPAPER 14 (60 Hz panel) over USB, 20 Mbit/s, pen idle. These are separate from the Linux tables above; the monitor here runs at 60 Hz, not 75.
+
+| Built-in statistics, `--transport adb`, 2026-11-18 (5 s windows, 4 in a row) | Windows |
+|---|---|
+| Capture → shown on the tablet | p50 32.3–32.8 / p95 37–39 ms (n ≈ 300 per window) |
+| Capture → sent (capture, GPU convert, NVENC, write) | p50 3.3 / p95 3.5 ms |
+| NVENC encode | 2.6 ms per frame |
+| Tablet: wait for decoder / decode / decoded → shown | p50 1.1 / 21.7 / 2.9 ms |
+| Frame rate / bitrate | 60.0 fps, 20.0 Mbit/s |
+
+The decode time is the MT8781's idle-clock decode that the Linux section already describes (19–22 ms while nothing touches the screen; ~11 ms while drawing). The host's part is about the same as on Linux: 3.3 ms from capture to the first byte on the wire.
+
+Not measured yet (they need the camera and a person at the tablet): photon to photon with `tools/latency/camera.py`, pen-down → host with `tools/latency/pen.py --windows-monitor N`, and everything over Wi-Fi and USB accessory mode (AOA needs the Zadig step above).
 
 ## Status / roadmap
 
