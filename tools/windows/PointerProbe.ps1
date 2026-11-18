@@ -56,7 +56,7 @@ public class ProbeForm : Form {
                     else penHover++;
                     if ((pi.penFlags & 1) != 0) penBarrel++;
                     if ((pi.penFlags & 4) != 0 || (pi.penFlags & 2) != 0) penEraser++;
-                    combos.Add(String.Format("msg=0x{0:x} flags=0x{1:x} penFlags=0x{2:x}", msg, f & 0xfff, pi.penFlags));
+                    combos.Add(String.Format("msg=0x{0:x} flags=0x{1:x} penFlags=0x{2:x} buttonChange={3}", msg, f & 0xfff, pi.penFlags, pi.p.btn));
                     if (msg == 0x246) { penDown++; if (stream) { Console.Out.WriteLine("DOWN " + System.Diagnostics.Stopwatch.GetTimestamp() + " " + System.Diagnostics.Stopwatch.Frequency); Console.Out.Flush(); } }
                     if (msg == 0x247) penUp++;
                     if (pi.tiltX < tMinX) tMinX = pi.tiltX; if (pi.tiltX > tMaxX) tMaxX = pi.tiltX;
@@ -84,7 +84,8 @@ public class ProbeForm : Form {
 [ProbeForm]::new([System.Drawing.Rectangle]::Empty, 1) | Out-Null  # compile check only
 $null = Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);' -Name Dpi -Namespace W -PassThru
 [W.Dpi]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
-$screens = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { -not $_.Primary }, { $_.Bounds.X }
+# Same numbering as `waylus --list-outputs`: by device number (\\.\DISPLAYn).
+$screens = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { [int]($_.DeviceName -replace '\D', '') }
 $r = $screens[$Monitor - 1].Bounds
 $f = [ProbeForm]::new($r, $Seconds)
 $f.stream = [bool]$Stream

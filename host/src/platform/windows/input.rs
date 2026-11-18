@@ -20,9 +20,13 @@ use windows::Win32::{
             POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
         },
         Input::Pointer::{
-            InjectSyntheticPointerInput, POINTER_FLAG_DOWN, POINTER_FLAG_FIFTHBUTTON, POINTER_FLAG_FIRSTBUTTON,
-            POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_NEW, POINTER_FLAG_SECONDBUTTON, POINTER_FLAG_UP,
-            POINTER_FLAG_UPDATE, POINTER_FLAGS, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
+            InjectSyntheticPointerInput, POINTER_BUTTON_CHANGE_TYPE, POINTER_CHANGE_FIFTHBUTTON_DOWN,
+            POINTER_CHANGE_FIFTHBUTTON_UP, POINTER_CHANGE_FIRSTBUTTON_DOWN, POINTER_CHANGE_FIRSTBUTTON_UP,
+            POINTER_CHANGE_NONE, POINTER_CHANGE_SECONDBUTTON_DOWN, POINTER_CHANGE_SECONDBUTTON_UP,
+            POINTER_CHANGE_THIRDBUTTON_DOWN, POINTER_CHANGE_THIRDBUTTON_UP, POINTER_FLAG_DOWN, POINTER_FLAG_FIFTHBUTTON,
+            POINTER_FLAG_FIRSTBUTTON, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_NEW,
+            POINTER_FLAG_SECONDBUTTON, POINTER_FLAG_THIRDBUTTON, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_FLAGS,
+            POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
         },
         WindowsAndMessaging::{
             PEN_FLAG_BARREL, PEN_FLAG_ERASER, PEN_FLAG_INVERTED, PEN_FLAG_NONE, PEN_MASK_PRESSURE, PEN_MASK_TILT_X,
@@ -118,6 +122,8 @@ pub struct Pen {
     eraser: bool,
     touching: bool,
     buttons: u8,
+    /// Button of the current contact: its pointer flag and down / up change types.
+    contact: (POINTER_FLAGS, POINTER_BUTTON_CHANGE_TYPE, POINTER_BUTTON_CHANGE_TYPE),
     /// Last position, for the "left range" frame.
     last: POINT,
 }
@@ -131,11 +137,23 @@ impl Pen {
             eraser: false,
             touching: false,
             buttons: 0,
+            contact: (POINTER_FLAG_FIRSTBUTTON, POINTER_CHANGE_FIRSTBUTTON_DOWN, POINTER_CHANGE_FIRSTBUTTON_UP),
             last: POINT::default(),
         })
     }
 
     fn frame(&self, flags: POINTER_FLAGS, at: POINT, pressure: u32, tilt: (i32, i32)) -> POINTER_TYPE_INFO {
+        self.frame_change(flags, POINTER_CHANGE_NONE, at, pressure, tilt)
+    }
+
+    fn frame_change(
+        &self,
+        flags: POINTER_FLAGS,
+        change: POINTER_BUTTON_CHANGE_TYPE,
+        at: POINT,
+        pressure: u32,
+        tilt: (i32, i32),
+    ) -> POINTER_TYPE_INFO {
         let mut pen_flags = PEN_FLAG_NONE;
         if self.buttons & pen_buttons::PRIMARY != 0 {
             pen_flags |= PEN_FLAG_BARREL;
@@ -144,7 +162,14 @@ impl Pen {
             pen_flags |= PEN_FLAG_INVERTED | PEN_FLAG_ERASER;
         }
         let pen = POINTER_PEN_INFO {
-            pointerInfo: POINTER_INFO { pointerType: PT_PEN, pointerId: 0, pointerFlags: flags, ptPixelLocation: at, ..Default::default() },
+            pointerInfo: POINTER_INFO {
+                pointerType: PT_PEN,
+                pointerId: 0,
+                pointerFlags: flags,
+                ptPixelLocation: at,
+                ButtonChangeType: change,
+                ..Default::default()
+            },
             penFlags: pen_flags,
             penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
             pressure,
@@ -155,23 +180,32 @@ impl Pen {
         POINTER_TYPE_INFO { r#type: PT_PEN, Anonymous: POINTER_TYPE_INFO_0 { penInfo: pen } }
     }
 
-    /// Button bits of `pointerFlags` while the pen is in range.
+    /// Button bits of `pointerFlags`: the button the current contact is made with (none
+    /// while hovering, as with a real Windows Ink pen).
     fn button_flags(&self) -> POINTER_FLAGS {
-        let mut f = POINTER_FLAGS(0);
-        if self.touching {
-            f |= if self.eraser { POINTER_FLAG_FIFTHBUTTON } else { POINTER_FLAG_FIRSTBUTTON };
+        if self.touching { self.contact.0 } else { POINTER_FLAGS(0) }
+    }
+
+    /// Which button a contact starting now is made with, latched until the pen lifts. As
+    /// with a real Windows Ink pen, the barrel button turns the contact into a second-
+    /// button one (right-click; GTK button 3); the pen's other button gives the third
+    /// button (GTK button 2), the eraser the fifth.
+    fn contact_button(&self) -> (POINTER_FLAGS, POINTER_BUTTON_CHANGE_TYPE, POINTER_BUTTON_CHANGE_TYPE) {
+        if self.eraser {
+            (POINTER_FLAG_FIFTHBUTTON, POINTER_CHANGE_FIFTHBUTTON_DOWN, POINTER_CHANGE_FIFTHBUTTON_UP)
+        } else if self.buttons & pen_buttons::PRIMARY != 0 {
+            (POINTER_FLAG_SECONDBUTTON, POINTER_CHANGE_SECONDBUTTON_DOWN, POINTER_CHANGE_SECONDBUTTON_UP)
+        } else if self.buttons & pen_buttons::SECONDARY != 0 {
+            (POINTER_FLAG_THIRDBUTTON, POINTER_CHANGE_THIRDBUTTON_DOWN, POINTER_CHANGE_THIRDBUTTON_UP)
+        } else {
+            (POINTER_FLAG_FIRSTBUTTON, POINTER_CHANGE_FIRSTBUTTON_DOWN, POINTER_CHANGE_FIRSTBUTTON_UP)
         }
-        // The barrel button (and the pen's second button) reports as the second button.
-        if self.buttons != 0 {
-            f |= POINTER_FLAG_SECONDBUTTON;
-        }
-        f
     }
 
     fn leave(&mut self) -> Result<()> {
         if self.touching {
             self.touching = false;
-            self.dev.inject(&[self.frame(POINTER_FLAG_UP | POINTER_FLAG_INRANGE, self.last, 0, (0, 0))])?;
+            self.dev.inject(&[self.frame_change(POINTER_FLAG_UP | POINTER_FLAG_INRANGE, self.contact.2, self.last, 0, (0, 0))])?;
         }
         self.buttons = 0;
         // Out of range: an update without INRANGE.
@@ -210,10 +244,17 @@ impl Pen {
         let base = POINTER_FLAG_INRANGE;
         if touching && !self.touching {
             self.touching = true;
-            frames.push(self.frame(POINTER_FLAG_DOWN | POINTER_FLAG_INCONTACT | base | self.button_flags(), at, pressure, tilt));
+            self.contact = self.contact_button();
+            frames.push(self.frame_change(
+                POINTER_FLAG_DOWN | POINTER_FLAG_INCONTACT | base | self.button_flags(),
+                self.contact.1,
+                at,
+                pressure,
+                tilt,
+            ));
         } else if !touching && self.touching {
             self.touching = false;
-            frames.push(self.frame(POINTER_FLAG_UP | base | self.button_flags(), at, 0, tilt));
+            frames.push(self.frame_change(POINTER_FLAG_UP | base, self.contact.2, at, 0, tilt));
         } else {
             let contact = if touching { POINTER_FLAG_INCONTACT } else { POINTER_FLAGS(0) };
             frames.push(self.frame(POINTER_FLAG_UPDATE | contact | base | self.button_flags(), at, pressure, tilt));
