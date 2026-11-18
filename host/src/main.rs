@@ -3,20 +3,14 @@
 
 mod adb;
 mod aoa;
-mod capture;
-mod cuda;
-mod dmabuf;
 mod encode;
-mod gnome;
-mod input;
-mod kde;
+mod frame;
 mod link;
-mod niri;
+mod platform;
 mod proto;
 mod rawpen;
 mod session;
 mod slot;
-mod vaapi;
 mod wifi;
 
 use std::path::PathBuf;
@@ -33,14 +27,20 @@ struct Args {
     no_video: bool,
     /// Add `include optional=true "config.d/90-waylus.kdl"` to the niri config and
     /// exit. Waylus writes its pen/touch mapping to that file while it runs.
+    #[cfg(target_os = "linux")]
     #[arg(long)]
     niri_setup: bool,
-    /// Output (connector name) being mirrored, e.g. DP-2. Used for the niri
-    /// mapping hint and, with --no-video, for the aspect ratio.
+    /// List the monitors (for --output) and exit.
+    #[cfg(windows)]
+    #[arg(long)]
+    list_outputs: bool,
+    /// Output being mirrored: a connector name such as DP-2 (Linux; used for the niri
+    /// mapping hint and, with --no-video, for the aspect ratio), or a monitor number or
+    /// name from --list-outputs (Windows).
     #[arg(long, short)]
     output: Option<String>,
-    /// FFmpeg encoder: h264_nvenc, h264_vaapi, or auto (NVENC if an NVIDIA driver is
-    /// present, else VAAPI).
+    /// FFmpeg encoder: h264_nvenc, h264_amf, h264_qsv, h264_vaapi, or auto (by GPU:
+    /// NVENC on NVIDIA; Windows: AMF on AMD, QSV on Intel; Linux: else VAAPI).
     #[arg(long, default_value = "auto")]
     encoder: String,
     /// Video bitrate in Mbit/s (default: 20 at 1080p, scaled with resolution).
@@ -132,27 +132,25 @@ fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    platform::init();
+    #[cfg(windows)]
+    if args.list_outputs {
+        platform::list_outputs();
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
     if args.niri_setup {
-        return niri::setup();
+        return platform::niri_setup();
     }
 
     let encoder = match args.encoder.as_str() {
-        "auto" => encode::auto_encoder().to_owned(),
+        "auto" => platform::auto_encoder().to_owned(),
         e => e.to_owned(),
     };
     if !args.no_video {
         info!("encoder: {encoder}");
     }
-    capture::ZERO_COPY.store(
-        if encoder.contains("nvenc") {
-            capture::ZERO_COPY_CUDA
-        } else if encoder.contains("vaapi") {
-            capture::ZERO_COPY_VAAPI
-        } else {
-            capture::ZERO_COPY_NONE
-        },
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    platform::set_encoder(&encoder);
     if let Some(which) = &args.unpair {
         return wifi::unpair(which);
     }
@@ -233,10 +231,7 @@ fn main() -> Result<()> {
         _ => None,
     };
 
-    let mut output = args.output.as_deref().and_then(niri::by_name);
-    if args.output.is_some() && output.is_none() && niri::is_niri() {
-        warn!("output {:?} not found via niri IPC", args.output);
-    }
+    let mut output = platform::find_output(args.output.as_deref(), None);
 
     let source_max_fps = args.fps.map_or(240, |f| f * 2);
     let virtual_size = match args.r#virtual.as_deref() {
@@ -254,12 +249,14 @@ fn main() -> Result<()> {
             let size = size
                 .unwrap_or_else(|| session::stream_size((hello.surface_w as u32, hello.surface_h as u32), hello, fps));
             info!("creating a {}x{} virtual monitor", size.0, size.1);
-            if gnome::is_gnome() {
-                gnome::remember_connectors();
-            }
             // Virtual monitors take their refresh rate from what we ask for (Mutter made
             // a 240 Hz one with the mirroring headroom), so ask for the tablet's rate.
-            let cap = capture::start(fps, true, Some(size))?;
+            let cap = platform::capture_start(&platform::CaptureRequest {
+                source_max_fps: fps,
+                choose_again: true,
+                virtual_size: Some(size),
+                output: None,
+            })?;
             std::thread::sleep(std::time::Duration::from_millis(500));
             if !cap.running.load(std::sync::atomic::Ordering::SeqCst) {
                 bail!("virtual monitor capture failed to start (see warnings above)");
@@ -268,16 +265,19 @@ fn main() -> Result<()> {
         }));
         None
     } else {
-        let cap = capture::start(source_max_fps, args.choose, None)?;
+        let cap = platform::capture_start(&platform::CaptureRequest {
+            source_max_fps,
+            choose_again: args.choose,
+            virtual_size: None,
+            output: args.output.as_deref(),
+        })?;
         // Give PipeWire a moment to negotiate so format errors surface before the tablet connects.
         std::thread::sleep(std::time::Duration::from_millis(500));
         if !cap.running.load(std::sync::atomic::Ordering::SeqCst) {
             bail!("screen capture failed to start (see warnings above)");
         }
-        if output.is_none()
-            && let (Some(p), Some(s)) = (cap.geometry.position, cap.geometry.size)
-        {
-            output = niri::by_geometry(p, s);
+        if output.is_none() {
+            output = platform::find_output(None, Some(&cap));
         }
         Some(cap)
     };
@@ -285,21 +285,7 @@ fn main() -> Result<()> {
     match &output {
         Some(o) => {
             info!("mirroring {} ({}x{})", o.name, o.mode_w, o.mode_h);
-            if niri::is_niri() {
-                match niri::write_mapping(&o.name) {
-                    Ok(_) if niri::is_included() => info!("niri: pen/touch mapped to {} while Waylus runs", o.name),
-                    Ok(p) => warn!(
-                        "niri: wrote the pen/touch mapping to {}, but your niri config doesn't include it; \
-                         run `waylus --niri-setup` once, or add this line at the end of your config:\n{}",
-                        p.display(),
-                        niri::include_line()
-                    ),
-                    Err(e) => warn!(
-                        "niri: {e:#}; map the pen/touch yourself:\n{}",
-                        niri::config_hint(&o.name)
-                    ),
-                }
-            }
+            platform::announce_output(o);
         }
         None if args.no_video => warn!("no --output given, assuming 16:9"),
         None => {}
@@ -350,7 +336,7 @@ fn main() -> Result<()> {
         capture,
         lazy,
     );
-    niri::remove_mapping();
+    platform::on_exit();
     result
 }
 
@@ -365,13 +351,13 @@ fn install_exit_handler(adb: Option<adb::Adb>, reverse_port: Option<u16>, keep_a
     static STOPPING: AtomicBool = AtomicBool::new(false);
     ctrlc::set_handler(move || {
         if STOPPING.swap(true, Ordering::SeqCst) {
-            unsafe { libc::_exit(130) };
+            platform::exit_now(130);
         }
         eprintln!("\nstopping…");
-        niri::remove_mapping();
+        platform::on_exit();
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(3));
-            unsafe { libc::_exit(1) };
+            platform::exit_now(1);
         });
         if let Some(adb) = &adb {
             if let Some(port) = reverse_port {
@@ -385,7 +371,7 @@ fn install_exit_handler(adb: Option<adb::Adb>, reverse_port: Option<u16>, keep_a
                 adb.kill_remote_cat(dev);
             }
         }
-        unsafe { libc::_exit(0) };
+        platform::exit_now(0);
     })
     .context("install Ctrl-C handler")
 }

@@ -16,7 +16,7 @@ mod video;
 
 use std::{
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -215,56 +215,36 @@ pub fn unpair(which: &str) -> Result<()> {
 /// Private IPv4 addresses of up interfaces (no loopback, no CGNAT/VPN ranges like tailscale).
 pub fn lan_addresses() -> Vec<IpAddr> {
     let mut out = Vec::new();
-    unsafe {
-        let mut ifa: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifa) != 0 {
-            return out;
+    for i in if_addrs::get_if_addrs().unwrap_or_default() {
+        if i.is_loopback() || !i.is_oper_up() {
+            continue;
         }
-        let mut p = ifa;
-        while !p.is_null() {
-            let i = &*p;
-            let up = i.ifa_flags & libc::IFF_UP as u32 != 0 && i.ifa_flags & libc::IFF_LOOPBACK as u32 == 0;
-            if up && !i.ifa_addr.is_null() && (*i.ifa_addr).sa_family as i32 == libc::AF_INET {
-                let sin = &*(i.ifa_addr as *const libc::sockaddr_in);
-                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                if ip.is_private() && !out.contains(&IpAddr::V4(ip)) {
-                    out.push(IpAddr::V4(ip));
-                }
-            }
-            p = i.ifa_next;
+        if let IpAddr::V4(ip) = i.ip()
+            && ip.is_private()
+            && !out.contains(&IpAddr::V4(ip))
+        {
+            out.push(IpAddr::V4(ip));
         }
-        libc::freeifaddrs(ifa);
     }
     out
 }
 
-fn set_tos<S: std::os::fd::AsRawFd>(s: &S, tos: u32) {
-    let v = tos as libc::c_int;
-    let r = unsafe {
-        libc::setsockopt(s.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS, &v as *const _ as *const libc::c_void, std::mem::size_of_val(&v) as u32)
-    };
-    if r != 0 {
-        debug!("IP_TOS: {}", io::Error::last_os_error());
+/// IP type-of-service / DSCP byte for outgoing datagrams. (Windows ignores it unless a
+/// QoS policy allows the app to set DSCP; harmless there.)
+fn set_tos(s: &UdpSocket, tos: u32) {
+    if let Err(e) = socket2::SockRef::from(s).set_tos(tos) {
+        debug!("IP_TOS: {e}");
     }
 }
 
-fn set_sndbuf<S: std::os::fd::AsRawFd>(s: &S, bytes: i32) {
-    let r = unsafe {
-        libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, &bytes as *const _ as *const libc::c_void, 4)
-    };
-    if r != 0 {
-        debug!("SO_SNDBUF: {}", io::Error::last_os_error());
+fn set_sndbuf(s: &UdpSocket, bytes: usize) {
+    if let Err(e) = socket2::SockRef::from(s).set_send_buffer_size(bytes) {
+        debug!("SO_SNDBUF: {e}");
     }
 }
 
 fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if r != 0 {
-        return "waylus host".into();
-    }
-    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..n]).into_owned()
+    gethostname::gethostname().to_str().filter(|n| !n.is_empty()).unwrap_or("waylus host").to_owned()
 }
 
 fn send_fail(s: &mut TcpStream, code: u8, msg: &str) {

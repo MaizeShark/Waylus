@@ -12,6 +12,7 @@ use evdev::{
     PropType, UinputAbsSetup, uinput::VirtualDevice,
 };
 
+use crate::platform::InputTarget;
 use crate::proto::{PenSample, TouchPoint, pen_buttons, pen_state};
 
 /// Coordinate range used for both devices (matches the u16 wire format).
@@ -21,14 +22,6 @@ const PRESSURE_MAX: i32 = 4095;
 const TILT_MAX: i32 = 9000;
 const TILT_RES_PER_RAD: i32 = 5730; // 9000 / (π/2)
 const MAX_SLOTS: usize = 10;
-
-/// Physical size of the area the video occupies on the tablet, used to set
-/// the axis resolution (units/mm). libinput wants a resolution on tablets.
-#[derive(Debug, Clone, Copy)]
-pub struct AreaMm {
-    pub width: f32,
-    pub height: f32,
-}
 
 fn abs(code: Abs, min: i32, max: i32, res: i32) -> UinputAbsSetup {
     UinputAbsSetup::new(code, AbsInfo::new(0, min, max, 0, 0, res))
@@ -53,7 +46,8 @@ pub struct Pen {
 }
 
 impl Pen {
-    pub fn new(area: AreaMm) -> Result<Self> {
+    pub fn new(target: &InputTarget) -> Result<Self> {
+        let area = target.area;
         let rx = ((AXIS_MAX as f32 / area.width).round() as i32).max(1);
         let ry = ((AXIS_MAX as f32 / area.height).round() as i32).max(1);
         let keys = AttributeSet::from_iter([
@@ -173,7 +167,8 @@ pub struct Touch {
 }
 
 impl Touch {
-    pub fn new(area: AreaMm) -> Result<Self> {
+    pub fn new(target: &InputTarget) -> Result<Self> {
+        let area = target.area;
         let rx = ((AXIS_MAX as f32 / area.width).round() as i32).max(1);
         let ry = ((AXIS_MAX as f32 / area.height).round() as i32).max(1);
         let dev = VirtualDevice::builder()

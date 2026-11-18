@@ -14,17 +14,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
-#[derive(Debug, Clone)]
-pub struct Output {
-    pub name: String,
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-    /// Physical mode size.
-    pub mode_w: u32,
-    pub mode_h: u32,
-}
+pub use crate::platform::Output;
 
 pub fn is_niri() -> bool {
     std::env::var_os("NIRI_SOCKET").is_some()

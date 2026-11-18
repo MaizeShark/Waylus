@@ -25,52 +25,12 @@ use tracing::{debug, info, warn};
 
 use std::os::fd::RawFd;
 
+use super::dmabuf::{Importer, Plane, fourcc};
 use crate::{
-    dmabuf::{Importer, Plane, fourcc},
+    frame::{Capture, Frame, PixFmt, StreamGeometry},
     proto::now_ns,
     slot::LatestSlot,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PixFmt {
-    Bgrx,
-    Bgra,
-    Rgbx,
-    Rgba,
-}
-
-pub struct Frame {
-    /// On the GPU (zero-copy path): an FFmpeg CUDA frame; `data` is then empty.
-    pub gpu: Option<ffmpeg_next::frame::Video>,
-    pub width: u32,
-    pub height: u32,
-    pub stride: usize,
-    pub format: PixFmt,
-    pub capture_ns: u64,
-    pub data: Vec<u8>,
-}
-
-/// Geometry of the captured monitor in compositor (logical) coordinates.
-#[derive(Debug, Clone, Copy)]
-pub struct StreamGeometry {
-    pub position: Option<(i32, i32)>,
-    pub size: Option<(i32, i32)>,
-}
-
-pub struct Capture {
-    pub frames: Arc<LatestSlot<Frame>>,
-    /// Target frame interval for pacing (0 = pass every frame). Set per session
-    /// from the tablet's refresh rate.
-    pub pace_ns: Arc<AtomicU64>,
-    /// Captured size as `w << 32 | h` (0 until negotiated).
-    pub source_size: Arc<AtomicU64>,
-    /// Size to scale frames to, `w << 32 | h` (0 = native). Only the DMA-BUF path scales.
-    pub target_size: Arc<AtomicU64>,
-    /// Recycled frame buffers, sent back by the encoder.
-    pub recycle: crossbeam_channel::Sender<Vec<u8>>,
-    pub geometry: StreamGeometry,
-    pub running: Arc<AtomicBool>,
-}
 
 fn token_path() -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
@@ -193,7 +153,7 @@ struct UserData {
     format: Option<PixFmt>,
     dmabuf: bool,
     importer: Option<Importer>,
-    interop: Option<crate::dmabuf::Interop>,
+    interop: Option<super::dmabuf::Interop>,
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
     source_size: Arc<AtomicU64>,
@@ -394,8 +354,8 @@ fn run_pipewire(
         dmabuf: false,
         interop: if importer.is_some() && std::env::var_os("WAYLUS_NO_ZEROCOPY").is_none() {
             let r = match ZERO_COPY.load(Ordering::Relaxed) {
-                ZERO_COPY_CUDA => crate::cuda::Interop::new().map(crate::dmabuf::Interop::Cuda),
-                ZERO_COPY_VAAPI => crate::vaapi::Interop::new().map(crate::dmabuf::Interop::Vaapi),
+                ZERO_COPY_CUDA => super::cuda::Interop::new().map(super::dmabuf::Interop::Cuda),
+                ZERO_COPY_VAAPI => super::vaapi::Interop::new().map(super::dmabuf::Interop::Vaapi),
                 _ => Err(anyhow::anyhow!("not supported for this encoder")),
             };
             r.map_err(|e| info!("zero-copy unavailable ({e:#}); using readback")).ok()

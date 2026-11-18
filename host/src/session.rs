@@ -18,10 +18,10 @@ use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 
 use crate::{
-    capture::{Capture, Frame},
     encode::{Encoder, EncoderOpts, Packet},
-    input::{AreaMm, Pen, Touch},
+    frame::{Capture, Frame},
     link::Link,
+    platform::{AreaMm, InputTarget, input::{Pen, Touch}},
     proto::{self, DeviceMsg, Hello, codec, now_ns, video_flags},
 };
 
@@ -226,17 +226,6 @@ pub fn serve(opts: Opts, transports: Vec<Transport>, mut capture: Option<Capture
     }
 }
 
-fn wait_source_size(cap: &Capture) -> Option<(u32, u32)> {
-    for _ in 0..40 {
-        let v = cap.source_size.load(Ordering::SeqCst);
-        if v != 0 {
-            return Some(((v >> 32) as u32, v as u32));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    None
-}
-
 /// Stream size for a `src`-sized capture: never larger than the area the video
 /// covers on the tablet, within the decoder's size and macroblock-rate limits
 /// at `fps`, never upscaled, aspect ratio kept.
@@ -325,33 +314,11 @@ fn session(
             area.height,
             if ppmm == hello.px_per_mm { format!("{ppmm:.2} px/mm reported by the tablet") } else { format!("assumed {ppmm} px/mm") }
         );
-        *inputs = Some((Arc::new(Mutex::new(Pen::new(area)?)), Touch::new(area)?));
+        let target = InputTarget { area, geometry: capture.map(|c| c.geometry), output_name: opts.output_name.as_deref() };
+        *inputs = Some((Arc::new(Mutex::new(Pen::new(&target)?)), Touch::new(&target)?));
     }
     let (pen, touch) = inputs.as_mut().unwrap();
-    if crate::kde::is_kde() {
-        let target = match capture {
-            Some(cap) => match cap.geometry.position {
-                Some(p) => crate::kde::output_at(p, cap.geometry.size),
-                // Virtual monitors have no position yet; find KWin's output by size.
-                None => wait_source_size(cap).and_then(crate::kde::virtual_output),
-            },
-            None => opts.output_name.clone(),
-        };
-        match target {
-            Some(t) => crate::kde::map_devices(t),
-            None => warn!("KDE: couldn't tell which output is shown; map the Waylus pen/touch in System Settings"),
-        }
-    }
-    if crate::gnome::is_gnome() {
-        let pos = capture.and_then(|c| c.geometry.position);
-        let virtual_size = if capture.is_some() && pos.is_none() { capture.and_then(wait_source_size) } else { None };
-        let named = opts.output_name.clone();
-        crate::gnome::map_devices_with(move || match (pos, virtual_size) {
-            (Some(p), _) => crate::gnome::output_at(p),
-            (None, Some(sz)) => crate::gnome::virtual_output(sz),
-            _ => named.clone(),
-        });
-    }
+    crate::platform::map_devices(capture, opts.output_name.as_deref());
 
     let writer: Writer = Arc::new(Mutex::new(writer));
     let stop = Arc::new(AtomicBool::new(false));
@@ -378,7 +345,7 @@ fn session(
         enc_opts.fps = opts.fps.unwrap_or(if hello.refresh_hz >= 1.0 { hello.refresh_hz.round() as u32 } else { 60 });
         let pace = cap.pace_ns.clone();
         let mut stream_dims = None;
-        if let Some(src) = wait_source_size(cap) {
+        if let Some(src) = cap.wait_source_size() {
             let (w, h) = stream_size(src, &hello, enc_opts.fps);
             cap.target_size.store(if (w, h) == src { 0 } else { (w as u64) << 32 | h as u64 }, Ordering::SeqCst);
             if (w, h) != src {
@@ -614,7 +581,7 @@ fn video_loop(
             }
             pace.store(1_000_000_000 / opts.fps.max(1) as u64, Ordering::Relaxed);
             info!("streaming at {} fps", opts.fps);
-            let hw = frame.gpu.as_ref().map(crate::cuda::frames_ctx_of).transpose()?;
+            let hw = frame.gpu.as_ref().map(crate::encode::frames_ctx_of).transpose()?;
             let e = Encoder::new(opts, frame.width, frame.height, frame.format, hw)?;
             send(writer, |w| proto::write_config(w, codec::H264, frame.width as u16, frame.height as u16, vendor_tweaks))?;
             if let Some(x) = e.extradata() {

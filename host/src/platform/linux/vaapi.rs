@@ -13,7 +13,7 @@ use ffmpeg_next as ff;
 use ff::ffi;
 use tracing::info;
 
-use crate::dmabuf::Plane;
+use super::dmabuf::Plane;
 
 pub struct Interop {
     device: *mut ffi::AVBufferRef,

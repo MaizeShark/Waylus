@@ -11,17 +11,9 @@ anyhow = "1"
 ctrlc = "3"
 clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
-evdev = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ffmpeg-next = "9.1"
-ashpd = { version = "0.14", default-features = false, features = ["tokio", "screencast"] }
-pipewire = { version = "0.10", features = ["v0_3_65"] }
-tokio = { version = "1", features = ["rt", "macros"] }
-libc = "0.2"
-khronos-egl = { version = "6", features = ["dynamic"] }
-glow = "0.18"
-libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 nusb = "0.2.9"
@@ -34,6 +26,47 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 subtle = "2"
 reed-solomon-erasure = "6"
 mdns-sd = "0.22.0"
+socket2 = { version = "0.5", features = ["all"] }
+if-addrs = "0.15"
+gethostname = "0.5"
+
+# Linux (Wayland): portal + PipeWire capture, EGL/GL/CUDA zero-copy, uinput.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "screencast"] }
+pipewire = { version = "0.10", features = ["v0_3_65"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+libc = "0.2"
+libloading = "0.8"
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.18"
+
+# Windows 10/11: Windows.Graphics.Capture + D3D11, synthetic pointer input.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Media",
+]
 
 [dev-dependencies]
 hex = "0.4"

@@ -226,9 +226,3 @@ impl Drop for Interop {
         }
     }
 }
-
-/// The hw frames context of a CUDA frame, for configuring the encoder.
-pub fn frames_ctx_of(frame: &ff::frame::Video) -> Result<*mut ffi::AVBufferRef> {
-    let r = unsafe { (*frame.as_ptr()).hw_frames_ctx };
-    if r.is_null() { Err(anyhow!("frame has no hw_frames_ctx")) } else { Ok(r) }
-}

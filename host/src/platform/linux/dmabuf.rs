@@ -74,8 +74,8 @@ pub struct Importer {
 
 /// GPU encoder the zero-copy path feeds.
 pub enum Interop {
-    Cuda(crate::cuda::Interop),
-    Vaapi(crate::vaapi::Interop),
+    Cuda(super::cuda::Interop),
+    Vaapi(super::vaapi::Interop),
 }
 
 const NV12_VS: &str = "#version 330 core
@@ -355,7 +355,7 @@ impl Importer {
         format: u32,
         modifier: u64,
         planes: &[Plane],
-        interop: &mut crate::vaapi::Interop,
+        interop: &mut super::vaapi::Interop,
     ) -> Result<ffmpeg_next::frame::Video> {
         let src = self.blit(w, h, ow, oh, format, modifier, planes)?;
         let (frame, surface) = interop.get(ow, oh)?;
@@ -450,7 +450,7 @@ impl Importer {
         format: u32,
         modifier: u64,
         planes: &[Plane],
-        interop: &mut crate::cuda::Interop,
+        interop: &mut super::cuda::Interop,
     ) -> Result<ffmpeg_next::frame::Video> {
         self.blit(w, h, ow, oh, format, modifier, planes)?;
         let (_, fbo, _, _) = self.staging.unwrap();

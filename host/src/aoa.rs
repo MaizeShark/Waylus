@@ -74,7 +74,7 @@ impl Aoa {
             if let Some(d) = self.pick_accessory(&devices) {
                 match claim(&d) {
                     Ok(i) => {
-                        info!("USB accessory link up ({:04x}:{:04x}, bus {} addr {})", d.vendor_id(), d.product_id(), d.busnum(), d.device_address());
+                        info!("USB accessory link up ({:04x}:{:04x}, {})", d.vendor_id(), d.product_id(), bus_address(&d));
                         self.iface = Some(i);
                         return Ok(());
                     }
@@ -171,16 +171,77 @@ fn describe(d: &DeviceInfo) -> String {
     )
 }
 
+/// Where the device sits, for the log.
+fn bus_address(d: &DeviceInfo) -> String {
+    #[cfg(target_os = "linux")]
+    return format!("bus {} addr {}", d.busnum(), d.device_address());
+    #[cfg(not(target_os = "linux"))]
+    format!("bus {} addr {}", d.bus_id(), d.device_address())
+}
+
+/// Something control transfers can be sent through. Linux sends them to the device;
+/// Windows (WinUSB) only lets you send them through a claimed interface.
+enum Control {
+    #[cfg(not(windows))]
+    Device(nusb::Device),
+    #[cfg(windows)]
+    Interface(Interface),
+}
+
+impl Control {
+    fn open(d: &DeviceInfo) -> Result<Self> {
+        let dev = d.open().wait().context("open USB device")?;
+        #[cfg(not(windows))]
+        return Ok(Self::Device(dev));
+        #[cfg(windows)]
+        {
+            // The tablet's own interfaces (adb, MTP) carry whatever driver the vendor
+            // installed; any interface bound to WinUSB will do to reach the control pipe.
+            let mut last = None;
+            for i in d.interfaces() {
+                match dev.claim_interface(i.interface_number()).wait() {
+                    Ok(iface) => return Ok(Self::Interface(iface)),
+                    Err(e) => last = Some(e),
+                }
+            }
+            match last {
+                Some(e) => bail!(
+                    "no interface of the tablet is usable through WinUSB ({e}); install the Google USB Driver                      or bind WinUSB to its adb interface with Zadig (see the README)"
+                ),
+                None => bail!("the tablet reports no USB interfaces"),
+            }
+        }
+    }
+
+    fn control_in(&self, data: ControlIn, t: Duration) -> Result<Vec<u8>> {
+        Ok(match self {
+            #[cfg(not(windows))]
+            Self::Device(d) => d.control_in(data, t).wait()?,
+            #[cfg(windows)]
+            Self::Interface(i) => i.control_in(data, t).wait()?,
+        })
+    }
+
+    fn control_out(&self, data: ControlOut, t: Duration) -> Result<()> {
+        match self {
+            #[cfg(not(windows))]
+            Self::Device(d) => d.control_out(data, t).wait()?,
+            #[cfg(windows)]
+            Self::Interface(i) => i.control_out(data, t).wait()?,
+        }
+        Ok(())
+    }
+}
+
 /// Sends the AOA handshake. Returns the device's AOA protocol version.
 fn switch(d: &DeviceInfo) -> Result<u16> {
-    let dev = d.open().wait().context("open USB device")?;
+    let dev = Control::open(d)?;
     let t = Duration::from_secs(1);
     let v = dev
         .control_in(
             ControlIn { control_type: ControlType::Vendor, recipient: Recipient::Device, request: GET_PROTOCOL, value: 0, index: 0, length: 2 },
             t,
         )
-        .wait()
         .context("AOA get protocol")?;
     let version = u16::from_le_bytes([*v.first().unwrap_or(&0), *v.get(1).unwrap_or(&0)]);
     if version == 0 {
@@ -193,14 +254,12 @@ fn switch(d: &DeviceInfo) -> Result<u16> {
             ControlOut { control_type: ControlType::Vendor, recipient: Recipient::Device, request: SEND_STRING, value: 0, index: i as u16, data: &data },
             t,
         )
-        .wait()
         .context("AOA send string")?;
     }
     dev.control_out(
         ControlOut { control_type: ControlType::Vendor, recipient: Recipient::Device, request: START, value: 0, index: 0, data: &[] },
         t,
     )
-    .wait()
     .context("AOA start")?;
     Ok(version)
 }

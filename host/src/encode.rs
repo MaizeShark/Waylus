@@ -11,7 +11,7 @@ use ffmpeg_next as ff;
 use ff::{codec, format::Pixel, frame, picture};
 use tracing::{info, warn};
 
-use crate::capture::{Frame, PixFmt};
+use crate::frame::{Frame, PixFmt};
 
 #[derive(Debug, Clone)]
 pub struct EncoderOpts {
@@ -40,10 +40,10 @@ pub struct Encoder {
     vaapi: Option<Vaapi>,
 }
 
-/// Picks the encoder for `auto`: NVENC when the NVIDIA driver is present, else VAAPI.
-pub fn auto_encoder() -> &'static str {
-    let nvidia = unsafe { libloading::Library::new("libcuda.so.1") }.is_ok();
-    if nvidia { "h264_nvenc" } else { "h264_vaapi" }
+/// The hw frames context of a GPU frame, for configuring the encoder.
+pub fn frames_ctx_of(frame: &frame::Video) -> Result<*mut ff::ffi::AVBufferRef> {
+    let r = unsafe { (*frame.as_ptr()).hw_frames_ctx };
+    if r.is_null() { Err(anyhow!("frame has no hw_frames_ctx")) } else { Ok(r) }
 }
 
 /// CPU frames → NV12 VAAPI surfaces.

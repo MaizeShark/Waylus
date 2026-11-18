@@ -374,9 +374,7 @@ pub fn write_ping(w: &mut impl Write, host_ns: u64) -> io::Result<()> {
     message(w, ty::PING, &[&host_ns.to_le_bytes()])
 }
 
-/// CLOCK_MONOTONIC in nanoseconds.
+/// Host monotonic clock in nanoseconds (the app estimates its offset from pings).
 pub fn now_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    crate::platform::monotonic_ns()
 }

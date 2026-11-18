@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Host identity and paired tablets, in `$XDG_STATE_HOME/waylus/wifi.json` (mode 0600).
+//! Host identity and paired tablets: `$XDG_STATE_HOME/waylus/wifi.json` (mode 0600) on
+//! Linux, `%LOCALAPPDATA%\waylus\wifi.json` on Windows (the directory's inherited ACL
+//! already limits it to the user, SYSTEM and administrators; Waylus doesn't widen it).
 
 use std::{
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -31,11 +32,16 @@ pub struct Store {
 }
 
 fn path() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("waylus").join("wifi.json")
+    crate::platform::state_dir().join("wifi.json")
+}
+
+/// Opens the temp file for the new store; on Unix with mode 0600 from the start.
+fn create_private(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(p)
 }
 
 pub fn to_hex(b: &[u8]) -> String {
@@ -55,10 +61,14 @@ impl Store {
         let p = path();
         match std::fs::read(&p) {
             Ok(b) => {
-                let meta = std::fs::metadata(&p)?;
-                if meta.permissions().mode() & 0o077 != 0 {
-                    tracing::warn!("{} is readable by other users; fixing permissions", p.display());
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let meta = std::fs::metadata(&p)?;
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        tracing::warn!("{} is readable by other users; fixing permissions", p.display());
+                        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                    }
                 }
                 serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))
             }
@@ -79,7 +89,7 @@ impl Store {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = p.with_extension("json.tmp");
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut f = create_private(&tmp)?;
         f.write_all(&serde_json::to_vec_pretty(self)?)?;
         f.sync_all()?;
         std::fs::rename(&tmp, &p).with_context(|| format!("write {}", p.display()))
