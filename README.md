@@ -261,7 +261,7 @@ The host also runs on Windows 10 (1903 or newer; 11 recommended) with the same a
    ```
    (vcpkg works as well: `vcpkg install ffmpeg[nvcodec,amf,qsv]:x64-windows`.) At run time `waylus.exe` finds the FFmpeg DLLs on `PATH` or next to itself: copy the `bin\*.dll` files beside it.
 2. The **tablet app** is the same APK as on Linux (protocol version 5), installed with `adb` (platform-tools on `PATH`, USB debugging on). Waylus installs an APK it finds next to the binary or the source tree, or uses the installed one.
-3. Run it. `waylus --list-outputs` shows the monitors (number, GDI name, size, refresh rate, GPU); `waylus --output 2` mirrors one. Without `--output` Waylus asks once and remembers the choice in `%LOCALAPPDATA%\waylus\output.txt` (`--choose` asks again).
+3. Run it. `waylus --list-outputs` shows the monitors (number, GDI name, size, refresh rate, GPU); `waylus --output 2` mirrors one. The numbers follow Windows' device names (`\\.\DISPLAY1`, `\\.\DISPLAY2`, …), so they don't change when you pick another main display or rearrange the monitors; `--output DISPLAY2` works too. Without `--output` Waylus asks once and remembers the choice in `%LOCALAPPDATA%\waylus\output.txt` (`--choose` asks again).
 
 ```powershell
 waylus --list-outputs
@@ -340,7 +340,29 @@ Not the same measurement point as the Linux figures (p50 6.8 / p95 8.8 ms over U
 
 **Wi-Fi, 2026-11-18** (built-in statistics as above, `waylus --wifi --no-usb`, release build, 4 windows of 5 s, host and tablet on the same access point at 5260 MHz, tablet −71…−72 dBm, 263 Mbit/s link): capture → shown p50 35.3–36.7 / p95 40.8–49 ms; capture → sent p50 5.0–5.2 ms (send 1.0 ms per frame, seal + FEC 0.13 ms); sent → received p50 7.4–8.0 / p95 11.6–13.9 ms; 0 of 10 800 shards lost per window, no FEC repair, no lost frames, 60 fps. mDNS discovery (the tablet listed the host), PIN pairing from a fresh key store and qWAVE flow marking (accepted without administrator rights; its effect on the air was not measured) all worked.
 
-Not measured yet: USB taking over from Wi-Fi, and Weylus / Moonlight on Windows.
+#### Weylus and Moonlight on Windows
+
+Same desktop, monitor, tablet and `camera.py` method as above, 2026-11-18, the barcode page on `\\.\DISPLAY2` (1920×1080, 60 Hz). Photon to photon, tablet behind the real monitor:
+
+| | p50 | p95 | p5 / p99 | n |
+|---|---|---|---|---|
+| Waylus, USB accessory mode | **39 ms** | **59 ms** | 23 / 67 | 209 |
+| Waylus, USB `--transport adb` | **46 ms** | **65 ms** | 32 / 68 | 194 |
+| Weylus 0.11.4, USB (`adb reverse`), min. frame interval 1 ms | **393 ms** | **471 ms** | 293 / 512 | 258 |
+| Weylus 0.11.4, same, min. frame interval 8 ms | **401 ms** | **494 ms** | 317 / 527 | 1651 |
+| Waylus `--wifi --no-usb`, 5 GHz (earlier session) | **48 ms** | **64 ms** | 29 / 73 | 239 ᵂ |
+| Waylus `--wifi --no-usb`, 5 GHz (same session as Moonlight) | **55 ms** | **78 ms** | 34 / 93 | 438 ᵂ |
+| Moonlight 12.2 + Sunshine 2026.914, H.264, 5 GHz | **47 ms** | **71 ms** | 30 / 73 | 301 |
+| Moonlight 12.2 + Sunshine 2026.914, HEVC, 5 GHz | **53 ms** | **61 ms** | 37 / 68 | 524 |
+
+- **Weylus** is the official Windows release 0.11.4 (the Linux comparison used a newer local build). It captures only the main display, so monitor 2 was made the main display for its clips. Settings: NVENC (`--try-nvenc`), Chrome on the tablet, "Lower Latency" on, maximum resolution. 0.11.4 has no frame-rate slider; its "minimum frame interval" was set to 1 ms, then to 8 ms (≈ 120 fps, as on Linux), with the same result. About 400 ms is twice what Weylus reached on Linux (198 ms) and ten times Waylus; where Windows adds the time (capture, the browser's decoder queue) was not investigated.
+- **Moonlight**: Sunshine 2026.914, the same version as on Linux, portable build, `output_name = \\.\DISPLAY2`, `capture = ddx` (Desktop Duplication), NVENC; Moonlight at 1080p, 60 fps, 20 Mbit/s, frame pacing "Prefer lowest latency". The tablet was on 5260 MHz at −60…−63 dBm, 351–390 Mbit/s. On Windows Moonlight is 13–20 ms faster than with the same versions on Linux (H.264 67 → 47 ms, HEVC 60 → 53 ms at p50), so Sunshine's Windows capture path is the quicker one.
+- **Waylus over Wi-Fi**: the clip filmed right after Moonlight's caught a Wi-Fi stall (the host's statistics for that 5 s window: sent → received p95 51 ms instead of 10–13); outside it the built-in figures matched the earlier session (capture → shown p50 34–37 ms). On Windows Waylus over Wi-Fi is about level with Moonlight at the median (48–55 vs 47–53 ms) and has the longer tail when the link stalls, the same open item as on Linux (⁹ above).
+- The pen with Moonlight was not measured on Windows.
+
+ᵂ Outliers dropped as described for Linux (⁹ above): 6 readings of 86–124 ms in the earlier clip, 25 of 105–293 ms in the later one (with them: p95 110 / p99 260 ms).
+
+Not measured yet: USB taking over from Wi-Fi.
 
 ## Status / roadmap
 

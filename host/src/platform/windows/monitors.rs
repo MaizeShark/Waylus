@@ -64,7 +64,9 @@ unsafe extern "system" fn collect(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARA
     true.into()
 }
 
-/// All attached monitors, primary first, then left to right.
+/// All attached monitors, in the order of their device numbers (`\\.\DISPLAYn`). The
+/// numbers `--output` takes index this list, so they must not move when the main display
+/// or the desktop layout changes.
 pub fn list() -> Vec<Monitor> {
     let mut v: Vec<Monitor> = Vec::new();
     unsafe {
@@ -74,8 +76,14 @@ pub fn list() -> Vec<Monitor> {
     for m in &mut v {
         m.adapter = names.get(&m.name).cloned().unwrap_or_default();
     }
-    v.sort_by_key(|m| (!m.primary, m.rect.left, m.rect.top));
+    v.sort_by_key(|m| (device_number(&m.name), m.name.clone()));
     v
+}
+
+/// `\\.\DISPLAY12` → 12 (names without a number sort last).
+fn device_number(name: &str) -> u32 {
+    let digits = name.trim_start_matches(|c: char| !c.is_ascii_digit());
+    digits.parse().unwrap_or(u32::MAX)
 }
 
 fn wide(s: &[u16]) -> String {
