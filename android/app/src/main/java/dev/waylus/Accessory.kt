@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit
  */
 object Accessory : Connection.Link {
     private const val TAG = "waylus"
-    private const val ACTION_PERMISSION = "dev.waylus.USB_PERMISSION"
+    private const val ACTION_PERMISSION = BuildConfig.APPLICATION_ID + ".USB_PERMISSION"
     /** The accessory driver completes reads in units of up to 16 KiB; asking for less can lose data. */
     private const val CHUNK = 16384
     private val EOF = ByteArray(0)

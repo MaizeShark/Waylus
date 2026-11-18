@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Source artwork: docs/logo.svg (screen, drawn stroke, stylus). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path
+        android:fillColor="#173447"
+        android:strokeColor="#E8F3F7"
+        android:strokeWidth="4.5"
+        android:pathData="M30,42H66A5,5 0,0 1,71 47V68A5,5 0,0 1,66 73H30A5,5 0,0 1,25 68V47A5,5 0,0 1,30 42Z" />
+    <path
+        android:strokeColor="#FFC46B"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round"
+        android:pathData="M33,62c3,-7.5 7,-7.5 10.5,0s7.5,7.5 10.5,0" />
+    <group android:translateX="56" android:translateY="61" android:rotation="40">
+        <path android:fillColor="#E8F3F7" android:pathData="M0,0L-5,-11H5Z" />
+        <path
+            android:fillColor="#43D6C4"
+            android:pathData="M-2.5,-37H2.5A2.5,2.5 0,0 1,5 -34.5V-15.5A2.5,2.5 0,0 1,2.5 -13H-2.5A2.5,2.5 0,0 1,-5 -15.5V-34.5A2.5,2.5 0,0 1,-2.5 -37Z" />
+    </group>
+</vector>

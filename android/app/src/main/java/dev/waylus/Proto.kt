@@ -43,6 +43,16 @@ object Proto {
     const val WIFI_FRAME_LOST = 25
     /** Wi-Fi: reception statistics, once per second. */
     const val WIFI_STATS = 26
+    /**
+     * Host → tablet, about once a second: the host's rolling figures for the stats display
+     * (parseStats). Added without a version bump: older apps ignore unknown message types.
+     */
+    const val STATS = 27
+
+    /** STATS flags. */
+    const val STATS_HUD = 1
+    /** The host reads the stylus directly (over adb): no pen→host figure. */
+    const val STATS_RAW_PEN = 2
 
     /** AUTH_FAIL reasons (host/src/wifi/mod.rs `fail`). */
     const val FAIL_UNKNOWN_DEVICE = 1
@@ -163,6 +173,20 @@ object Proto {
     }
 
     fun requestKeyframe(): ByteArray = msg(REQUEST_KEYFRAME, 0).array()
+
+    class HostStats(val flags: Int, val stats: LiveStats.Host)
+
+    /**
+     * STATS payload: [u8 flags][u16 capture→shown p50][u16 p95][u16 pen→host p50][u16 p95]
+     * [u16 held back ms/s], times in 0.1 ms, 0xFFFF = no data. Fields may be appended.
+     */
+    fun parseStats(p: ByteArray): HostStats? {
+        if (p.isEmpty()) return null
+        val b = le(p)
+        val flags = b.get().toInt() and 0xff
+        fun next(): Float? = if (b.remaining() >= 2) (b.getShort().toInt() and 0xffff).let { if (it == 0xffff) null else it / 10f } else null
+        return HostStats(flags, LiveStats.Host(next(), next(), next(), next(), next()))
+    }
 
     class Message(val type: Int, val payload: ByteArray)
 

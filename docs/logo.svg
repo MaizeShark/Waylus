@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Waylus logo: a pen display (screen outline) with a stylus drawing a wave across it.
+     108x108 like an Android adaptive icon; the screen and the stylus tip stay inside
+     the 66-unit safe circle. The launcher icon (android/app/src/main/res/drawable/ic_launcher_*.xml)
+     uses the same paths. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108">
+  <rect width="108" height="108" rx="24" fill="#0F2230"/>
+  <!-- screen -->
+  <rect x="25" y="42" width="46" height="31" rx="5" fill="#173447" stroke="#E8F3F7" stroke-width="4.5"/>
+  <!-- drawn stroke -->
+  <path d="M33 62 c3-7.5 7-7.5 10.5 0 s7.5 7.5 10.5 0" fill="none" stroke="#FFC46B" stroke-width="4.5" stroke-linecap="round"/>
+  <!-- stylus: tip at (56,61), body towards the top right, over the screen edge -->
+  <g transform="translate(56 61) rotate(40)">
+    <path d="M0 0 L-5 -11 H5 Z" fill="#E8F3F7"/>
+    <rect x="-5" y="-37" width="10" height="24" rx="2.5" fill="#43D6C4"/>
+  </g>
+</svg>

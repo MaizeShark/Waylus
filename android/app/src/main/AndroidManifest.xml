@@ -6,6 +6,8 @@
     <!-- Wi-Fi transport: the low-latency Wi-Fi lock and link info. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Device info on the idle screen (Wi-Fi addresses, band, signal); a normal permission. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-feature android:name="android.hardware.usb.accessory" android:required="false" />
     <!-- Only for the latency measurement overlay (tools/latency). -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -14,8 +16,9 @@
 
     <application
         android:label="Waylus"
-        android:icon="@android:drawable/ic_menu_edit"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/Theme.Waylus.Starting"
         android:hardwareAccelerated="true">
         <activity
             android:name=".MainActivity"

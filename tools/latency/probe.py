@@ -15,7 +15,7 @@ import argparse, io, socket, statistics, struct, subprocess, sys, threading, tim
 
 from PIL import Image
 
-PKG = "dev.waylus"
+PKG = "de.hut9.waylus"
 CELL_W, CELL_H = 40, 24  # LatencyOverlay cell size in px
 
 
@@ -96,7 +96,7 @@ def main():
     threading.Thread(target=sync_server, args=(a.port,), daemon=True).start()
     adb("reverse", f"tcp:{a.port}", f"tcp:{a.port}")
     adb("shell", "appops", "set", PKG, "SYSTEM_ALERT_WINDOW", "allow")
-    adb("shell", "am", "start-foreground-service", "-n", f"{PKG}/.LatencyOverlay", "--ei", "port", str(a.port))
+    adb("shell", "am", "start-foreground-service", "-n", f"{PKG}/dev.waylus.LatencyOverlay", "--ei", "port", str(a.port))
     time.sleep(3)  # clock sync settles
 
     lat, fails = [], 0
@@ -118,7 +118,7 @@ def main():
             lat.append(d)
             print(f"\r{len(lat)}/{a.samples}: {d} ms   ", end="", file=sys.stderr, flush=True)
     finally:
-        adb("shell", "am", "stopservice", "-n", f"{PKG}/.LatencyOverlay", check=False)
+        adb("shell", "am", "stopservice", "-n", f"{PKG}/dev.waylus.LatencyOverlay", check=False)
         adb("reverse", "--remove", f"tcp:{a.port}", check=False)
     print(file=sys.stderr)
     if not lat:

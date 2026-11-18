@@ -28,8 +28,8 @@ import java.net.Socket
  * barcode, and the difference is the end-to-end latency, independent of
  * which mirroring app (Waylus or a browser) is showing the host screen.
  *
- * Start: adb shell appops set dev.waylus SYSTEM_ALERT_WINDOW allow
- *        adb shell am start-foreground-service -n dev.waylus/.LatencyOverlay --ei port 27184
+ * Start: adb shell appops set de.hut9.waylus SYSTEM_ALERT_WINDOW allow
+ *        adb shell am start-foreground-service -n de.hut9.waylus/dev.waylus.LatencyOverlay --ei port 27184
  */
 class LatencyOverlay : Service() {
     @Volatile private var offsetNs = Long.MIN_VALUE // hostRealtime - deviceMonotonic

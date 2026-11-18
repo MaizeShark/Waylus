@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package dev.waylus
 
-import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
-import android.hardware.usb.UsbManager
+import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
+import android.hardware.usb.UsbManager
+import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.InputDevice
@@ -16,59 +21,89 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
-import android.text.InputType
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
-import android.widget.Button
-import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.LinearLayout
 import android.widget.TextView
-import java.io.IOException
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import dev.waylus.ui.Discovered
+import dev.waylus.ui.Hud
+import dev.waylus.ui.HudState
+import dev.waylus.ui.IdleScreen
+import dev.waylus.ui.PairedHost
+import dev.waylus.ui.Pairing
+import dev.waylus.ui.Phase
+import dev.waylus.ui.TransportKind
+import dev.waylus.ui.UiActions
+import dev.waylus.ui.UiModel
+import dev.waylus.ui.WaylusTheme
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
-class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
+/**
+ * Owns the connection and decoder lifecycle. The screens are Compose (ui/), reading
+ * [UiModel]; the video is a plain SurfaceView whose Surface goes straight to MediaCodec.
+ *
+ * While a stream runs, the window shows the SurfaceView and nothing else: the idle UI's
+ * ComposeView is GONE and its content removed, and the stats display (off by default) is
+ * a small non-interactive ComposeView updated once a second. Pen and touch go to [Root]'s
+ * onTouchEvent/onGenericMotionEvent, unbuffered, as before.
+ */
+class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Callback, UiActions {
     private lateinit var root: Root
     private lateinit var surfaceView: SurfaceView
     private lateinit var frame: View
-    private lateinit var status: TextView
+    /** "input only" label (`waylus --no-video`); a plain view so it can't take input. */
+    private lateinit var inputOnlyLabel: TextView
+    private lateinit var idleView: ComposeView
+    private lateinit var hudView: ComposeView
     private lateinit var conn: Connection
     private var port = Proto.DEFAULT_PORT
     private var usingAccessory = false
     private var usingWifi = false
+    private var transport = TransportKind.WIFI
     private lateinit var wifiStore: WifiStore
-    private lateinit var wifiPanel: LinearLayout
-    private lateinit var wifiMsg: TextView
-    private lateinit var wifiAddr: EditText
-    private lateinit var pairButton: Button
-    private lateinit var pinRow: LinearLayout
-    private lateinit var hostsRow: LinearLayout
     private lateinit var discovery: WifiDiscovery
-    private lateinit var pinEdit: EditText
+    private lateinit var deviceInfo: DeviceInfoWatcher
+    private lateinit var prefs: SharedPreferences
     private val pinQueue = LinkedBlockingQueue<String>()
-    /** Keeps the pairing result readable for a while instead of the connection status. */
-    @Volatile private var pairNoteUntil = 0L
+    @Volatile private var pairCancelled = false
     private lateinit var decoder: VideoDecoder
     private lateinit var input: InputCapture
     private lateinit var boost: ClockBoost
     private val decoderInfo by lazy { VideoDecoder.pick() }
+    private val main = Handler(Looper.getMainLooper())
+
+    private val ui = UiModel()
+    private val hud = HudState()
+    /** The host asked for the stats display (--hud, in its STATS messages) this session. */
+    private var hostHud = false
+    /** The user hid the host-requested stats display; stays hidden this session. */
+    private var hostHudDismissed = false
+    private var resumed = false
 
     /** Where the video is drawn, in root-view coordinates. Read from the UI thread only. */
     private val videoRect = RectF()
     private var videoW = 16
     private var videoH = 9
     @Volatile private var firstFrameShown = false
+    @Volatile private var loggedStartup = false
     /** Refresh rate of the display mode we asked for (the highest available). */
     @Volatile private var refreshHz = 60f
 
     /** Full-screen container that receives all pointer events, unbatched. */
     inner class Root(ctx: Context) : FrameLayout(ctx) {
         override fun onTouchEvent(e: MotionEvent): Boolean {
+            if (letterboxTap(e)) return true
             boost.poke()
             return input.onEvent(e) || super.onTouchEvent(e)
         }
@@ -83,13 +118,15 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen()
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge(SystemBarStyle.dark(Color.TRANSPARENT), SystemBarStyle.dark(Color.TRANSPARENT))
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // Generic Android API: ask for stable (not bursty) CPU/GPU clocks. Decode latency on
         // some SoCs follows the CPU clock, so frequency drops show up as decode spikes.
         val pm = getSystemService(android.os.PowerManager::class.java)
         if (pm.isSustainedPerformanceModeSupported) window.setSustainedPerformanceMode(true)
-        android.util.Log.i("waylus", "sustained performance mode supported: ${pm.isSustainedPerformanceModeSupported}")
+        Log.i(TAG, "sustained performance mode supported: ${pm.isSustainedPerformanceModeSupported}")
         window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         port = intent.getIntExtra("port", Proto.DEFAULT_PORT)
         boost = ClockBoost(
@@ -97,23 +134,41 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             intent.getIntExtra("boost_threads", 1).coerceIn(1, 4),
         )
         pickFastestMode()
+        prefs = getSharedPreferences("settings", MODE_PRIVATE)
 
         root = Root(this).apply { setBackgroundColor(Color.BLACK) }
         surfaceView = SurfaceView(this)
         surfaceView.holder.addCallback(this)
         root.addView(surfaceView, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
         frame = View(this).apply {
-            background = GradientDrawable().apply { setStroke(2, 0xFF3A3A3A.toInt()) }
+            background = GradientDrawable().apply { setStroke(2, 0xFF5A6A72.toInt()) }
+            visibility = View.GONE
         }
         root.addView(frame, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
-        status = TextView(this).apply {
-            setTextColor(0xFFB0B0B0.toInt())
+        inputOnlyLabel = TextView(this).apply {
+            setTextColor(0xFFE0ECF0.toInt())
             textSize = 18f
             gravity = Gravity.CENTER
+            visibility = View.GONE
         }
-        root.addView(status, FrameLayout.LayoutParams(-1, -1))
+        root.addView(inputOnlyLabel, FrameLayout.LayoutParams(-1, -1))
+        idleView = ComposeView(this).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            setContent {
+                WaylusTheme {
+                    // Out of the composition while streaming, not just hidden.
+                    if (ui.phase != Phase.STREAMING && ui.phase != Phase.INPUT_ONLY) IdleScreen(ui, this@MainActivity)
+                }
+            }
+        }
+        root.addView(idleView, FrameLayout.LayoutParams(-1, -1))
+        hudView = ComposeView(this).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            setContent { Hud(hud) }
+            visibility = View.GONE
+        }
+        root.addView(hudView, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
         setContentView(root)
-        setStatus("Waylus\nwaiting for host…\n\nrun `waylus` on your computer")
 
         // Deliver every pen/touch sample as it arrives instead of batching to vsync.
         root.requestUnbufferedDispatch(InputDevice.SOURCE_STYLUS or InputDevice.SOURCE_TOUCHSCREEN)
@@ -122,9 +177,15 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             decoderInfo,
             onShown = { c, r, n, q, d ->
                 conn.send(Proto.frameShown(c, r, n, q, d))
+                LiveStats.frameShown(q, d)
                 if (!firstFrameShown) {
                     firstFrameShown = true
-                    runOnUiThread { status.visibility = View.GONE; frame.visibility = View.GONE }
+                    if (!loggedStartup) {
+                        loggedStartup = true
+                        val ms = android.os.SystemClock.uptimeMillis() - android.os.Process.getStartUptimeMillis()
+                        Log.i(TAG, "startup: first video frame $ms ms after process start")
+                    }
+                    runOnUiThread { enterStream(Phase.STREAMING) }
                 }
             },
             onNeedKeyframe = { conn.send(Proto.requestKeyframe()) },
@@ -134,9 +195,9 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         Log.i(TAG, "decoder: $decoderInfo, port $port")
         wifiStore = WifiStore(this)
         discovery = WifiDiscovery(this) { onHostsChanged() }
+        deviceInfo = DeviceInfoWatcher(this) { ui.device = it }
         WifiPower.init(this)
-        WifiPower.enabled = intent.getBooleanExtra("wifi_lock", true)
-        buildWifiPanel()
+        loadSettings(intent)
         if (intent.getBooleanExtra("bench_crypto", false)) {
             Thread({
                 WifiCrypto.bench()
@@ -145,7 +206,20 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             }, "waylus-bench").start()
         }
         intent.getStringExtra("host")?.let { wifiStore.address = "$it:$port" }
+        ui.port = port
+        ui.paired = pairedHost()
         startConnection(pickTransport(intent))
+        showIdle()
+    }
+
+    /** App settings; intent extras from the host (started over adb) win for this run. */
+    private fun loadSettings(i: Intent) {
+        ui.everConnected = prefs.getBoolean("ever_connected", false)
+        ui.wifiLockFromHost = i.hasExtra("wifi_lock")
+        ui.wifiLock = if (ui.wifiLockFromHost) i.getBooleanExtra("wifi_lock", true) else prefs.getBoolean("wifi_lock", true)
+        WifiPower.enabled = ui.wifiLock
+        ui.hudFromHost = i.hasExtra("hud")
+        ui.hudEnabled = if (ui.hudFromHost) i.getBooleanExtra("hud", false) else prefs.getBoolean("hud", false)
     }
 
     private enum class Transport { USB, ADB, WIFI, AUTO }
@@ -169,6 +243,12 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
     private fun startConnection(t: Transport) {
         usingAccessory = t == Transport.USB
         usingWifi = t == Transport.WIFI || t == Transport.AUTO
+        transport = when (t) {
+            Transport.USB -> TransportKind.USB
+            Transport.ADB -> TransportKind.ADB
+            Transport.WIFI -> TransportKind.WIFI
+            Transport.AUTO -> TransportKind.AUTO
+        }
         Log.i(TAG, "transport: $t")
         val opener: () -> Connection.Link? = when (t) {
             Transport.USB -> ({ Accessory.open(applicationContext) })
@@ -178,12 +258,19 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             Transport.AUTO -> ::openWifi
         }
         if (t == Transport.AUTO) watchUsb()
-        if (usingWifi) discovery.start() else {
-            discovery.stop()
-            runOnUiThread { wifiPanel.visibility = View.GONE }
+        runOnUiThread {
+            ui.transport = transport
+            ui.detail = null
+            if (ui.phase != Phase.STREAMING && ui.phase != Phase.INPUT_ONLY) ui.phase = waitingPhase()
         }
         conn = Connection(opener, this)
         conn.start()
+    }
+
+    private fun waitingPhase() = when (transport) {
+        TransportKind.USB -> Phase.WAITING_USB
+        TransportKind.ADB -> Phase.ADB_CONNECTING
+        TransportKind.WIFI, TransportKind.AUTO -> Phase.WIFI_SEARCHING
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -197,7 +284,144 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         WifiPower.foreground(true)
+        if (idleView.visibility == View.VISIBLE) { deviceInfo.start(); deviceInfo.refresh() }
+    }
+
+    override fun onPause() {
+        resumed = false
+        WifiPower.foreground(false)
+        boost.idle()
+        deviceInfo.stop()
+        super.onPause()
+    }
+
+    // --- idle screen / stream ---
+
+    /** Back to the idle screen (start, or the stream ended). Main thread. */
+    private fun showIdle() {
+        stopHud()
+        frame.visibility = View.GONE
+        inputOnlyLabel.visibility = View.GONE
+        ui.phase = waitingPhase()
+        // Visible and opaque: covers the last decoded picture, which the SurfaceView keeps.
+        idleView.visibility = View.VISIBLE
+        discovery.start()
+        if (resumed) deviceInfo.start()
+        applySystemBars()
+    }
+
+    /** First frame shown (or an input-only session): nothing on screen but the video. */
+    private fun enterStream(p: Phase) {
+        if (!conn.connected) return
+        ui.phase = p
+        idleView.visibility = View.GONE
+        deviceInfo.stop()
+        applySystemBars()
+        startHudIfWanted()
+    }
+
+    private fun streaming() = ui.phase == Phase.STREAMING || ui.phase == Phase.INPUT_ONLY
+
+    private fun applySystemBars() {
+        window.insetsController?.let {
+            it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            if (streaming()) it.hide(WindowInsets.Type.systemBars()) else it.show(WindowInsets.Type.systemBars())
+        }
+    }
+
+    // --- stats display ---
+
+    private fun hudOn() = ui.hudEnabled || hostHud
+
+    private val hudTick = object : Runnable {
+        override fun run() {
+            updateHud()
+            main.postDelayed(this, 1000)
+        }
+    }
+
+    private fun startHudIfWanted() {
+        if (!streaming() || !hudOn() || hudView.visibility == View.VISIBLE) return
+        LiveStats.reset()
+        LiveStats.enabled = true
+        hud.lines = listOf("stats: waiting for data…")
+        hudView.visibility = View.VISIBLE
+        main.removeCallbacks(hudTick)
+        main.postDelayed(hudTick, 1000)
+    }
+
+    private fun stopHud() {
+        LiveStats.enabled = false
+        main.removeCallbacks(hudTick)
+        hudView.visibility = View.GONE
+        hud.lines = emptyList()
+    }
+
+    private fun updateHud() {
+        val now = System.nanoTime()
+        val t = LiveStats.takeTablet(now)
+        val h = LiveStats.host?.takeIf { now - LiveStats.hostAtNs < 3_000_000_000L }
+        val l = java.util.Locale.ROOT
+        fun ms(v: Float?) = v?.let { "%.1f".format(l, it) } ?: "–"
+        val pen = if (h != null && LiveStats.hostFlags and Proto.STATS_RAW_PEN != 0) "pen: raw stylus" else "pen ${ms(h?.penP50)} ms"
+        val lines = ArrayList<String>(4)
+        if (ui.phase == Phase.STREAMING) {
+            lines += "%.0f fps · shown p50 %s / p95 %s ms".format(l, t.fps, ms(h?.shownP50), ms(h?.shownP95))
+            lines += "decode ${ms(t.decodeMs)} ms · $pen" +
+                (h?.heldMsPerS?.takeIf { it >= 1f }?.let { " · held %.0f ms/s".format(l, it) } ?: "")
+        } else {
+            lines += if (pen.startsWith("pen:")) "input only · $pen" else "input only · pen p50 ${ms(h?.penP50)} / p95 ${ms(h?.penP95)} ms"
+        }
+        val w = if (usingWifi && !usingAccessory) LiveStats.wifi else null
+        lines += when {
+            w != null -> "Wi-Fi ${w.freqMhz} MHz ${w.rssi} dBm"
+            else -> ui.transport.label
+        }
+        if (w != null) {
+            val loss = if (w.shardsExpected > 0) 100f * w.shardsLost / w.shardsExpected else 0f
+            lines += "loss %.1f%% · FEC %d · lost %d".format(l, loss, w.fecShards, w.framesLost)
+        }
+        if (h == null && ui.phase == Phase.STREAMING) lines += "(host sends no stats: older waylus?)"
+        hud.lines = lines
+    }
+
+    private fun setHudOn(on: Boolean) {
+        ui.hudEnabled = on
+        if (!on && hostHud) { hostHud = false; hostHudDismissed = true }
+        prefs.edit().putBoolean("hud", on).apply()
+        if (on) startHudIfWanted() else stopHud()
+    }
+
+    private var tapDownX = 0f
+    private var tapDownY = 0f
+    private var tapDownT = 0L
+    private var tapActive = false
+
+    /**
+     * A finger tap on the black bars beside the video toggles the stats display. Gestures
+     * that start there never reach the host; everything over the video does, unchanged.
+     */
+    private fun letterboxTap(e: MotionEvent): Boolean {
+        if (ui.phase != Phase.STREAMING) return false
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (e.getToolType(0) != MotionEvent.TOOL_TYPE_FINGER || videoRect.contains(e.x, e.y)) return false
+                tapActive = true
+                tapDownX = e.x; tapDownY = e.y; tapDownT = e.eventTime
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!tapActive) return false
+                tapActive = false
+                val slop = ViewConfiguration.get(this).scaledTouchSlop
+                if (e.eventTime - tapDownT < 400 && kotlin.math.hypot(e.x - tapDownX, e.y - tapDownY) < slop) setHudOn(!hudOn())
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> { val was = tapActive; tapActive = false; return was }
+            else -> return tapActive
+        }
     }
 
     // --- Wi-Fi ---
@@ -233,14 +457,18 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         }, "waylus-usb-watch").apply { isDaemon = true; start() }
     }
 
-    /** Connection opener on the network thread: connect to the paired host, or show the pairing panel. */
+    private fun pairedHost(): PairedHost? = wifiStore.host()?.let { PairedHost(it.name, it.address) }
+
+    private fun setDetail(msg: String?) = runOnUiThread { ui.detail = msg }
+
+    /** Connection opener on the network thread: connect to the paired host, or wait for pairing. */
     private var lastWifiStatus = ""
     private fun openWifi(): Connection.Link? {
         val host = wifiStore.host()
         // Where mDNS last saw the paired host, else the stored address.
         val addr = host?.let { discovery.hosts[WifiStore.toHex(it.id)]?.address } ?: wifiStore.address
         if (host == null || addr.isNullOrBlank()) {
-            showWifiPanel(null)
+            setDetail(if (host != null) "The address of ${host.name} isn't known yet; it shows up once `waylus --wifi` runs there." else null)
             Thread.sleep(700)
             return null
         }
@@ -249,9 +477,10 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         } catch (e: WifiLink.AuthFailed) {
             if (e.code == Proto.FAIL_UNKNOWN_DEVICE) {
                 wifiStore.forgetPairing()
-                showWifiPanel("${host.name} no longer knows this tablet. Pair again: run `waylus --wifi --pair` on it.")
+                runOnUiThread { ui.paired = null }
+                setDetail("${host.name} no longer knows this tablet. Pair again: run `waylus --wifi --pair` on it.")
             } else {
-                showWifiPanel("${host.name}: ${e.message}")
+                setDetail("${host.name} refused the connection: ${e.message}")
             }
             Thread.sleep(1000)
             null
@@ -260,136 +489,130 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         } catch (e: Exception) {
             val why = when {
                 e is java.net.ConnectException && e.message?.contains("ECONNREFUSED") == true ->
-                    "Waylus isn't running there; start `waylus --wifi`"
+                    "Waylus isn't running there; start `waylus --wifi`."
                 e is java.net.SocketTimeoutException || e.message?.contains("EHOSTUNREACH") == true ->
-                    "no answer; is the computer on and on the same network?"
+                    "no answer. Is the computer on, and on the same network?"
                 else -> e.message ?: e.javaClass.simpleName
             }
-            val msg = "Waiting for ${host.name} at $addr: $why"
+            val msg = "${host.name} at $addr: $why"
             if (msg != lastWifiStatus) Log.i(TAG, msg)
             lastWifiStatus = msg
-            showWifiPanel(msg)
+            setDetail(msg)
             Thread.sleep(700)
             null
         }
     }
 
-    /** mDNS results changed: follow the paired host's address, list the others for pairing. */
+    /** mDNS results changed: follow the paired host's address, list the hosts for pairing. */
     private fun onHostsChanged() {
         val paired = wifiStore.host()?.let { WifiStore.toHex(it.id) }
-        discovery.hosts[paired]?.let { h ->
+        // (ConcurrentHashMap rejects a null key: unpaired tablets crashed here.)
+        paired?.let { discovery.hosts[it] }?.let { h ->
             if (h.address != wifiStore.address) {
                 Log.i(TAG, "paired host ${h.name} is now at ${h.address}")
                 wifiStore.address = h.address
             }
         }
+        val list = discovery.hosts.values.sortedBy { it.name }.map { Discovered(it.id, it.name, it.address, it.id == paired) }
         runOnUiThread {
-            hostsRow.removeAllViews()
-            for (h in discovery.hosts.values.sortedBy { it.name }) {
-                if (h.id == paired) continue
-                hostsRow.addView(Button(this).apply {
-                    text = "Pair with ${h.name}"
-                    isAllCaps = false
-                    setOnClickListener { wifiAddr.setText(h.address); startPairing() }
-                })
-            }
+            ui.discovered = list
+            ui.paired = pairedHost()
         }
     }
 
-    private fun showWifiPanel(msg: String?) = runOnUiThread {
-        if (!usingWifi || conn.connected) return@runOnUiThread
-        val host = wifiStore.host()
-        if (wifiAddr.text.isNullOrBlank()) wifiAddr.setText(wifiStore.address ?: "")
-        if (pinRow.visibility != View.VISIBLE && System.nanoTime() > pairNoteUntil) {
-            wifiMsg.text = msg ?: if (host != null) "Wi-Fi: waiting for ${host.name} (run `waylus --wifi` there)" else
-                "Wi-Fi: not paired. On the computer run `waylus --wifi --pair`, then enter its address here."
-        }
-        // Paired: connecting is automatic; pairing again is only needed if the host forgot us.
-        pairButton.text = if (host != null) "Pair again" else "Pair with this host"
-        wifiPanel.visibility = View.VISIBLE
-    }
-
-    private fun buildWifiPanel() {
-        val dp = resources.displayMetrics.density
-        wifiMsg = TextView(this).apply { setTextColor(0xFFB0B0B0.toInt()); textSize = 15f; gravity = Gravity.CENTER }
-        wifiAddr = EditText(this).apply {
-            hint = "host address, e.g. 192.168.1.20"
-            setSingleLine()
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_DONE
-            setTextColor(Color.WHITE); setHintTextColor(0xFF707070.toInt())
-            minWidth = (320 * dp).toInt()
-        }
-        pairButton = Button(this).apply { text = "Pair with this host"; setOnClickListener { startPairing() } }
-        pinEdit = EditText(this).apply {
-            hint = "PIN"
-            setSingleLine()
-            inputType = InputType.TYPE_CLASS_NUMBER
-            imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_DONE
-            setTextColor(Color.WHITE); setHintTextColor(0xFF707070.toInt())
-            minWidth = (160 * dp).toInt()
-            setOnEditorActionListener { _, _, _ -> submitPin(); true }
-        }
-        pinRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(pinEdit)
-            addView(Button(this@MainActivity).apply { text = "OK"; setOnClickListener { submitPin() } })
-            visibility = View.GONE
-        }
-        wifiPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding((16 * dp).toInt(), (8 * dp).toInt(), (16 * dp).toInt(), (8 * dp).toInt())
-            hostsRow = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
-            addView(wifiMsg); addView(hostsRow); addView(wifiAddr); addView(pairButton); addView(pinRow)
-            visibility = View.GONE
-        }
-        root.addView(wifiPanel, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM).apply {
-            bottomMargin = (24 * dp).toInt()
-        })
-    }
-
-    private fun submitPin() {
-        pinQueue.offer(pinEdit.text.toString())
-        pinEdit.setText("")
-        getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(pinEdit.windowToken, 0)
-    }
-
-    private fun startPairing() {
-        val addr = wifiAddr.text.toString().trim()
-        if (addr.isEmpty()) return
-        wifiStore.address = addr
-        pairButton.isEnabled = false
-        wifiMsg.text = "asking $addr to pair…"
+    override fun pair(address: String) {
+        if (ui.pairing is Pairing.Asking || ui.pairing is Pairing.EnterPin) return
+        ui.pairing = Pairing.Asking(address)
+        ui.tab = dev.waylus.ui.Tab.WIFI
         pinQueue.clear()
+        pairCancelled = false
         Thread({
-            val result = try {
-                val name = WifiLink.pair(wifiStore, WifiLink.parseAddress(addr, port)) { hostName ->
-                    runOnUiThread {
-                        wifiMsg.text = "Enter the PIN shown on $hostName"
-                        pinRow.visibility = View.VISIBLE
-                        pinEdit.requestFocus()
-                        getSystemService(InputMethodManager::class.java).showSoftInput(pinEdit, 0)
+            var wrongPin: String? = null
+            var result: Pairing
+            while (true) {
+                result = try {
+                    val name = WifiLink.pair(wifiStore, WifiLink.parseAddress(address, port)) { hostName ->
+                        val err = wrongPin
+                        runOnUiThread { ui.pairing = Pairing.EnterPin(hostName, err) }
+                        val pin = pinQueue.poll(170, TimeUnit.SECONDS)
+                        if (pin == CANCEL) null else pin
                     }
-                    pinQueue.poll(170, TimeUnit.SECONDS)
+                    Pairing.Done("Paired with $name. Connecting…", ok = true)
+                } catch (e: WifiLink.AuthFailed) {
+                    when (e.code) {
+                        Proto.FAIL_WRONG_PIN -> {
+                            // The host shows a new PIN for the next attempt (and closes pairing
+                            // after a few wrong ones, which ends up in PAIRING_OFF below).
+                            wrongPin = "Wrong PIN. The computer now shows a new one."
+                            continue
+                        }
+                        Proto.FAIL_PAIRING_OFF ->
+                            Pairing.Done("The computer refused: ${e.message?.takeIf { it.isNotBlank() } ?: "pairing is off"}. Run `waylus --wifi --pair` there.", ok = false)
+                        else -> Pairing.Done("Pairing failed: ${e.message}", ok = false)
+                    }
+                } catch (e: Exception) {
+                    if (pairCancelled) Pairing.Idle
+                    else Pairing.Done("Pairing failed: ${connectError(e)}", ok = false)
                 }
-                "Paired with $name. Connecting…"
-            } catch (e: WifiLink.AuthFailed) {
-                when (e.code) {
-                    Proto.FAIL_PAIRING_OFF -> "Host: ${e.message?.takeIf { it.isNotBlank() } ?: "pairing is off; run `waylus --wifi --pair` there"}"
-                    Proto.FAIL_WRONG_PIN -> "Wrong PIN. Try again; the host shows a new PIN."
-                    else -> "Pairing failed: ${e.message}"
-                }
-            } catch (e: Exception) {
-                "Pairing failed: ${e.message ?: e.javaClass.simpleName}"
+                break
             }
-            pairNoteUntil = System.nanoTime() + 15_000_000_000L
             runOnUiThread {
-                wifiMsg.text = result
-                pinRow.visibility = View.GONE
-                pairButton.isEnabled = true
+                ui.pairing = result
+                ui.paired = pairedHost()
             }
         }, "waylus-pair").start()
+    }
+
+    private fun connectError(e: Exception) = when {
+        e is java.net.ConnectException -> "nothing answers there. Is `waylus --wifi --pair` running?"
+        e is java.net.SocketTimeoutException || e.message?.contains("EHOSTUNREACH") == true -> "no answer from that address."
+        e is java.net.UnknownHostException -> "unknown address."
+        else -> e.message ?: e.javaClass.simpleName
+    }
+
+    override fun submitPin(pin: String) {
+        pinQueue.offer(pin)
+    }
+
+    override fun cancelPairing() {
+        pairCancelled = true
+        pinQueue.offer(CANCEL)
+        ui.pairing = Pairing.Idle
+    }
+
+    override fun dismissPairingResult() {
+        ui.pairing = Pairing.Idle
+    }
+
+    override fun forgetHost() {
+        wifiStore.forgetPairing()
+        ui.paired = null
+        onHostsChanged()
+    }
+
+    override fun setHud(on: Boolean) = setHudOn(on)
+
+    override fun setWifiLock(on: Boolean) {
+        ui.wifiLock = on
+        WifiPower.enabled = on
+        prefs.edit().putBoolean("wifi_lock", on).apply()
+    }
+
+    override fun openUrl(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, "No browser found. Open $url on another device.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun openDeveloperOptions() {
+        val action = if (ui.device.devOptions == false) Settings.ACTION_DEVICE_INFO_SETTINGS else Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS
+        try {
+            startActivity(Intent(action))
+        } catch (_: ActivityNotFoundException) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
+        }
     }
 
     /** Ask for the highest refresh rate at the current resolution (e.g. 120/144 Hz tablets). */
@@ -408,34 +631,18 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) {
-            window.insetsController?.let {
-                it.hide(WindowInsets.Type.systemBars())
-                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            }
-        } else {
-            input.reset()
-        }
-    }
-
-    override fun onPause() {
-        WifiPower.foreground(false)
-        boost.idle()
-        super.onPause()
+        if (hasFocus) applySystemBars() else input.reset()
     }
 
     override fun onDestroy() {
         destroyed = true
         discovery.stop()
+        deviceInfo.stop()
+        stopHud()
         boost.shutdown()
         conn.stop()
         decoder.shutdown()
         super.onDestroy()
-    }
-
-    private fun setStatus(text: String) {
-        status.text = text
-        status.visibility = View.VISIBLE
     }
 
     private fun relayout() {
@@ -466,11 +673,20 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
 
     // --- Connection.Listener (network thread) ---
 
+    override fun onLinkOpened() {
+        if (usingAccessory) runOnUiThread { if (!streaming()) ui.phase = Phase.USB_ATTACHED }
+    }
+
     override fun onConnected() {
-        if (usingWifi) discovery.stop()
+        discovery.stop()
+        if (!ui.everConnected) prefs.edit().putBoolean("ever_connected", true).apply()
         runOnUiThread {
-            wifiPanel.visibility = View.GONE
-            setStatus("Waylus\nconnected" + if (usingWifi) " (Wi-Fi)" else "")
+            hostHud = false
+            hostHudDismissed = false
+            ui.everConnected = true
+            ui.lastDisconnect = null
+            ui.detail = null
+            ui.phase = Phase.WAITING_FIRST_FRAME
         }
     }
 
@@ -495,16 +711,14 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         return if (square && dpi in 80f..1000f) dpi / 25.4f else 0f
     }
 
-    override fun onDisconnected() {
-        if (usingWifi) discovery.start()
+    override fun onDisconnected(reason: String) {
         firstFrameShown = false
         decoder.configure(0, 0)
         runOnUiThread {
             input.reset()
-            frame.visibility = View.VISIBLE
-            // Cover the last decoded picture, which the SurfaceView keeps showing.
-            status.setBackgroundColor(Color.BLACK)
-            setStatus("Waylus\nwaiting for host…")
+            hostHud = false
+            ui.lastDisconnect = if (destroyed) null else reason
+            showIdle()
         }
     }
 
@@ -515,8 +729,9 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
             relayout()
             if (codec == Proto.CODEC_NONE) {
                 frame.visibility = View.VISIBLE
-                status.background = null // keep the video-area border visible
-                setStatus("Waylus — input only\n${width}×$height")
+                inputOnlyLabel.text = "Waylus — input only\n${width}×$height"
+                inputOnlyLabel.visibility = View.VISIBLE
+                enterStream(Phase.INPUT_ONLY)
             }
         }
         if (codec == Proto.CODEC_H264) {
@@ -531,6 +746,21 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
 
     override fun onVideoLost() {
         decoder.dropUntilKey()
+    }
+
+    override fun onHostStats(payload: ByteArray) {
+        val s = Proto.parseStats(payload) ?: return
+        LiveStats.host = s.stats
+        LiveStats.hostFlags = s.flags
+        LiveStats.hostAtNs = System.nanoTime()
+        if (s.flags and Proto.STATS_HUD != 0) {
+            runOnUiThread {
+                if (hostHud || hostHudDismissed) return@runOnUiThread
+                hostHud = true
+                ui.hudFromHost = true
+                startHudIfWanted()
+            }
+        }
     }
 
     // --- SurfaceHolder.Callback ---
@@ -551,5 +781,8 @@ class MainActivity : Activity(), Connection.Listener, SurfaceHolder.Callback {
         done.await(500, TimeUnit.MILLISECONDS)
     }
 
-    companion object { private const val TAG = "waylus" }
+    companion object {
+        private const val TAG = "waylus"
+        private const val CANCEL = "\u0000cancel"
+    }
 }

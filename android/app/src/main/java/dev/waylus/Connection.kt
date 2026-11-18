@@ -22,7 +22,12 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
         /** Called on the network thread when a session starts; return the hello message. */
         fun hello(): ByteArray
         fun onConnected()
-        fun onDisconnected()
+        /** [reason]: why the session ended, in words for the idle screen. Reconnecting follows. */
+        fun onDisconnected(reason: String)
+        /** The opener returned a link; the session handshake (hello, SYNC) follows. */
+        fun onLinkOpened() {}
+        /** Host STATS message (Proto.parseStats). */
+        fun onHostStats(payload: ByteArray) {}
         /** flags: Proto.TWEAK_* bits, opt-in vendor-specific decoder tweaks. */
         fun onConfig(codec: Int, width: Int, height: Int, flags: Int)
         fun onVideo(captureNs: Long, flags: Int, data: ByteArray, offset: Int, recvNs: Long)
@@ -82,11 +87,13 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
         while (running) {
             var l: Link? = null
             var hadSession = false
+            var reason = "the connection closed"
             try {
                 l = opener()
                 if (l != null) {
                     link = l
                     hadSession = true
+                    listener.onLinkOpened()
                     session(l)
                 }
             } catch (e: InterruptedException) {
@@ -96,11 +103,12 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
                 val kind = "${e.javaClass.simpleName}: ${e.message?.replace(Regex("\\d+"), "#")}"
                 if (hadSession || kind != lastError) Log.i(TAG, if (hadSession) "disconnected: $e" else "connect failed: $e")
                 lastError = kind
+                reason = describe(e)
             }
             // session() clears `connected` itself; report every session that started.
             if (hadSession || connected) {
                 connected = false
-                listener.onDisconnected()
+                listener.onDisconnected(reason)
             }
             if (l != null && !l.needsSync) l.close()
             link = null
@@ -171,6 +179,7 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
                         listener.onVideo(captureNs, flags, m.payload, 9, recvNs)
                     }
                     Proto.FRAME_LOST -> listener.onVideoLost()
+                    Proto.STATS -> listener.onHostStats(m.payload)
                     else -> Log.d(TAG, "ignoring message ${m.type}")
                 }
             }
@@ -183,6 +192,15 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
 
     companion object {
         private const val TAG = "waylus"
+
+        /** A disconnect, in words. */
+        fun describe(e: Exception): String = when {
+            e is java.io.EOFException -> "the computer closed the connection"
+            e is java.net.SocketTimeoutException -> "the computer stopped answering"
+            e.message?.contains("ECONNRESET") == true || e.message?.contains("reset") == true -> "the connection was reset"
+            e.message?.contains("EPIPE") == true || e.message?.contains("Broken pipe") == true -> "the computer closed the connection"
+            else -> e.message ?: e.javaClass.simpleName
+        }
         /** The host pings at 2 Hz; this much silence means it's gone. Matches host/src/link.rs. */
         const val IDLE_TIMEOUT_MS = 5000L
 

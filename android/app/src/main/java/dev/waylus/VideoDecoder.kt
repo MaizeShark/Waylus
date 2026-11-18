@@ -245,7 +245,7 @@ class VideoDecoder(
             val best = all.firstOrNull { it.isHardwareAccelerated && !it.name.contains("secure") }
                 ?: all.first()
             val caps = best.getCapabilitiesForType(mime)
-            val v = caps.videoCapabilities
+            val v = checkNotNull(caps.videoCapabilities) { "${best.name} has no video capabilities" }
             val maxW = v.supportedWidths.upper
             val maxHForW = runCatching { v.getSupportedHeightsFor(maxW).upper }.getOrDefault(v.supportedHeights.upper)
             val mbFrame = (maxW / 16) * (maxHForW / 16)

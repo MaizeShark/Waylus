@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Window and splash colours; the Compose colour scheme is in ui/Theme.kt. -->
+<resources>
+    <color name="waylus_splash">#0F2230</color>
+</resources>

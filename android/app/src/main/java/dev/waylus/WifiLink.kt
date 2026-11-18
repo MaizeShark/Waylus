@@ -72,7 +72,9 @@ class WifiLink private constructor(
         timer.scheduleAtFixedRate({
             val (freq, rssi, link) = WifiPower.info()
             val skipped = framesSkipped.getAndSet(0)
-            sendUdp(listOf(hello, Proto.wifiStats(assembler.takeStats(), skipped, freq, rssi, link)))
+            val stats = assembler.takeStats()
+            LiveStats.wifiReport(stats, freq, rssi)
+            sendUdp(listOf(hello, Proto.wifiStats(stats, skipped, freq, rssi, link)))
         }, 1000, 1000, TimeUnit.MILLISECONDS)
         WifiPower.streaming(true)
     }
@@ -387,8 +389,9 @@ object WifiPower {
     private var lock: WifiManager.WifiLock? = null
     private var streaming = false
     private var foreground = false
-    /** Off for measurements: `--ez wifi_lock false`. */
+    /** The app setting, or `--ez wifi_lock false` from the host (measurements). */
     var enabled = true
+        @Synchronized set(v) { field = v; update() }
 
     fun init(ctx: Context) {
         if (lock != null) return
