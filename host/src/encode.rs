@@ -253,6 +253,8 @@ impl Encoder {
             height,
             if hw_format == Some(ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI) {
                 "NV12 VAAPI surfaces (zero-copy)".to_string()
+            } else if hw_format == Some(ff::ffi::AVPixelFormat::AV_PIX_FMT_D3D11) {
+                "NV12 D3D11 textures (zero-copy)".to_string()
             } else if hw_frames.is_some() {
                 "CUDA (zero-copy)".to_string()
             } else if vaapi.is_some() {
