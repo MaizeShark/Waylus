@@ -318,7 +318,9 @@ Setup: the same desktop as the Linux numbers, booted into Windows 11 (RTX 4060, 
 
 The decode time is the MT8781's idle-clock decode that the Linux section already describes (19–22 ms while nothing touches the screen; ~11 ms while drawing). The host's part is about the same as on Linux: 3.3 ms from capture to the first byte on the wire.
 
-Not measured yet (they need the camera and a person at the tablet): photon to photon with `tools/latency/camera.py`, pen-down → host with `tools/latency/pen.py --windows-monitor N`, and everything over Wi-Fi and USB accessory mode (AOA needs the Zadig step above).
+**Wi-Fi, 2026-11-18** (built-in statistics as above, `waylus --wifi --no-usb`, release build, 4 windows of 5 s, host and tablet on the same access point at 5260 MHz, tablet −71…−72 dBm, 263 Mbit/s link): capture → shown p50 35.3–36.7 / p95 40.8–49 ms; capture → sent p50 5.0–5.2 ms (send 1.0 ms per frame, seal + FEC 0.13 ms); sent → received p50 7.4–8.0 / p95 11.6–13.9 ms; 0 of 10 800 shards lost per window, no FEC repair, no lost frames, 60 fps. mDNS discovery (the tablet listed the host), PIN pairing from a fresh key store and qWAVE flow marking (accepted without administrator rights; its effect on the air was not measured) all worked.
+
+Not measured yet (they need the camera and a person at the tablet): photon to photon with `tools/latency/camera.py`, pen-down → host with `tools/latency/pen.py --windows-monitor N`, USB accessory mode (needs the Zadig step above), USB taking over from Wi-Fi, and Weylus / Moonlight on Windows.
 
 ## Status / roadmap
 
