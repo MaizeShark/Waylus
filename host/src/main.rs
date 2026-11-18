@@ -122,7 +122,21 @@ struct Args {
     /// install/start the app and read the raw pen).
     #[arg(long, requires = "wifi")]
     no_usb: bool,
+    /// Show the stats display (frame rate, latency) on the tablet. It can also be turned on
+    /// in the app's settings, or with a tap on the black bar beside the picture.
+    #[arg(long)]
+    hud: bool,
+    /// More output: -v adds a status line and the detailed statistics every 5 s, -vv debug
+    /// messages, -vvv everything (including FFmpeg's). RUST_LOG, when set, overrides this.
+    #[arg(short, long, action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    verbose: u8,
+    /// Only warnings and errors.
+    #[arg(short, long)]
+    quiet: bool,
 }
+
+/// -v count, for parts that log outside `tracing` (FFmpeg).
+pub static VERBOSITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 enum TransportArg {
@@ -131,12 +145,20 @@ enum TransportArg {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "waylus=info".into()),
-        )
-        .init();
     let args = Args::parse();
+    VERBOSITY.store(if args.quiet { 0 } else { args.verbose }, std::sync::atomic::Ordering::Relaxed);
+    // Default: what happens (start, choices, connects, warnings), no periodic statistics:
+    // those are on the tablet's stats display, or here with -v.
+    let filter = match (args.quiet, args.verbose) {
+        (true, _) => "waylus=warn",
+        (_, 0) => "waylus=info,waylus::stats=off",
+        (_, 1) => "waylus=info",
+        (_, 2) => "waylus=debug",
+        _ => "waylus=trace",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()))
+        .init();
     platform::init();
     #[cfg(windows)]
     if args.list_outputs {
@@ -328,6 +350,7 @@ fn main() -> Result<()> {
             output_name: args.output.clone(),
             raw_pen: _raw_pen.as_ref().map(|_| pen_sink.clone()),
             output_size,
+            hud: args.hud,
         },
         {
             let mut t = Vec::new();

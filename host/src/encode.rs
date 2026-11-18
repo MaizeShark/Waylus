@@ -199,7 +199,8 @@ impl Encoder {
         hw_frames: Option<*mut ff::ffi::AVBufferRef>,
     ) -> Result<Self> {
         ff::init().context("ffmpeg init")?;
-        if std::env::var_os("WAYLUS_FFMPEG_LOG").is_some() {
+        // -vvv (or WAYLUS_FFMPEG_LOG): FFmpeg's own debug output; else its warnings and errors.
+        if std::env::var_os("WAYLUS_FFMPEG_LOG").is_some() || crate::VERBOSITY.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
             ff::util::log::set_level(ff::util::log::Level::Debug);
         }
         let codec = ff::encoder::find_by_name(&opts.encoder)

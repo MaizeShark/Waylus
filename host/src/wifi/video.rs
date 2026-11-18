@@ -187,6 +187,7 @@ impl Sender {
         if self.window.elapsed().as_secs() >= 5 {
             let n = self.n.max(1);
             info!(
+                target: crate::session::STATS,
                 "wifi video: {} frames ({} key), {:.1} shards/frame (max {}), parity {:.0}%, seal+FEC {:.2} ms/frame, send {:.2} ms/frame",
                 self.n,
                 self.keys,

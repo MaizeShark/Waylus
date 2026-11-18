@@ -10,8 +10,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info};
 
-pub const PACKAGE: &str = "dev.waylus";
-pub const ACTIVITY: &str = "dev.waylus/.MainActivity";
+pub const PACKAGE: &str = "de.hut9.waylus";
+pub const ACTIVITY: &str = "de.hut9.waylus/dev.waylus.MainActivity";
+/// The app's id before version 0.2.0. Removed when the new app is installed: both declare
+/// the Waylus USB accessory, and with two such apps Android asks which one to open instead
+/// of starting the app when the host switches the tablet to accessory mode.
+const OLD_PACKAGE: &str = "dev.waylus";
 
 #[derive(Clone)]
 pub struct Adb {
@@ -78,11 +82,15 @@ impl Adb {
             .and_then(|s| s.split_whitespace().next().map(str::to_owned));
         if remote.as_deref() == Some(local.as_str()) {
             debug!("client APK up to date");
-            return Ok(());
+        } else {
+            info!("installing client APK {}", apk.display());
+            let apk = apk.to_str().context("non-utf8 APK path")?;
+            self.run(&["install", "-r", "-g", apk])?;
         }
-        info!("installing client APK {}", apk.display());
-        let apk = apk.to_str().context("non-utf8 APK path")?;
-        self.run(&["install", "-r", "-g", apk])?;
+        if self.shell(&format!("pm path {OLD_PACKAGE}")).is_ok_and(|s| s.contains("package:")) {
+            info!("removing the old app ({OLD_PACKAGE}); its Wi-Fi pairing does not carry over, pair again with --wifi --pair");
+            let _ = self.run(&["uninstall", OLD_PACKAGE]);
+        }
         Ok(())
     }
 

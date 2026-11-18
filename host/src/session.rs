@@ -8,7 +8,7 @@ use std::{
     net::TcpListener,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -22,8 +22,11 @@ use crate::{
     frame::{Capture, Frame},
     link::Link,
     platform::{AreaMm, InputTarget, input::{Pen, Touch}},
-    proto::{self, DeviceMsg, Hello, codec, now_ns, video_flags},
+    proto::{self, DeviceMsg, Hello, HostStats, codec, now_ns, video_flags},
 };
+
+/// Log target of the periodic statistics lines: off by default, on with -v (main.rs).
+pub const STATS: &str = "waylus::stats";
 
 /// Pixel density assumed when the client can't report a plausible one (TCL NXTPAPER 14,
 /// whose firmware reports bogus dpi values; also a typical tablet density).
@@ -58,6 +61,15 @@ pub struct Opts {
     pub raw_pen: Option<crate::rawpen::Sink>,
     /// Size reported to the tablet in input-only mode (aspect ratio of the output).
     pub output_size: (u32, u32),
+    /// --hud: ask the app to show its stats display.
+    pub hud: bool,
+}
+
+/// Figures the video thread shares with the session thread (for STATS and the status line).
+#[derive(Default)]
+struct Live {
+    /// Total time the encoder waited for the tablet (back-pressure).
+    held_ns: AtomicU64,
 }
 
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -97,6 +109,10 @@ impl InFlight {
         }
         self.cv.notify_all();
         sent_at
+    }
+
+    fn len(&self) -> usize {
+        self.sent.lock().unwrap().len()
     }
 
     /// Blocks while `max` or more frames are in flight. Returns the time spent
@@ -264,7 +280,7 @@ fn session(
     inputs: &mut Option<(Arc<Mutex<Pen>>, Touch)>,
     last_frame: &mut Option<Frame>,
 ) -> Result<()> {
-    let Link { mut reader, writer, close, sync } = link;
+    let Link { mut reader, writer, close, sync, kind } = link;
     // The app repeats SYNC + hello until it sees our answer; extra copies may follow.
     let mut repeats = 0u32;
     let mut buf = Vec::new();
@@ -325,6 +341,9 @@ fn session(
     let keyframe = Arc::new(AtomicBool::new(false));
     let refresh_ids: RefreshIds = Default::default();
     let in_flight: Arc<InFlight> = Default::default();
+    let live: Arc<Live> = Default::default();
+    let flags = if opts.hud { proto::stats_flags::HUD } else { 0 } | if opts.raw_pen.is_some() { proto::stats_flags::RAW_PEN } else { 0 };
+    let host_stats = Arc::new(Mutex::new(HostStats { flags, ..Default::default() }));
 
     if capture.is_none() {
         send(&writer, |w| {
@@ -339,6 +358,7 @@ fn session(
         let capture_running = cap.running.clone();
         let refresh_ids = refresh_ids.clone();
         let in_flight = in_flight.clone();
+        let live = live.clone();
         let max_in_flight = opts.max_in_flight;
         let vendor_tweaks = opts.vendor_tweaks;
         let mut enc_opts = opts.enc.clone();
@@ -366,7 +386,7 @@ fn session(
         thread::Builder::new()
             .name("video".into())
             .spawn(move || {
-                let r = video_loop(&mut enc_opts, &pace, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids, &in_flight, max_in_flight, vendor_tweaks);
+                let r = video_loop(&mut enc_opts, &pace, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids, &in_flight, max_in_flight, vendor_tweaks, &live, kind);
                 stop.store(true, Ordering::SeqCst);
                 close();
                 r
@@ -374,13 +394,22 @@ fn session(
             .expect("spawn video thread")
     });
 
+    // Pings, and once a second the STATS for the tablet's stats display. Sent from here
+    // rather than the session thread, which handles pen input and should never wait for
+    // the writer (the video thread holds it while it writes a frame).
     let pinger = {
-        let (writer, stop) = (writer.clone(), stop.clone());
+        let (writer, stop, host_stats) = (writer.clone(), stop.clone(), host_stats.clone());
         thread::Builder::new().name("ping".into()).spawn(move || {
             let mut n = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 if send(&writer, |w| proto::write_ping(w, now_ns())).is_err() {
                     break;
+                }
+                if n >= 10 && n.is_multiple_of(2) {
+                    let s = *host_stats.lock().unwrap();
+                    if send(&writer, |w| proto::write_stats(w, &s)).is_err() {
+                        break;
+                    }
                 }
                 n += 1;
                 // Burst at start for a quick clock estimate, then 2 Hz.
@@ -389,7 +418,7 @@ fn session(
         })?
     };
 
-    let mut stats = Stats::default();
+    let mut stats = Stats { kind, live: live.clone(), host_stats: host_stats.clone(), ..Default::default() };
     let res: Result<()> = (|| loop {
         let msg = proto::read_msg(&mut reader, &mut buf)?;
         match msg {
@@ -431,6 +460,7 @@ fn session(
                     ids.remove(i);
                 } else {
                     stats.frame(capture_ns, recv_ns, render_ns);
+                    stats.shown += 1;
                 }
                 while ids.len() > 64 {
                     ids.pop_front();
@@ -517,6 +547,8 @@ fn video_loop(
     in_flight: &InFlight,
     max_in_flight: usize,
     vendor_tweaks: u8,
+    live: &Live,
+    kind: &str,
 ) -> Result<Option<Frame>> {
     let mut enc: Option<Encoder> = None;
     let mut packets: Vec<Packet> = Vec::new();
@@ -528,17 +560,31 @@ fn video_loop(
     let mut window = Instant::now();
     let (mut n, mut bytes, mut enc_ns, mut sent_lag_ns, mut pkts, mut empty) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut held = Duration::ZERO;
+    let mut busy = Busy::default();
+    let mut stalls = StallLog::default();
+    // In flight when the last back-pressure wait began, and whether it gave up.
+    let mut bp_in_flight = 0usize;
+    let mut bp_gave_up = false;
 
     while !stop.load(Ordering::Relaxed) {
         // Back-pressure: wait for the tablet to catch up *before* picking a frame, so
         // the one we encode next is the newest capture rather than a stale backlog.
         if max_in_flight > 0 {
-            held += in_flight.wait_below(max_in_flight, stop);
+            let t = now_ns();
+            let queued = in_flight.len();
+            let w = in_flight.wait_below(max_in_flight, stop);
+            held += w;
+            live.held_ns.fetch_add(w.as_nanos() as u64, Ordering::Relaxed);
+            if w >= Duration::from_millis(1) {
+                busy.add(t, now_ns(), Stage::BackPressure);
+                (bp_in_flight, bp_gave_up) = (queued, w >= Duration::from_millis(250));
+            }
         }
-        let frame = match pending.take() {
-            Some(f) => f,
-            None => match frames.take_timeout(Duration::from_millis(REFRESH_INTERVAL_MS)) {
-                Some(f) => f,
+        // `avail`: since when a new frame has been waiting (None: kept from the last session).
+        let (frame, avail) = match pending.take() {
+            Some(f) => (f, None),
+            None => match frames.take_timeout_since(Duration::from_millis(REFRESH_INTERVAL_MS)) {
+                Some((f, t)) => (f, Some(t)),
                 None if !capture_running.load(Ordering::Relaxed) => bail!("screen capture stopped"),
                 None => {
                     if let (Some(e), Some(f)) = (enc.as_mut(), last.as_ref())
@@ -549,12 +595,15 @@ fn video_loop(
                         refresh_ids.lock().unwrap().push_back(ns);
                         packets.clear();
                         e.encode(f, ns, &mut packets)?;
+                        busy.add(ns, now_ns(), Stage::Encode);
                         for p in &packets {
                             let flags = if p.key { video_flags::KEY } else { 0 };
+                            let t = now_ns();
                             send(writer, |w| {
                                 proto::write_video(w, p.capture_ns, flags, &p.data)?;
                                 w.flush()
                             })?;
+                            busy.add(t, now_ns(), Stage::Send);
                             in_flight.sent(p.capture_ns);
                         }
                     }
@@ -563,7 +612,9 @@ fn video_loop(
             },
         };
         refreshes_left = REFRESH_FRAMES;
-        if enc.as_ref().is_none_or(|e| !e.matches(&frame)) {
+        // A new encoder takes a while to start; that is no stall.
+        let fresh_encoder = enc.as_ref().is_none_or(|e| !e.matches(&frame));
+        if fresh_encoder {
             let mb = frame.width.div_ceil(16) * frame.height.div_ceil(16);
             if hello.max_mb_per_frame > 0 && mb > hello.max_mb_per_frame {
                 warn!(
@@ -600,16 +651,19 @@ fn video_loop(
         e.encode(&frame, frame.capture_ns, &mut packets)?;
         let t1 = now_ns();
         enc_ns += t1 - t0;
+        busy.add(t0, t1, Stage::Encode);
         if packets.is_empty() {
             empty += 1;
         }
         for p in &packets {
             let flags = if p.key { video_flags::KEY } else { 0 };
             bytes += p.data.len() as u64;
+            let ts = now_ns();
             send(writer, |w| {
                 proto::write_video(w, p.capture_ns, flags, &p.data)?;
                 w.flush()
             })?;
+            busy.add(ts, now_ns(), Stage::Send);
             in_flight.sent(p.capture_ns);
             tracing::trace!("sent frame {} bytes={} at {}", p.capture_ns, p.data.len(), now_ns());
             sent_lag_ns += now_ns().saturating_sub(p.capture_ns);
@@ -622,12 +676,43 @@ fn video_loop(
             pkts += 1;
         }
         n += 1;
+        if let Some(avail) = avail
+            && !packets.is_empty()
+            && !fresh_encoder
+        {
+            let done = now_ns();
+            // From when the screen changed (the capture, or the slot filling if the frame
+            // arrived late) to the frame leaving the host.
+            let start = avail.min(frame_capture_ns);
+            if done.saturating_sub(start) > STALL_NS {
+                let bp = busy.overlap(start, done, Stage::BackPressure);
+                let bp_note = if bp > 0 {
+                    format!(
+                        " with {bp_in_flight}/{max_in_flight} frames in flight (waiting for the tablet's acks{})",
+                        if bp_gave_up { "; gave up at 250 ms" } else { "" }
+                    )
+                } else {
+                    String::new()
+                };
+                stalls.report(
+                    done - start,
+                    &[
+                        ("back-pressure", bp, bp_note),
+                        ("encoder", busy.overlap(start, done, Stage::Encode), String::new()),
+                        ("send", busy.overlap(start, done, Stage::Send), String::new()),
+                        ("capture", avail.saturating_sub(start), String::new()),
+                    ],
+                    kind,
+                );
+            }
+        }
         if let Some(old) = last.replace(frame) {
             let _ = recycle.try_send(old.data);
         }
         if window.elapsed() >= Duration::from_secs(5) {
             let secs = window.elapsed().as_secs_f64();
             info!(
+                target: STATS,
                 "video: {:.1} fps, {:.1} Mbit/s, encode {:.2} ms/frame, capture→sent {:.2} ms, {} frames without output, held back {:.0} ms/s for the tablet",
                 n as f64 / secs,
                 bytes as f64 * 8.0 / secs / 1e6,
@@ -642,6 +727,84 @@ fn video_loop(
         }
     }
     Ok(last)
+}
+
+/// A frame waiting longer than this before it is sent counts as a stall (logged as a warning).
+const STALL_NS: u64 = 100_000_000;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Stage {
+    BackPressure,
+    Encode,
+    Send,
+}
+
+/// Recent time spans the video thread spent per stage, to explain a stall.
+#[derive(Default)]
+struct Busy {
+    spans: std::collections::VecDeque<(u64, u64, Stage)>,
+}
+
+impl Busy {
+    fn add(&mut self, from: u64, to: u64, stage: Stage) {
+        self.spans.push_back((from, to, stage));
+        while self.spans.len() > 64 {
+            self.spans.pop_front();
+        }
+    }
+
+    /// Nanoseconds of `stage` within [from, to].
+    fn overlap(&self, from: u64, to: u64, stage: Stage) -> u64 {
+        self.spans.iter().filter(|s| s.2 == stage).map(|&(a, b, _)| b.min(to).saturating_sub(a.max(from))).sum()
+    }
+}
+
+/// Stall warnings, at most one per [`StallLog::EVERY`]; the rest are counted.
+#[derive(Default)]
+struct StallLog {
+    last: Option<Instant>,
+    suppressed: u32,
+    suppressed_max_ns: u64,
+}
+
+impl StallLog {
+    const EVERY: Duration = Duration::from_secs(10);
+
+    /// `parts`: (stage, ns, note) for what the thread did meanwhile.
+    fn report(&mut self, total_ns: u64, parts: &[(&str, u64, String)], transport: &str) {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let accounted: u64 = parts.iter().map(|p| p.1).sum();
+        let other = total_ns.saturating_sub(accounted);
+        let cause = parts.iter().max_by_key(|p| p.1).filter(|p| p.1 >= other).map_or("nothing in particular", |p| p.0);
+        let mut detail: Vec<String> =
+            parts.iter().filter(|p| p.1 >= 1_000_000).map(|(name, ns, note)| format!("{name} {:.0} ms{note}", ms(*ns))).collect();
+        if other >= 1_000_000 {
+            detail.push(format!("other {:.0} ms", ms(other)));
+        }
+        let msg = format!(
+            "video stall: {:.0} ms before a new frame went out over {transport}, mostly {cause}: {}",
+            ms(total_ns),
+            detail.join(", ")
+        );
+        debug!("{msg}");
+        if self.last.is_some_and(|t| t.elapsed() < Self::EVERY) {
+            self.suppressed += 1;
+            self.suppressed_max_ns = self.suppressed_max_ns.max(total_ns);
+            return;
+        }
+        if self.suppressed > 0 {
+            warn!(
+                "{msg}; {} more stall(s) in the last {:.0} s, longest {:.0} ms (-vv shows each)",
+                self.suppressed,
+                self.last.map_or(0.0, |t| t.elapsed().as_secs_f64()),
+                ms(self.suppressed_max_ns)
+            );
+        } else {
+            warn!("{msg}");
+        }
+        self.last = Some(Instant::now());
+        (self.suppressed, self.suppressed_max_ns) = (0, 0);
+    }
 }
 
 #[derive(Default)]
@@ -667,6 +830,27 @@ struct Stats {
     wifi_spread_sum: u64,
     wifi_assemble_sum: u64,
     wifi_reports: u32,
+    /// Frames shown on the tablet in this report interval (refresh frames excluded).
+    shown: u32,
+    /// Transport, for the status line.
+    kind: &'static str,
+    live: Arc<Live>,
+    /// What the ping thread sends as STATS; refreshed every second from `hud_*`.
+    host_stats: Arc<Mutex<HostStats>>,
+    hud_frame: Vec<f64>,
+    hud_pen: Vec<f64>,
+    hud_last: Option<Instant>,
+    hud_held_ns: u64,
+}
+
+/// p50 and p95 of `v` (sorts it), None if empty.
+fn p50_p95(v: &mut [f64]) -> (Option<f64>, Option<f64>) {
+    if v.is_empty() {
+        return (None, None);
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let p = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+    (Some(p(0.5)), Some(p(0.95)))
 }
 
 impl Stats {
@@ -688,6 +872,7 @@ impl Stats {
     fn frame(&mut self, capture_ns: u64, recv_ns: u64, render_ns: u64) {
         if let (Some(r), Some(v)) = (self.to_host(render_ns), self.to_host(recv_ns)) {
             self.frame_lat.push((r - capture_ns as i64) as f64 / 1e6);
+            self.hud_frame.push((r - capture_ns as i64) as f64 / 1e6);
             self.net_lat.push((v - capture_ns as i64) as f64 / 1e6);
         }
     }
@@ -729,16 +914,63 @@ impl Stats {
 
     fn pen(&mut self, s: &proto::PenSample) {
         if let Some(t) = self.to_host(s.t_ns) {
-            self.pen_lat.push((now_ns() as i64 - t) as f64 / 1e6);
+            let ms = (now_ns() as i64 - t) as f64 / 1e6;
+            self.pen_lat.push(ms);
+            self.hud_pen.push(ms);
         }
     }
 
+    /// Once a second: the figures the tablet's stats display shows (sent by the ping thread).
+    fn maybe_update_hud(&mut self) {
+        let Some(last) = self.hud_last else {
+            self.hud_last = Some(Instant::now());
+            return;
+        };
+        let secs = last.elapsed().as_secs_f64();
+        if secs < 1.0 {
+            return;
+        }
+        let (shown_p50, shown_p95) = p50_p95(&mut self.hud_frame);
+        let (pen_p50, pen_p95) = p50_p95(&mut self.hud_pen);
+        let held = self.live.held_ns.load(Ordering::Relaxed);
+        let held_ms_per_s = Some(held.saturating_sub(self.hud_held_ns) as f64 / 1e6 / secs);
+        self.hud_held_ns = held;
+        {
+            let mut h = self.host_stats.lock().unwrap();
+            *h = HostStats { flags: h.flags, shown_p50, shown_p95, pen_p50, pen_p95, held_ms_per_s };
+        }
+        self.hud_frame.clear();
+        self.hud_pen.clear();
+        self.hud_last = Some(Instant::now());
+    }
+
     fn maybe_report(&mut self) {
+        self.maybe_update_hud();
         let due = self.last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
         if !due {
             return;
         }
+        let secs = self.last_report.map(|t| t.elapsed().as_secs_f64());
         self.last_report = Some(Instant::now());
+        // -v: one compact line first, then the detailed ones.
+        if let Some(secs) = secs
+            && tracing::enabled!(target: STATS, tracing::Level::INFO)
+            && (self.shown > 0 || !self.pen_lat.is_empty())
+        {
+            let (f50, f95) = p50_p95(&mut self.frame_lat.clone());
+            let (pen50, _) = p50_p95(&mut self.pen_lat.clone());
+            let ms = |v: Option<f64>| v.map_or("-".into(), |x| format!("{x:.0}"));
+            info!(
+                target: STATS,
+                "{:.0} fps | capture→shown p50 {} / p95 {} ms | pen {} ms | {}",
+                self.shown as f64 / secs,
+                ms(f50),
+                ms(f95),
+                pen50.map_or("-".into(), |x| format!("{x:.1}")),
+                self.kind
+            );
+        }
+        self.shown = 0;
         let fmt = |v: &mut Vec<f64>| -> String {
             if v.is_empty() {
                 return "-".into();
@@ -751,6 +983,7 @@ impl Stats {
         };
         if !self.frame_lat.is_empty() || !self.pen_lat.is_empty() {
             info!(
+                target: STATS,
                 "latency: capture→shown {} | capture→received {} | pen→host {} | rtt {:.2} ms",
                 fmt(&mut self.frame_lat),
                 fmt(&mut self.net_lat),
@@ -759,13 +992,14 @@ impl Stats {
             );
         }
         if !self.h_send.is_empty() {
-            info!("stages: capture→sent {} | sent→received {}", fmt(&mut self.h_send), fmt(&mut self.link));
+            info!(target: STATS, "stages: capture→sent {} | sent→received {}", fmt(&mut self.h_send), fmt(&mut self.link));
         }
         if self.wifi_reports > 0 {
             let w = std::mem::take(&mut self.wifi);
             let ok = w.frames_ok.max(1) as f64;
             let missing = w.shards_expected.saturating_sub(w.shards_rx);
             info!(
+                target: STATS,
                 "wifi: {} MHz {} dBm {} Mbit/s | shards lost {:.2}% ({missing}/{}) | FEC recovered {} shards in {} frames | frames lost {}, skipped {}, keyframes forced {} | spread avg {:.2} / max {:.1} ms | FEC+decrypt {:.2} ms",
                 w.freq_mhz,
                 w.rssi,
@@ -785,6 +1019,7 @@ impl Stats {
         }
         if !self.t_decode.is_empty() {
             info!(
+                target: STATS,
                 "tablet: wait for decoder {} | decode {} | decoded→shown {}",
                 fmt(&mut self.t_queue),
                 fmt(&mut self.t_decode),

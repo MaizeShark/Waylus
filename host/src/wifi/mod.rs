@@ -450,6 +450,7 @@ fn make_link(s: TcpStream, keys: crypto::SessionKeys, hub: &Arc<Hub>, fec: usize
             }
         }),
         sync: None,
+        kind: "wifi",
     })
 }
 

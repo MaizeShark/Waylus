@@ -19,6 +19,8 @@ pub struct Link {
     pub close: Arc<dyn Fn() + Send + Sync>,
     /// AOA: the nonce of the SYNC this session started with.
     pub sync: Option<u64>,
+    /// Transport, for logs and the status line: "usb", "adb" or "wifi".
+    pub kind: &'static str,
 }
 
 impl Link {
@@ -33,6 +35,7 @@ impl Link {
                 let _ = closer.shutdown(Shutdown::Both);
             }),
             sync: None,
+            kind: "adb",
         })
     }
 }

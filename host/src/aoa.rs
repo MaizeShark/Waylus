@@ -383,6 +383,7 @@ fn open_link(iface: &Interface, ep_in: u8, ep_out: u8) -> Result<Link> {
         writer: Box::new(writer),
         close: Arc::new(move || stop.store(true, Ordering::SeqCst)),
         sync: Some(nonce),
+        kind: "usb",
     })
 }
 

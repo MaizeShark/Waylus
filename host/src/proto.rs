@@ -48,6 +48,29 @@ pub mod ty {
     pub const WIFI_FRAME_LOST: u8 = 25;
     /// Wi-Fi tablet → host, once per second: reception statistics (WifiStats).
     pub const WIFI_STATS: u8 = 26;
+    /// Host → tablet, about once a second: rolling figures for the tablet's stats display
+    /// (HostStats). Added without a version bump: apps ignore message types they don't know.
+    pub const STATS: u8 = 27;
+}
+
+/// STATS flags.
+pub mod stats_flags {
+    /// The host was started with --hud: show the stats display.
+    pub const HUD: u8 = 1;
+    /// The pen comes from the raw stylus device (rawpen.rs), which has no pen→host figure.
+    pub const RAW_PEN: u8 = 2;
+}
+
+/// Payload of STATS. Times in ms; None = no data in this interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HostStats {
+    pub flags: u8,
+    pub shown_p50: Option<f64>,
+    pub shown_p95: Option<f64>,
+    pub pen_p50: Option<f64>,
+    pub pen_p95: Option<f64>,
+    /// Back-pressure: time per second the encoder waited for the tablet.
+    pub held_ms_per_s: Option<f64>,
 }
 
 /// Payload of a SYNC message: this magic followed by the client's u64 session nonce.
@@ -374,7 +397,46 @@ pub fn write_ping(w: &mut impl Write, host_ns: u64) -> io::Result<()> {
     message(w, ty::PING, &[&host_ns.to_le_bytes()])
 }
 
+/// `[u8 flags][u16 × 5]`: capture→shown p50, p95, pen→host p50, p95, held back ms/s; times
+/// in 0.1 ms, 0xFFFF = no data (Proto.kt `parseStats`). Fields may be appended later.
+pub fn write_stats(w: &mut impl Write, s: &HostStats) -> io::Result<()> {
+    let enc = |v: Option<f64>| -> [u8; 2] {
+        let x = v.map_or(0xffff, |ms| (ms * 10.0).round().clamp(0.0, 65534.0) as u16);
+        x.to_le_bytes()
+    };
+    let mut p = [0u8; 11];
+    p[0] = s.flags;
+    for (i, v) in [s.shown_p50, s.shown_p95, s.pen_p50, s.pen_p95, s.held_ms_per_s].into_iter().enumerate() {
+        p[1 + 2 * i..3 + 2 * i].copy_from_slice(&enc(v));
+    }
+    message(w, ty::STATS, &[&p])
+}
+
 /// Host monotonic clock in nanoseconds (the app estimates its offset from pings).
 pub fn now_ns() -> u64 {
     crate::platform::monotonic_ns()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same bytes are checked in the app's ProtoTest.kt.
+    #[test]
+    fn stats_encoding() {
+        let s = HostStats {
+            flags: stats_flags::HUD,
+            shown_p50: Some(38.25),
+            shown_p95: Some(47.0),
+            pen_p50: None,
+            pen_p95: Some(7000.0),
+            held_ms_per_s: Some(0.0),
+        };
+        let mut out = Vec::new();
+        write_stats(&mut out, &s).unwrap();
+        assert_eq!(
+            out,
+            [ty::STATS, 11, 0, 0, 0, 1, 0x7f, 0x01, 0xd6, 0x01, 0xff, 0xff, 0xfe, 0xff, 0, 0]
+        );
+    }
 }
