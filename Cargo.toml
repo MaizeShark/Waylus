@@ -8,6 +8,11 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/MaizeShark/Waylus"
 
+# nusb with one change (vendor/nusb/WAYLUS.md): on Windows it also claims WinUSB
+# interfaces under vendor composite drivers such as Samsung's.
+[patch.crates-io]
+nusb = { path = "vendor/nusb" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

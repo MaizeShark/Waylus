@@ -86,7 +86,10 @@ impl Aoa {
                         if !said_driver {
                             said_driver = true;
                             warn!(
-                                "the tablet is in accessory mode, but Windows has no WinUSB driver on its accessory                                  interface ({e:#}). Install it once with Zadig: select \"Android Open Accessory\"                                  (interface 0), driver WinUSB, Install (see the README, Windows setup)"
+                                "the tablet is in accessory mode, but its accessory interface can't be opened \
+                                 ({e:#}). If Windows has no WinUSB driver on it, install it once with Zadig: \
+                                 select \"Android Open Accessory\" (interface 0), driver WinUSB, Install \
+                                 (see the README, Windows setup)"
                             );
                         }
                     }
@@ -226,7 +229,8 @@ impl Control {
             }
             match last {
                 Some(e) => bail!(
-                    "no interface of the tablet is usable through WinUSB ({e}); install the Google USB Driver                      or bind WinUSB to its adb interface with Zadig (see the README)"
+                    "no interface of the tablet is usable through WinUSB ({e}); install the Google USB Driver \
+                     or bind WinUSB to its adb interface with Zadig (see the README)"
                 ),
                 None => bail!("the tablet reports no USB interfaces"),
             }

@@ -274,15 +274,19 @@ All other flags are the same as on Linux (`--transport`, `--bitrate`, `--fps`, `
 
 AMF and QSV are implemented but **untested**: the development machine has an NVIDIA GPU only (the error paths were checked: without an AMD/Intel GPU both stop with a clear message). NVENC is the tested path. QSV needs Intel's graphics driver with the oneVPL runtime.
 
-### USB accessory mode needs a driver, once
+### USB accessory mode and its driver
 
-`--transport adb` works with Google's or the vendor's USB driver, as for any Android tooling. The default, **USB accessory mode (AOA)**, needs a one-time step: Android doesn't tell Windows which driver the accessory interface wants (it advertises no Microsoft OS descriptors), so Windows leaves it without WinUSB (or binds a vendor's own driver, like Samsung's) and Waylus can't open it. It then says so and uses `adb` instead. To install WinUSB:
+`--transport adb` works with Google's or the vendor's USB driver, as for any Android tooling. The default, **USB accessory mode (AOA)**, needs WinUSB on the tablet's accessory interface, which Android doesn't ask for (it advertises no Microsoft OS descriptors):
 
-1. Run `waylus` once with the tablet attached. It switches the tablet into accessory mode (USB ID 18d1:2d00 or 2d01), and Windows lists an "Android Open Accessory" device.
-2. Start [Zadig](https://zadig.akeo.ie/), tick *Options → List All Devices*, select that **Android Open Accessory** entry (interface 0) and install the **WinUSB** driver.
-3. Run `waylus` again: it takes the accessory link.
+- **With Samsung's Android USB driver installed** (the usual "Samsung USB driver" download, which many people have for any Android phone), nothing to do: its package binds WinUSB to the accessory interface (18d1:2d00/2d01, "SAMSUNG Android Open Accessory(AOA) Device"). Samsung's driver also takes the parent composite device (`dg_ssudbus` instead of Microsoft's `usbccgp`), which the upstream USB library, nusb 0.2.9, refuses; Waylus ships nusb with a one-line change for that (`vendor/nusb/WAYLUS.md`).
+- **Without it**, Windows leaves the accessory interface without a driver; Waylus says so and uses `adb` instead. Install WinUSB once:
+  1. Run `waylus` once with the tablet attached. It switches the tablet into accessory mode (USB ID 18d1:2d00 or 2d01), and Windows lists an "Android Open Accessory" device.
+  2. Start [Zadig](https://zadig.akeo.ie/), tick *Options → List All Devices*, select that **Android Open Accessory** entry (interface 0) and install the **WinUSB** driver.
+  3. Run `waylus` again: it takes the accessory link.
 
-This replaces the driver of that one interface; adb and the tablet's other uses are unaffected. To switch the tablet into accessory mode at all, Waylus has to open the tablet's own USB interface, which Windows' adb server holds, so it runs `adb kill-server` at that point (the next adb call starts the server again).
+  This replaces the driver of that one interface; adb and the tablet's other uses are unaffected.
+
+To switch the tablet into accessory mode at all, Waylus has to open the tablet's own USB interface, which Windows' adb server holds, so it runs `adb kill-server` at that point (the next adb call starts the server again).
 
 ### Wi-Fi on Windows
 
