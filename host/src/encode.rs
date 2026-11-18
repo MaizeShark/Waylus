@@ -38,12 +38,53 @@ pub struct Encoder {
     pkt: ff::Packet,
     force_key: bool,
     vaapi: Option<Vaapi>,
+    /// Intel QSV: the QSV frames context D3D11 frames are mapped into.
+    qsv: Option<*mut ff::ffi::AVBufferRef>,
 }
+
+// The raw buffer reference is only used from the thread that owns the encoder.
+unsafe impl Send for Encoder {}
 
 /// The hw frames context of a GPU frame, for configuring the encoder.
 pub fn frames_ctx_of(frame: &frame::Video) -> Result<*mut ff::ffi::AVBufferRef> {
     let r = unsafe { (*frame.as_ptr()).hw_frames_ctx };
     if r.is_null() { Err(anyhow!("frame has no hw_frames_ctx")) } else { Ok(r) }
+}
+
+/// A QSV frames context derived from a D3D11 one (Intel QSV on Windows).
+fn derive_qsv(d3d11_frames: *mut ff::ffi::AVBufferRef) -> Result<*mut ff::ffi::AVBufferRef> {
+    use ff::ffi;
+    unsafe {
+        let fc = (*d3d11_frames).data as *mut ffi::AVHWFramesContext;
+        let mut dev = std::ptr::null_mut();
+        let r = ffi::av_hwdevice_ctx_create_derived(&mut dev, ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV, (*fc).device_ref, 0);
+        if r < 0 {
+            bail!("QSV device from the D3D11 device: {} (is the Intel GPU driver with oneVPL installed?)", ff::Error::from(r));
+        }
+        let mut frames = std::ptr::null_mut();
+        let r = ffi::av_hwframe_ctx_create_derived(&mut frames, ffi::AVPixelFormat::AV_PIX_FMT_QSV, dev, d3d11_frames, ffi::AV_HWFRAME_MAP_DIRECT as i32);
+        ffi::av_buffer_unref(&mut dev);
+        if r < 0 {
+            bail!("QSV frames from D3D11 frames: {}", ff::Error::from(r));
+        }
+        Ok(frames)
+    }
+}
+
+/// Maps a D3D11 frame into the QSV frames context.
+fn map_qsv(src: &frame::Video, qsv_frames: *mut ff::ffi::AVBufferRef) -> Result<frame::Video> {
+    use ff::ffi;
+    unsafe {
+        let dst = ffi::av_frame_alloc();
+        (*dst).format = ffi::AVPixelFormat::AV_PIX_FMT_QSV as i32;
+        (*dst).hw_frames_ctx = ffi::av_buffer_ref(qsv_frames);
+        let r = ffi::av_hwframe_map(dst, src.as_ptr(), ffi::AV_HWFRAME_MAP_DIRECT as i32);
+        let out = frame::Video::wrap(dst);
+        if r < 0 {
+            bail!("map D3D11 frame to QSV: {}", ff::Error::from(r));
+        }
+        Ok(out)
+    }
 }
 
 /// CPU frames → NV12 VAAPI surfaces.
@@ -122,6 +163,14 @@ impl Vaapi {
     }
 }
 
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        if let Some(mut q) = self.qsv.take() {
+            unsafe { ff::ffi::av_buffer_unref(&mut q) };
+        }
+    }
+}
+
 impl Drop for Vaapi {
     fn drop(&mut self) {
         unsafe {
@@ -165,6 +214,15 @@ impl Encoder {
         } else {
             None
         };
+        // QSV can't take D3D11 frames directly: derive a QSV frames context from ours.
+        let qsv = match hw_frames {
+            Some(h) if opts.encoder.contains("qsv") && hw_format == Some(ff::ffi::AVPixelFormat::AV_PIX_FMT_D3D11) => {
+                Some(derive_qsv(h)?)
+            }
+            _ => None,
+        };
+        let hw_frames_for_enc = qsv.or(hw_frames);
+        let hw_format = hw_frames_for_enc.map(|h| unsafe { (*((*h).data as *mut ff::ffi::AVHWFramesContext)).format });
         let vaapi_ref = vaapi.as_ref();
         // cqp: constant quantiser instead of CBR, for VAAPI drivers without rate control.
         let open = |cqp: bool| -> Result<ff::encoder::video::Encoder> {
@@ -175,7 +233,7 @@ impl Encoder {
             enc.set_width(width);
             enc.set_height(height);
             enc.set_format(pixel(format));
-            if let Some(hw) = hw_frames {
+            if let Some(hw) = hw_frames_for_enc {
                 unsafe {
                     let c = enc.as_mut_ptr();
                     (*c).pix_fmt = hw_format.unwrap();
@@ -218,6 +276,21 @@ impl Encoder {
                 dict.set("rc", "cbr");
                 dict.set("rc-lookahead", "0");
                 dict.set("forced-idr", "1");
+                dict.set("profile", "high");
+            } else if opts.encoder.contains("amf") {
+                dict.set("usage", "ultralowlatency");
+                dict.set("quality", "speed");
+                dict.set("rc", "cbr");
+                dict.set("forced_idr", "1");
+                dict.set("preanalysis", "0");
+                dict.set("filler_data", "0");
+                dict.set("profile", "high");
+            } else if opts.encoder.contains("qsv") {
+                dict.set("preset", "veryfast");
+                dict.set("async_depth", "1");
+                dict.set("forced_idr", "1");
+                dict.set("look_ahead", "0");
+                dict.set("scenario", "displayremoting");
                 dict.set("profile", "high");
             } else if opts.encoder.contains("vaapi") {
                 // Default depth 2 keeps a frame queued in the driver: one frame of latency.
@@ -276,6 +349,7 @@ impl Encoder {
             pkt: ff::Packet::empty(),
             force_key: true,
             vaapi,
+            qsv,
         })
     }
 
@@ -312,6 +386,9 @@ impl Encoder {
             // New reference to the same GPU buffer. (ffmpeg-next's clone() would try
             // a deep CPU copy, which fails for hardware frames.)
             let mut fr = unsafe { frame::Video::wrap(ff::ffi::av_frame_clone(gpu.as_ptr())) };
+            if let Some(q) = self.qsv {
+                fr = map_qsv(&fr, q)?;
+            }
             fr.set_pts(Some(pts));
             fr.set_kind(kind);
             self.enc.send_frame(&fr).context("send GPU frame to encoder")?;

@@ -110,7 +110,11 @@ pub fn gpu_for_monitor(monitor: isize) -> Result<Gpu> {
 /// `--encoder auto`: by the vendor of the first GPU (the one Windows lists first drives the
 /// primary display on desktops; on hybrid laptops pass --encoder).
 pub fn auto_encoder() -> &'static str {
-    let vendor = adapters().ok().and_then(|a| a.first().map(|a| adapter_info(a).0)).unwrap_or(VENDOR_NVIDIA);
+    // The first real GPU (skips the Basic Render Driver and virtual display adapters).
+    let vendor = adapters()
+        .ok()
+        .and_then(|a| a.iter().map(|a| adapter_info(a).0).find(|v| [VENDOR_NVIDIA, VENDOR_AMD, VENDOR_INTEL].contains(v)))
+        .unwrap_or(VENDOR_NVIDIA);
     match vendor {
         VENDOR_AMD => "h264_amf",
         VENDOR_INTEL => "h264_qsv",
@@ -345,6 +349,9 @@ impl HwFrames {
             // A texture of our own, so FFmpeg doesn't try to create a render-target array.
             let first = new_nv12(gpu, size)?;
             (*d3d).texture = first.as_raw() as *mut _;
+            // FFmpeg releases `texture` when the frames context is freed: give it its own
+            // reference, so the pool's reference stays valid.
+            std::mem::forget(first.clone());
             let r = ffi::av_hwframe_ctx_init(frames);
             if r < 0 {
                 ffi::av_buffer_unref(&mut frames);

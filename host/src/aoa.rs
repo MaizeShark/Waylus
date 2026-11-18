@@ -68,6 +68,8 @@ impl Aoa {
     pub fn connect(&mut self, give_up: Option<Duration>) -> Result<()> {
         let start = Instant::now();
         let mut said_waiting = false;
+        #[cfg(windows)]
+        let mut said_driver = false;
         let mut switched_at: Option<Instant> = None;
         loop {
             let devices: Vec<DeviceInfo> = nusb::list_devices().wait().context("list USB devices")?.collect();
@@ -78,7 +80,16 @@ impl Aoa {
                         self.iface = Some(i);
                         return Ok(());
                     }
-                    Err(e) => debug!("accessory not ready yet: {e:#}"),
+                    Err(e) => {
+                        debug!("accessory not ready yet: {e:#}");
+                        #[cfg(windows)]
+                        if !said_driver {
+                            said_driver = true;
+                            warn!(
+                                "the tablet is in accessory mode, but Windows has no WinUSB driver on its accessory                                  interface ({e:#}). Install it once with Zadig: select \"Android Open Accessory\"                                  (interface 0), driver WinUSB, Install (see the README, Windows setup)"
+                            );
+                        }
+                    }
                 }
             } else if switched_at.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
                 if let Some(d) = self.pick_android(&devices) {
@@ -197,11 +208,20 @@ impl Control {
         {
             // The tablet's own interfaces (adb, MTP) carry whatever driver the vendor
             // installed; any interface bound to WinUSB will do to reach the control pipe.
+            // WinUSB allows one opener at a time: the adb server holds the adb interface
+            // while it runs, so stop it (the host's adb calls start it again) and retry.
             let mut last = None;
-            for i in d.interfaces() {
-                match dev.claim_interface(i.interface_number()).wait() {
-                    Ok(iface) => return Ok(Self::Interface(iface)),
-                    Err(e) => last = Some(e),
+            for attempt in 0..2 {
+                for i in d.interfaces() {
+                    match dev.claim_interface(i.interface_number()).wait() {
+                        Ok(iface) => return Ok(Self::Interface(iface)),
+                        Err(e) => last = Some(e),
+                    }
+                }
+                if attempt == 0 {
+                    debug!("interfaces busy; stopping the adb server");
+                    let _ = std::process::Command::new("adb").arg("kill-server").output();
+                    thread::sleep(Duration::from_millis(500));
                 }
             }
             match last {
