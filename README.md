@@ -3,14 +3,14 @@
 > [!NOTE]
 > **LLM-generated code.** Most of this project, including code and documentation, was written by an AI model (Claude, by Anthropic) working with a human maintainer. It has been tested on real hardware but not audited line by line, so review it before relying on it.
 
-*Weylus, but for Way(land).* Use an Android tablet as a **low-latency pen display** for your Linux desktop.
-It's Wayland-first, uses a native Android client and runs over USB or, optionally, Wi-Fi.
+*Weylus, but for Way(land).* Use an Android tablet as a **low-latency pen display** for your Linux (Wayland) or Windows 10/11 desktop.
+It uses a native Android client and runs over USB or, optionally, Wi-Fi.
 
 Waylus mirrors one of your monitors to the tablet using hardware H.264 encode and decode. It sends the tablet's pen and fingers back as real Linux input devices:
 - a tablet tool with pressure, tilt and both stylus buttons;
 - a multitouch screen.
 
-Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet through libinput and the Wayland tablet protocol.
+Apps such as Krita, GIMP, Xournal++ and Inkscape see a regular graphics tablet through libinput and the Wayland tablet protocol. On Windows the pen and touch are synthetic pointer devices, so Windows Ink applications see a real pen (see [Windows](#windows)).
 
 ```
  host (Rust)                                                        tablet (Kotlin)
@@ -107,7 +107,7 @@ Sunshine captured DP-2 through KMS (`output_name = DP-2`) and encoded with NVENC
 
 ## Requirements
 
-**Host**
+**Host (Linux; for Windows see [Windows](#windows))**
 - Linux with a Wayland compositor that implements the ScreenCast portal. Tested on niri (xdg-desktop-portal-gnome), KDE Plasma 6.8 and GNOME 51. Hyprland should work.
 - PipeWire, FFmpeg ≥ 7.1 with `h264_nvenc` (NVIDIA) or `h264_vaapi` (Intel / AMD; tested on Intel UHD 620 with Debian 13). `adb` is optional: it installs and starts the app and enables raw pen input.
 - Write access to `/dev/uinput`, for example:
@@ -234,6 +234,79 @@ With the old back-pressure default of 2 frames in flight, Wi-Fi measured 66 / 96
 `camera.py` drops values far from the median as chance decodes. Here they clustered at 0.2–1.2 s: real freezes, 15 % of the frames at 20 Mbit/s and 8 % at 10 Mbit/s, so both readings are given. The tablet's loss log shows the cause: the 2.4 GHz link stalls for 100–450 ms at a time and loses bursts of half a frame, more than the parity can repair; each such loss costs a keyframe, which on 2.4 GHz takes long to send. A longer loss timeout didn't help ([details](docs/wifi.md)). Use 5 GHz.
 
 ⁵ Measured 2026-11-17 with `tools/latency/pen.py` as in ³, at commit 841f4e0. Tablet on 5260 MHz, −67 dBm, with the host on the same access point over Wi-Fi. Both runs use the app's pen events (`--no-raw-pen`); with the raw stylus reader, the pen would travel over adb rather than the transport being measured. Over Wi-Fi, one of the 30 taps hit a link stall (132 ms); the other 29 stayed under 16 ms.
+
+## Windows
+
+The host also runs on Windows 10 (1903 or newer; 11 recommended) with the same app, protocol and transports. The Linux measurements and tables above don't apply to it; its own are [further down](#measured-on-windows).
+
+```
+ host (Rust, Windows)                                                tablet (Kotlin, unchanged)
+ Windows.Graphics.Capture → D3D11 video processor (BGRA→NV12, scale) ─┐
+   → FFmpeg D3D11 frames → NVENC / AMF / QSV ─────────────────────────┤  USB (AOA, adb)  ┌→ MediaCodec → SurfaceView
+                                                                      ├─ or Wi-Fi ───────┤
+ synthetic pointer devices (pen + touch)  ←  input events  ←──────────┘                  └← MotionEvent / raw stylus
+```
+
+- **Capture** is Windows.Graphics.Capture of one monitor, cursor included. Frames stay on the GPU: the D3D11 video processor converts them to NV12 (BT.709, limited range) and scales them down to what the tablet can decode, and FFmpeg hands the texture to the encoder (`h264_nvenc`, `h264_amf` or `h264_qsv`; `--encoder auto` picks by the GPU's vendor). The encoder settings are the same low-latency ones as on Linux.
+- **Pen and touch** use `CreateSyntheticPointerDevice` / `InjectSyntheticPointerInput` (Windows 10 1809+): a `PT_PEN` device with pressure (0–1024), tilt, hover and the barrel button, and a `PT_TOUCH` device with 10 contacts (scrolling and pinch-zoom work). Coordinates map to the mirrored monitor's rectangle in virtual-desktop pixels; the process is per-monitor DPI aware. Windows drops the eraser flags of a synthetic pen, so a stylus's eraser acts like its tip. Input can't reach windows of elevated programs unless Waylus runs elevated too.
+- Verified with `tools/windows/PointerProbe.ps1`, a window that records the `WM_POINTER` messages it receives: `waylus --test-input --output N` injects a pressure ramp with tilt, hover with the barrel button, and a two-finger pinch, and the probe sees pressure 0–1024, tilt up to 45°/−22°, the barrel flag, and two touch contacts.
+
+### Setup
+
+1. Install **Rust** (MSVC toolchain), the **Visual Studio Build Tools** (C++), **LLVM** (`winget install LLVM.LLVM`, for bindgen) and an **FFmpeg shared build, version 7.1 or newer**, with headers and import libraries: for example BtbN's `ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip` from <https://github.com/BtbN/FFmpeg-Builds/releases> (the one tested) or the gyan.dev "full-shared" build. Unpack it, then:
+   ```powershell
+   $env:FFMPEG_DIR = 'C:\ffmpeg-dev\ffmpeg-n8.1-latest-win64-gpl-shared-8.1'
+   $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+   cargo build --release            # target\release\waylus.exe
+   ```
+   (vcpkg works as well: `vcpkg install ffmpeg[nvcodec,amf,qsv]:x64-windows`.) At run time `waylus.exe` finds the FFmpeg DLLs on `PATH` or next to itself: copy the `bin\*.dll` files beside it.
+2. The **tablet app** is the same APK as on Linux (protocol version 5), installed with `adb` (platform-tools on `PATH`, USB debugging on). Waylus installs an APK it finds next to the binary or the source tree, or uses the installed one.
+3. Run it. `waylus --list-outputs` shows the monitors (number, GDI name, size, refresh rate, GPU); `waylus --output 2` mirrors one. Without `--output` Waylus asks once and remembers the choice in `%LOCALAPPDATA%\waylus\output.txt` (`--choose` asks again).
+
+```powershell
+waylus --list-outputs
+waylus --output 2                # mirror monitor 2: video + pen + touch
+waylus --no-video --output 2     # pen and touch only, as a plain graphics tablet
+waylus --encoder h264_amf        # force the encoder (AMD); h264_qsv for Intel
+```
+
+All other flags are the same as on Linux (`--transport`, `--bitrate`, `--fps`, `--wifi`, ...), except the Linux-only `--niri-setup`. Ctrl-C removes the `adb reverse`, stops the app and releases the pointer devices.
+
+AMF and QSV are implemented but **untested**: the development machine has an NVIDIA GPU only (the error paths were checked: without an AMD/Intel GPU both stop with a clear message). NVENC is the tested path. QSV needs Intel's graphics driver with the oneVPL runtime.
+
+### USB accessory mode needs a driver, once
+
+`--transport adb` works with Google's or the vendor's USB driver, as for any Android tooling. The default, **USB accessory mode (AOA)**, needs a one-time step: Android doesn't tell Windows which driver the accessory interface wants (it advertises no Microsoft OS descriptors), so Windows leaves it without WinUSB (or binds a vendor's own driver, like Samsung's) and Waylus can't open it. It then says so and uses `adb` instead. To install WinUSB:
+
+1. Run `waylus` once with the tablet attached. It switches the tablet into accessory mode (USB ID 18d1:2d00 or 2d01), and Windows lists an "Android Open Accessory" device.
+2. Start [Zadig](https://zadig.akeo.ie/), tick *Options → List All Devices*, select that **Android Open Accessory** entry (interface 0) and install the **WinUSB** driver.
+3. Run `waylus` again: it takes the accessory link.
+
+This replaces the driver of that one interface; adb and the tablet's other uses are unaffected. To switch the tablet into accessory mode at all, Waylus has to open the tablet's own USB interface, which Windows' adb server holds, so it runs `adb kill-server` at that point (the next adb call starts the server again).
+
+### Wi-Fi on Windows
+
+`--wifi`, `--pair`, `--unpair`, `--listen`, `--no-usb` and `--fec` work as on Linux, with the same pairing and encryption. The key store is `%LOCALAPPDATA%\waylus\wifi.json` (the folder's inherited permissions apply: your account, SYSTEM and administrators). The tablet keeps one paired host, so pairing it with the Windows host replaces a Linux pairing.
+
+- **Firewall.** Windows Defender Firewall asks the first time `waylus.exe` listens (TCP and UDP 27183, and mDNS on UDP 5353). Allow it on **Private networks only**; never tick *Public*. Windows often files a home Wi-Fi network as *Public*, and then the Private-only rule doesn't apply: switch the network to Private (Settings → Network & internet → Wi-Fi → the network → Network profile type). If the host starts but the tablet can't connect, look here first: `Get-NetConnectionProfile`, and the rules for `waylus.exe` under *Windows Defender Firewall → Allow an app*.
+- **DSCP.** Waylus marks its UDP video datagrams (`IP_TOS`), but Windows ignores that unless a QoS policy allows it. Waylus doesn't create a policy (that takes administrator rights), so on Windows the packets go out unmarked.
+- **mDNS.** Waylus advertises `_waylus._tcp` on the private LAN addresses it listens on only. The tablet's "enter address" fallback works without it.
+
+### Virtual monitor
+
+Waylus can't create a monitor on Windows (that takes a display driver), but an Indirect Display driver can: install [Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) and its monitor is captured like any other. Then:
+
+- `waylus --virtual` finds that monitor (the one on an Indirect Display adapter), switches it to the mode that fits the tablet best (same aspect ratio, as large as the tablet's decoder allows, the tablet's refresh rate) and mirrors it. Extend the desktop onto it in Windows' display settings, drag windows there and draw. Changing the mode needs no administrator rights.
+- The driver offers only the modes in its `vdd_settings.xml` (by default `C:\VirtualDisplayDriver\`: every `<resolution>` entry, plus the `<g_refresh_rate>` values for each). It lists 1920×1080 and 2560×1440 among others. For a 3:2 tablet such as the NXTPAPER 14 (2400×1600) add the size the stream uses, for example
+  ```xml
+  <resolution><width>2160</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
+  ```
+  and restart the driver (Device Manager → Display adapters → disable and enable "Virtual Display Driver", which needs administrator rights, or the driver's control app). When the exact mode is missing, Waylus logs which size it wanted and uses the closest one. Editing the file could be automated, but loading it takes elevation, so Waylus leaves the file alone.
+- 1920×1080 at 60 Hz is a safe choice for any tablet.
+
+### Measured on Windows
+
+(numbers follow)
 
 ## Status / roadmap
 

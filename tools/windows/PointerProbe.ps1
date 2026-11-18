@@ -1,9 +1,10 @@
 # Pointer listener for checking Waylus's Windows pen/touch injection (waylus --test-input).
-# Opens a borderless window on one monitor, records WM_POINTER* messages (pen pressure,
+# With -Stream, prints "DOWN <QueryPerformanceCounter ticks> <frequency>" for every pen-down
+# as it arrives (used by tools/latency/pen.py on Windows). Opens a borderless window on one monitor, records WM_POINTER* messages (pen pressure,
 # tilt, flags; touch contacts) and writes a summary to -Out when it closes.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\PointerProbe.ps1 -Monitor 2 -Seconds 12 -Out probe.txt
-param([int]$Monitor = 2, [int]$Seconds = 12, [string]$Out = "pointer-probe.txt")
+param([int]$Monitor = 2, [int]$Seconds = 12, [string]$Out = "pointer-probe.txt", [switch]$Stream)
 
 Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
 using System;
@@ -28,7 +29,7 @@ public class ProbeForm : Form {
     [StructLayout(LayoutKind.Sequential)] struct PEN_INFO { public PINFO p; public uint penFlags, penMask, pressure, rotation; public int tiltX, tiltY; }
     [StructLayout(LayoutKind.Sequential)] struct TOUCH_INFO { public PINFO p; public uint touchFlags, touchMask; public RC c, cr; public uint orientation, pressure; }
 
-    public int penEvents, penContact, penHover, penBarrel, penEraser, penDown, penUp, touchEvents, touchDown, touchUp;
+    public bool stream; public int penEvents, penContact, penHover, penBarrel, penEraser, penDown, penUp, touchEvents, touchDown, touchUp;
     public uint pMin = 99999, pMax = 0; public int tMinX = 999, tMaxX = -999, tMinY = 999, tMaxY = -999;
     public HashSet<uint> touchIds = new HashSet<uint>();
     public int mouseMoves, mouseDowns;
@@ -56,7 +57,7 @@ public class ProbeForm : Form {
                     if ((pi.penFlags & 1) != 0) penBarrel++;
                     if ((pi.penFlags & 4) != 0 || (pi.penFlags & 2) != 0) penEraser++;
                     combos.Add(String.Format("msg=0x{0:x} flags=0x{1:x} penFlags=0x{2:x}", msg, f & 0xfff, pi.penFlags));
-                    if (msg == 0x246) penDown++;
+                    if (msg == 0x246) { penDown++; if (stream) { Console.Out.WriteLine("DOWN " + System.Diagnostics.Stopwatch.GetTimestamp() + " " + System.Diagnostics.Stopwatch.Frequency); Console.Out.Flush(); } }
                     if (msg == 0x247) penUp++;
                     if (pi.tiltX < tMinX) tMinX = pi.tiltX; if (pi.tiltX > tMaxX) tMaxX = pi.tiltX;
                     if (pi.tiltY < tMinY) tMinY = pi.tiltY; if (pi.tiltY > tMaxY) tMaxY = pi.tiltY;
@@ -86,6 +87,8 @@ $null = Add-Type -MemberDefinition '[DllImport("user32.dll")] public static exte
 $screens = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { -not $_.Primary }, { $_.Bounds.X }
 $r = $screens[$Monitor - 1].Bounds
 $f = [ProbeForm]::new($r, $Seconds)
+$f.stream = [bool]$Stream
+if ($Stream) { Write-Output "READY" }
 [System.Windows.Forms.Application]::Run($f)
 $s = @()
 $s += "monitor rect: $($r.X),$($r.Y) $($r.Width)x$($r.Height)"

@@ -9,8 +9,9 @@ use anyhow::{Result, bail};
 use windows::Win32::{
     Foundation::{LPARAM, RECT},
     Graphics::Gdi::{
-        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR,
-        MONITORINFO, MONITORINFOEXW,
+        CDS_TYPE, ChangeDisplaySettingsExW, DEVMODE_FIELD_FLAGS, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DISPLAY_DEVICEW,
+        ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW,
+        GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     },
 };
 use windows::core::{BOOL, PCWSTR};
@@ -27,6 +28,8 @@ pub struct Monitor {
     pub rect: RECT,
     pub primary: bool,
     pub refresh_hz: u32,
+    /// Name of the display adapter ("NVIDIA GeForce ...", "Virtual Display Driver").
+    pub adapter: String,
 }
 
 impl Monitor {
@@ -55,6 +58,7 @@ unsafe extern "system" fn collect(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARA
             rect: info.monitorInfo.rcMonitor,
             primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
             refresh_hz: hz,
+            adapter: String::new(),
         });
     }
     true.into()
@@ -66,8 +70,88 @@ pub fn list() -> Vec<Monitor> {
     unsafe {
         let _ = EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut v as *mut Vec<Monitor> as isize));
     }
+    let names = adapter_names();
+    for m in &mut v {
+        m.adapter = names.get(&m.name).cloned().unwrap_or_default();
+    }
     v.sort_by_key(|m| (!m.primary, m.rect.left, m.rect.top));
     v
+}
+
+fn wide(s: &[u16]) -> String {
+    String::from_utf16_lossy(&s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())])
+}
+
+/// `\.\DISPLAYn` → the name of the adapter it belongs to.
+fn adapter_names() -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    for i in 0.. {
+        let mut dd = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+        if !unsafe { EnumDisplayDevicesW(PCWSTR::null(), i, &mut dd, 0) }.as_bool() {
+            break;
+        }
+        m.insert(wide(&dd.DeviceName), wide(&dd.DeviceString));
+    }
+    m
+}
+
+/// Display adapters of Indirect Display drivers (virtual monitors).
+const VIRTUAL_ADAPTERS: [&str; 5] = ["virtual display", "indirect display", "iddsample", "usbmmidd", "spacedesk"];
+
+impl Monitor {
+    pub fn is_virtual(&self) -> bool {
+        let a = self.adapter.to_ascii_lowercase();
+        VIRTUAL_ADAPTERS.iter().any(|v| a.contains(v)) && !a.contains("parsec")
+    }
+}
+
+/// Modes (width, height, Hz) the monitor's driver offers.
+pub fn modes(device: &str) -> Vec<(u32, u32, u32)> {
+    let name: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut v = Vec::new();
+    for i in 0.. {
+        let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+        if !unsafe { EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_DISPLAY_SETTINGS_MODE(i), &mut dm) }.as_bool() {
+            break;
+        }
+        let m = (dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency);
+        if dm.dmBitsPerPel == 32 && !v.contains(&m) {
+            v.push(m);
+        }
+    }
+    v
+}
+
+/// Switches the monitor to `mode` (not saved: it is gone after a restart).
+pub fn set_mode(device: &str, mode: (u32, u32, u32)) -> Result<()> {
+    let name: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+    if !unsafe { EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm) }.as_bool() {
+        bail!("cannot read the current mode of {device}");
+    }
+    dm.dmPelsWidth = mode.0;
+    dm.dmPelsHeight = mode.1;
+    dm.dmDisplayFrequency = mode.2;
+    dm.dmFields = DEVMODE_FIELD_FLAGS(0x80000 | 0x100000 | 0x400000); // width, height, frequency
+    let r = unsafe { ChangeDisplaySettingsExW(PCWSTR(name.as_ptr()), Some(&dm), None, CDS_TYPE(0), None) };
+    if r != DISP_CHANGE_SUCCESSFUL {
+        bail!("Windows refused {}x{} @ {} Hz on {device} (code {})", mode.0, mode.1, mode.2, r.0);
+    }
+    Ok(())
+}
+
+/// The mode of a virtual monitor that best fits a `want`-sized stream at `fps`: the same
+/// aspect ratio, the largest area not above the request, the closest refresh rate.
+pub fn best_mode(modes: &[(u32, u32, u32)], want: (u32, u32), fps: u32) -> Option<(u32, u32, u32)> {
+    let aspect = want.0 as f64 / want.1 as f64;
+    let score = |m: &&(u32, u32, u32)| {
+        let a = m.0 as f64 / m.1 as f64;
+        let aspect_off = ((a / aspect) - 1.0).abs();
+        let over = (m.0 * m.1) as f64 > (want.0 * want.1) as f64 * 1.001;
+        let area = -((m.0 * m.1) as f64);
+        (aspect_off > 0.02, over, area as i64, (m.2 as i64 - fps as i64).abs())
+    };
+    modes.iter().min_by_key(score).copied()
 }
 
 /// `--output`: a 1-based index into [`list`] (as printed by `--list-outputs`), a GDI name
@@ -131,13 +215,14 @@ fn print_list(all: &[Monitor]) {
     for (i, m) in all.iter().enumerate() {
         let (w, h) = (m.rect.right - m.rect.left, m.rect.bottom - m.rect.top);
         println!(
-            "  {}: {}  {w}x{h} @ {} Hz at ({}, {}){}",
+            "  {}: {}  {w}x{h} @ {} Hz at ({}, {}){}  [{}]",
             i + 1,
             m.name,
             m.refresh_hz,
             m.rect.left,
             m.rect.top,
-            if m.primary { "  (primary)" } else { "" }
+            if m.primary { "  (primary)" } else { "" },
+            m.adapter
         );
     }
 }

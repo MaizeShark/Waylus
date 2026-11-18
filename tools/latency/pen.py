@@ -13,6 +13,13 @@ same for every tool.
 
 Needs adb (USB debugging) and read access to /dev/input on the host (group `input`).
 Run with `python3 -I`.
+
+On Windows there is no /dev/input: `--windows-monitor N` (the number from `waylus
+--list-outputs`) opens tools/windows/PointerProbe.ps1 as a full-screen window on that
+monitor and takes the host time of each pen-down from its WM_POINTERDOWN message
+(QueryPerformanceCounter, mapped onto the system clock). That is a little later than
+Linux's kernel event timestamp: it includes Windows' delivery of the pointer message to
+the window. The mirrored monitor shows that window during the test.
 """
 
 import argparse
@@ -26,6 +33,30 @@ import time
 
 EV_KEY, BTN_TOUCH = 1, 0x14A
 EVENT = struct.Struct("<qqHHi")  # 64-bit timeval, type, code, value (x86_64 and arm64)
+
+
+def windows_listener(monitor, out, stop):
+    """Pen-down times from PointerProbe.ps1 -Stream (Windows)."""
+    import os
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "windows", "PointerProbe.ps1")
+    proc = subprocess.Popen(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Monitor", str(monitor),
+         "-Seconds", "600", "-Stream", "-Out", os.devnull],
+        stdout=subprocess.PIPE, text=True)
+    for line in proc.stdout:
+        if line.startswith("READY"):
+            break
+    # QueryPerformanceCounter ns → system clock ns (the tablet offset is against the system clock).
+    off = time.time_ns() - time.perf_counter_ns()
+
+    def run():
+        for line in proc.stdout:
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "DOWN" and not stop.is_set():
+                out.append(int(parts[1]) * 1_000_000_000 // int(parts[2]) + off)
+
+    threading.Thread(target=run, daemon=True).start()
+    return proc
 
 
 def host_device(name):
@@ -88,16 +119,24 @@ def reader(stream, out, stop):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--host-device", required=True, help='name (substring) of the tool\'s pen device, e.g. "Waylus Pen"')
+    ap.add_argument("--host-device", required=sys.platform != "win32", help='name (substring) of the tool\'s pen device, e.g. "Waylus Pen"')
+    ap.add_argument("--windows-monitor", type=int, help="Windows: monitor number (waylus --list-outputs) to listen on")
     ap.add_argument("--tablet-device", help="stylus device on the tablet (default: the one named *pen*/*stylus*)")
     ap.add_argument("--taps", type=int, default=30)
     ap.add_argument("--timeout", type=float, default=180)
     ap.add_argument("--label", default="")
     a = ap.parse_args()
 
-    host = host_device(a.host_device)
-    if not host:
-        sys.exit(f"no host input device named like {a.host_device!r} (is the tool running?)")
+    win = sys.platform == "win32"
+    host = None
+    if win:
+        if not a.windows_monitor:
+            sys.exit("on Windows pass --windows-monitor N (the mirrored monitor, see waylus --list-outputs)")
+        host = f"Windows monitor {a.windows_monitor}"
+    else:
+        host = host_device(a.host_device)
+        if not host:
+            sys.exit(f"no host input device named like {a.host_device!r} (is the tool running?)")
     tab_dev, tab_name = (a.tablet_device, "") if a.tablet_device else tablet_device()
     if not tab_dev:
         sys.exit("no stylus device found on the tablet; pass --tablet-device")
@@ -109,9 +148,13 @@ def main():
     tab_downs, host_downs = [], []
     # dd rather than cat: Waylus kills stray `cat <device>` readers on start.
     tab = subprocess.Popen(["adb", "exec-out", f"dd if={tab_dev} bs={EVENT.size} 2>/dev/null"], stdout=subprocess.PIPE)
-    hostf = open(host, "rb", buffering=0)
     threading.Thread(target=reader, args=(tab.stdout, tab_downs, stop), daemon=True).start()
-    threading.Thread(target=reader, args=(hostf, host_downs, stop), daemon=True).start()
+    probe = None
+    if win:
+        probe = windows_listener(a.windows_monitor, host_downs, stop)
+    else:
+        hostf = open(host, "rb", buffering=0)
+        threading.Thread(target=reader, args=(hostf, host_downs, stop), daemon=True).start()
 
     print(f"tap the pen on the tablet {a.taps} times (about one tap per second)", file=sys.stderr)
     start = time.time()
@@ -124,6 +167,8 @@ def main():
     time.sleep(1.0)
     stop.set()
     tab.kill()
+    if probe:
+        probe.kill()
     print(file=sys.stderr)
 
     off2, rtt2 = clock_offset()
@@ -143,7 +188,7 @@ def main():
                  "if the numbers are huge, the tablet's evdev clock may not be CLOCK_REALTIME")
     lat.sort()
     p95 = lat[min(len(lat) - 1, int(0.95 * len(lat)))]
-    print(f"{a.label or a.host_device}: pen-down → host device p50 {statistics.median(lat):.1f} / p95 {p95:.1f} / "
+    print(f"{a.label or a.host_device or 'Waylus (Windows)'}: pen-down → host device p50 {statistics.median(lat):.1f} / p95 {p95:.1f} / "
           f"min {lat[0]:.1f} / max {lat[-1]:.1f} ms (n={len(lat)} of {len(tab_downs)} taps; "
           f"clock sync ±{max(rtt1, rtt2) / 2e6:.1f} ms)")
 

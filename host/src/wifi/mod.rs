@@ -120,8 +120,13 @@ pub const MDNS_TYPE: &str = "_waylus._tcp.local.";
 /// host name avoids clashing with the records Avahi publishes for this machine.
 fn advertise(host_id: &str, addrs: &[SocketAddr]) -> Result<mdns_sd::ServiceDaemon> {
     let d = mdns_sd::ServiceDaemon::new().context("start mDNS responder")?;
-    let name = hostname();
     let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+    // Only the interfaces we listen on, never public or VPN ones.
+    d.disable_interface(mdns_sd::IfKind::All).context("mDNS interfaces")?;
+    for ip in &ips {
+        d.enable_interface(mdns_sd::IfKind::Addr(*ip)).context("mDNS interface")?;
+    }
+    let name = hostname();
     let props = [("id", host_id.to_owned()), ("v", proto::PROTO_VERSION.to_string()), ("name", name.clone())];
     let info = mdns_sd::ServiceInfo::new(MDNS_TYPE, &name, &format!("waylus-{name}.local."), ips.as_slice(), addrs[0].port(), &props[..])
         .context("mDNS service info")?;

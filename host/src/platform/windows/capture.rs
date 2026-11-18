@@ -121,14 +121,41 @@ impl State {
     }
 }
 
-pub fn start(req: &CaptureRequest) -> Result<Capture> {
-    if req.virtual_size.is_some() {
+/// `--virtual`: use the monitor of an Indirect Display driver (e.g. Virtual-Display-Driver),
+/// set to the mode that fits the tablet. Creating the monitor is the driver's job.
+fn virtual_monitor(size: (u32, u32)) -> Result<monitors::Monitor> {
+    let Some(m) = monitors::list().into_iter().find(|m| m.is_virtual()) else {
         anyhow::bail!(
-            "--virtual is not available on Windows: install an Indirect Display driver such as \
-             Virtual-Display-Driver (see the README) and mirror its monitor with --output"
+            "no virtual monitor found: install an Indirect Display driver such as Virtual-Display-Driver              (README, \"Virtual monitor\"), or mirror a real monitor with --output"
         );
+    };
+    let fps = m.refresh_hz.max(60);
+    let modes = monitors::modes(&m.name);
+    match monitors::best_mode(&modes, size, fps) {
+        Some(mode) if (mode.0, mode.1) == size => {
+            if (m.rect.right - m.rect.left, m.rect.bottom - m.rect.top, m.refresh_hz as i32) != (mode.0 as i32, mode.1 as i32, mode.2 as i32) {
+                monitors::set_mode(&m.name, mode)?;
+                std::thread::sleep(Duration::from_millis(800));
+            }
+        }
+        Some(mode) => {
+            info!(
+                "the virtual monitor offers no {}x{} mode (closest: {}x{} @ {} Hz); add it to the driver's vdd_settings.xml                  and restart the driver to get the exact size",
+                size.0, size.1, mode.0, mode.1, mode.2
+            );
+            monitors::set_mode(&m.name, mode)?;
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        None => anyhow::bail!("the virtual monitor {} reports no display modes", m.name),
     }
-    let monitor = monitors::choose(req.output, req.choose_again)?;
+    monitors::list().into_iter().find(|x| x.name == m.name).ok_or_else(|| anyhow::anyhow!("the virtual monitor disappeared"))
+}
+
+pub fn start(req: &CaptureRequest) -> Result<Capture> {
+    let monitor = match req.virtual_size {
+        Some(size) => virtual_monitor(size)?,
+        None => monitors::choose(req.output, req.choose_again)?,
+    };
     let out = monitor.output();
     info!(
         "capturing {} ({}x{} at {},{} @ {} Hz)",
