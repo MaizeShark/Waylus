@@ -14,7 +14,7 @@ loss. USB stays the default whenever a cable is connected.
 
 USB stays the default: with `--wifi` the host still uses USB when the tablet is plugged in, and additionally accepts the paired tablet over Wi-Fi.
 
-**Pairing (once).** Run `waylus --wifi --pair`. In the Waylus app on the tablet, tap the host under "Pair with …" (found via mDNS), or type its address and tap "Pair with this host". The host prints a 6-digit PIN (and shows a desktop notification); enter it on the tablet. Pairing stays possible for 5 minutes or until one tablet has paired, and closes after 3 wrong PINs. After that, `waylus --wifi` is enough: open the app on the tablet and it connects. The tablet keeps one paired host; pairing it with another host replaces the old pairing.
+**Pairing (once).** Run `waylus --wifi --pair`. In the Waylus app on the tablet, open the Wi-Fi tab and tap Pair next to the host under "On this network" (found via mDNS), or type its address under "Pair by address". The host prints a 6-digit PIN (and shows a desktop notification); enter it on the tablet. Pairing stays possible for 5 minutes or until one tablet has paired, and closes after 3 wrong PINs. After that, `waylus --wifi` is enough: open the app on the tablet and it connects. The tablet keeps one paired host; pairing it with another host replaces the old pairing.
 
 ```sh
 waylus --wifi --pair          # pair a tablet (shows a PIN)
@@ -39,6 +39,7 @@ Other flags: `--listen ADDR` (default: every private IPv4 address of the host, n
 - At a weak spot (−78 dBm in the measurements below), Android keeps scanning for a better access point, and the link stalls for ~80–200 ms every few seconds. A wired host helps, since otherwise every packet crosses the air twice.
 - Avoid 2.4 GHz if you can (measured: freezes of 0.2–1 s, [measurements](measurements.md#24-ghz)). If you must, use `--bitrate 10`.
 - The raw pen reader (full tilt on the NXTPAPER) needs adb; over Wi-Fi, without adb, the pen uses Android's events.
+- To see how the link is doing: the app's "This tablet" tab shows the band, frequency and signal (with a hint on 2.4 GHz); the stats display (`--hud`, or in the app's settings) shows frame rate, latency, shard loss, FEC repairs and lost frames while streaming; `waylus -v` logs the same every 5 s, and stalls are logged as warnings at any level.
 
 ## 1. What Sunshine / Moonlight do
 
@@ -246,6 +247,10 @@ moonlight-common-c (`src/RtpVideoQueue.c`, `src/ControlStream.c`, `src/InputStre
 - The host adds to its 5 s report: loss %, FEC recoveries, unrecoverable frames,
   IDRs sent (requested / initial), encrypt + FEC time per frame, and the Wi-Fi band
   where it can be read (tablet: `WifiInfo.frequency`, link speed, RSSI; sent in `Hello`).
+- Since version 0.2.0 the 5 s report (`wifi:`, `wifi video:` and the other statistics
+  lines quoted in this document) is printed only with `-v`. The tablet's stats display
+  shows the band, RSSI, shard loss, FEC repairs and lost frames from its own reception
+  figures.
 
 ### 2.7 Android
 - `WifiManager.createWifiLock(WIFI_MODE_FULL_LOW_LATENCY)`: acquired when a Wi-Fi

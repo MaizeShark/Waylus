@@ -1,3 +1,5 @@
+<img src="docs/logo.svg" width="96" align="right" alt="">
+
 # Waylus
 
 > [!NOTE]
@@ -35,7 +37,7 @@ The pen rows were measured at different points: on Linux to the kernel event of 
 
 ## Quick start
 
-The tablet needs Android 11 or newer and the Waylus app (`android/`). With `adb` available (USB debugging on), the host installs and starts the app itself; without it, install the APK once by other means.
+The tablet needs Android 11 or newer and the Waylus app (`android/`). With `adb` available (USB debugging on), the host installs and starts the app itself; without it, install the APK once by other means. When nothing is streaming, the app shows what it is waiting for and what to do next, Wi-Fi pairing, what it can see of the tablet's Wi-Fi, USB and adb state, and where to get the computer side.
 
 ### Linux
 
@@ -43,7 +45,7 @@ Requirements: a Wayland compositor with the ScreenCast portal, PipeWire, FFmpeg 
 
 ```sh
 cargo build --release                       # host: target/release/waylus
-cd android && ./gradlew assembleDebug       # app: android/app/build/outputs/apk/debug/app-debug.apk
+cd android && ./gradlew assembleRelease     # app: android/app/build/outputs/apk/release/app-release.apk
 waylus                                      # pick a monitor once; pen, touch and video over USB
 ```
 
@@ -67,7 +69,7 @@ Krita needs the Windows Ink tablet API. Driver, firewall, virtual monitor and Kr
 ### Wi-Fi
 
 ```sh
-waylus --wifi --pair             # once: the host shows a PIN, enter it in the app
+waylus --wifi --pair             # once: in the app's Wi-Fi tab tap Pair, enter the PIN the host shows
 waylus --wifi                    # USB if plugged in, else Wi-Fi
 ```
 
@@ -89,6 +91,8 @@ Use 5 GHz with a strong signal. Security model and tips: [docs/wifi.md](docs/wif
 | `--boost <s>` | Keep the tablet's CPU clocks up after input, for faster decoding (default 20, 0 = off) |
 | `--no-raw-pen` | Use Android's pen events instead of reading the stylus device over adb |
 | `--serial <serial>`, `-s` | adb serial, if several devices are attached |
+| `--hud` | Show frame rate and latency on the tablet (also a switch in the app, or tap the black bar beside the picture) |
+| `-v`, `-vv`, `-vvv`, `-q` | More or less output, see below |
 
 The full list is in `waylus --help` and [docs/linux.md](docs/linux.md#options).
 
@@ -103,14 +107,16 @@ The full list is in `waylus --help` and [docs/linux.md](docs/linux.md#options).
 - **No tilt on one axis.** Some tablets' Android configuration drops it (the NXTPAPER 14 reports no X tilt). With adb, Waylus reads the stylus device directly and gets both axes; over Wi-Fi without adb it can't.
 - **Krita on Windows has no pressure.** Set *Tablet Input API* to *Windows 8+ Pointer Input (Windows Ink)* ([details](docs/windows.md#pen-buttons-eraser-and-applications)).
 
-Verbose logs: `RUST_LOG=waylus=debug`.
+**Logs and statistics.** By default the host prints what it sets up and chose (monitor, encoder, transport, stream size), connects and disconnects, and warnings, including a warning when the video stalls for more than 100 ms and why (waiting for the tablet, the encoder, capture or sending). It prints no periodic statistics; turn on the tablet's stats display (`--hud`, or in the app) to see frame rate and latency there. `-v` adds a status line and the detailed statistics every 5 s, `-vv` debug messages, `-vvv` everything including FFmpeg's log, `-q` only warnings and errors. `RUST_LOG`, when set, overrides all of this.
+
+**The app's id changed** from `dev.waylus` to `de.hut9.waylus` in version 0.2.0. The host removes the old app when it finds it over adb (two apps claiming the USB accessory would make Android ask which one to open); without adb, uninstall the old one by hand. Wi-Fi pairings don't carry over: pair once more with `--wifi --pair`.
 
 ## Status / roadmap
 
-Done: pen, touch and video over USB (AOA and adb) and Wi-Fi; Linux (NVENC, VAAPI) and Windows (NVENC) hosts; virtual monitors on KDE, GNOME and Windows; built-in latency statistics and reproducible measurements, including Wi-Fi on 5 GHz and 2.4 GHz.
+Done: pen, touch and video over USB (AOA and adb) and Wi-Fi; Linux (NVENC, VAAPI) and Windows (NVENC) hosts; virtual monitors on KDE, GNOME and Windows; built-in latency statistics (in the host log with `-v`, and on the tablet with the stats display) and reproducible measurements, including Wi-Fi on 5 GHz and 2.4 GHz; an app with an idle screen that says what to do next, Wi-Fi pairing, device checks and settings.
 
 Open:
-- Wi-Fi: one ~190 ms freeze of undetermined cause in the Moonlight comparison clip, and pen latency over Wi-Fi trails Moonlight's ([details](docs/measurements.md#moonlight--sunshine-wi-fi-kde-2026-11-18)). 2.4 GHz still freezes under loss; intra refresh instead of keyframes is a candidate.
+- Wi-Fi: one ~190 ms freeze of undetermined cause in the Moonlight comparison clip (the host now logs stalls with their cause; one back-pressure stall of 195 ms has been seen since), and pen latency over Wi-Fi trails Moonlight's ([details](docs/measurements.md#moonlight--sunshine-wi-fi-kde-2026-11-18)). 2.4 GHz still freezes under loss; intra refresh instead of keyframes is a candidate.
 - Hardware decode is the largest stage: on the MT8781 it is CPU-clock-bound (19 ms idle, 11.5 ms while drawing); `--boost` keeps the clocks up for 20 s after input.
 - Virtual monitor on niri (needs `RecordVirtual` in niri; use a dummy plug meanwhile).
 - AMF and QSV encoders on Windows are untested. A comparison with MoreSpace's hardware (VAAPI) encoder is still open.

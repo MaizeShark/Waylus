@@ -22,6 +22,16 @@ The host also runs on Windows 10 (1903 or newer; 11 recommended) with the same a
 2. The **tablet app** is the same APK as on Linux (protocol version 5), installed with `adb` (platform-tools on `PATH`, USB debugging on). Waylus installs an APK it finds next to the binary or the source tree, or uses the installed one.
 3. For USB accessory mode (the default), the tablet's accessory interface needs WinUSB; see [USB accessory mode and its driver](#usb-accessory-mode-and-its-driver). Without it Waylus falls back to `adb`.
 
+**Type-checking the Windows code from Linux** (no build, no Windows SDK): `cargo check` needs FFmpeg headers (the Linux ones do; any 7.1+ version) and MinGW's C headers for bindgen, which Fedora has in `mingw64-headers` (`dnf download mingw64-headers` and unpack it with `rpm2cpio | cpio -idm` if you don't want to install it):
+```sh
+rustup target add x86_64-pc-windows-msvc
+mkdir -p /tmp/ffwin/lib && ln -sfn /usr/include/ffmpeg /tmp/ffwin/include
+MINGW=/usr/x86_64-w64-mingw32/sys-root/mingw/include
+FFMPEG_DIR=/tmp/ffwin BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-w64-mingw32 -isystem $MINGW -D__X86INTRIN_H" \
+  cargo check --target x86_64-pc-windows-msvc
+```
+`-D__X86INTRIN_H` keeps clang's x86 intrinsics headers out of the bindings (bindgen can't express their AMX types); FFmpeg's API doesn't use them.
+
 ## Run
 
 `waylus --list-outputs` shows the monitors (number, GDI name, size, refresh rate, GPU); `waylus --output 2` mirrors one. The numbers follow Windows' device names (`\\.\DISPLAY1`, `\\.\DISPLAY2`, …), so they don't change when you pick another main display or rearrange the monitors; `--output DISPLAY2` works too. Without `--output` Waylus asks once and remembers the choice in `%LOCALAPPDATA%\waylus\output.txt` (`--choose` asks again).
@@ -33,7 +43,7 @@ waylus --no-video --output 2     # pen and touch only, as a plain graphics table
 waylus --encoder h264_amf        # force the encoder (AMD); h264_qsv for Intel
 ```
 
-All other flags are the same as on Linux (`--transport`, `--bitrate`, `--fps`, `--wifi`, ...), except the Linux-only `--niri-setup`. Ctrl-C removes the `adb reverse`, stops the app and releases the pointer devices.
+All other flags are the same as on Linux (`--transport`, `--bitrate`, `--fps`, `--wifi`, `--hud`, `-v`, ...), except the Linux-only `--niri-setup`. The statistics lines quoted in the measurements need `-v`. Ctrl-C removes the `adb reverse`, stops the app and releases the pointer devices.
 
 ## How it works
 

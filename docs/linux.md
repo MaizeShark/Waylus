@@ -111,6 +111,9 @@ All options, as printed by `waylus --help`:
 | `--max-in-flight <n>` | Back-pressure: max frames sent but not yet shown (default 3, 0 = off) |
 | `--vendor-tweaks mtk-cpu-boost,mtk-vpp-off` | **Opt-in, device-specific** MediaTek decoder settings. `mtk-cpu-boost` saved ~1.9 ms of decode on the MT8781; `mtk-vpp-off` made no measurable difference. Never used for the published comparison numbers |
 | `--wifi`, `--pair`, `--unpair <name>`, `--listen <addr>`, `--fec <pct>`, `--no-usb` | Wi-Fi, see [wifi.md](wifi.md#using-wi-fi) |
+| `--hud` | Show the stats display (frame rate, latency, Wi-Fi reception) on the tablet. Also a switch in the app's settings, or tap the black bar beside the picture |
+| `-v, --verbose` | Repeatable. `-v`: a status line and the detailed statistics every 5 s; `-vv`: debug; `-vvv`: trace, plus FFmpeg's own log |
+| `-q, --quiet` | Warnings and errors only |
 
 ## Raw pen
 
@@ -126,4 +129,12 @@ With adb available, Waylus reads the tablet's stylus evdev device directly: full
 
 - Monitors larger than the tablet can show or decode (e.g. 4K) are scaled down on the GPU automatically. The tablet reports its decoder's limits at connect; the host logs them (`decoder … (max WxH, N MB/frame, N MB/s)`).
 - `WAYLUS_NO_ZEROCOPY=1` forces the CPU readback path.
-- `RUST_LOG=waylus=debug` gives verbose logs; `WAYLUS_FFMPEG_LOG=1` sets FFmpeg's own log level to debug.
+- Log levels: see `-v`/`-q` under [options](#options). By default there are no periodic statistics, only events and warnings; a video stall over 100 ms is logged as a warning with what held it up (at most one every 10 s, with a count of the others). `-v` prints, every 5 s:
+  ```
+  53 fps | capture→shown p50 25 / p95 27 ms | pen - ms | usb
+  video: 52.8 fps, 17.6 Mbit/s, encode 1.96 ms/frame, capture→sent 2.46 ms, 0 frames without output, held back 0 ms/s for the tablet
+  latency: capture→shown p50 24.7 / p95 26.6 ms (n=265) | capture→received p50 4.5 / p95 5.6 ms (n=265) | pen→host - | rtt 0.49 ms
+  stages: … | tablet: … (and wifi: … over Wi-Fi)
+  ```
+  `RUST_LOG` (e.g. `RUST_LOG=waylus=debug`) overrides the level when set; the statistics lines use the target `waylus::stats`. `WAYLUS_FFMPEG_LOG=1` sets FFmpeg's own log level to debug without `-vvv`.
+- `pen` in the status line and the stats display is Android's pen events to the host. With the raw stylus reader (adb) there is no such figure; `tools/latency/pen.py` measures that path.

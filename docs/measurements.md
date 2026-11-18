@@ -5,7 +5,7 @@ All numbers here come from one desktop (RTX 4060) and one tablet (TCL NXTPAPER 1
 Contents:
 - [Method](#method)
 - [How Waylus differs from Weylus](#how-waylus-differs-from-weylus)
-- [Linux](#linux): [Waylus vs Weylus](#waylus-vs-weylus-niri-2026-11-17), [where the time goes](#where-the-time-goes), [Wi-Fi](#wi-fi-linux-host-2026-11-17), [2.4 GHz](#24-ghz), [other Linux tools](#other-linux-tablet-as-monitor-tools-kde-2026-11-18), [Moonlight](#moonlight--sunshine-wi-fi-kde-2026-11-18)
+- [Linux](#linux): [Waylus vs Weylus](#waylus-vs-weylus-niri-2026-11-17), [where the time goes](#where-the-time-goes), [Wi-Fi](#wi-fi-linux-host-2026-11-17), [2.4 GHz](#24-ghz), [other Linux tools](#other-linux-tablet-as-monitor-tools-kde-2026-11-18), [Moonlight](#moonlight--sunshine-wi-fi-kde-2026-11-18), [app 0.2.0 and the stats display](#app-020-and-the-stats-display-niri-2026-11-19)
 - [Windows](#windows): [built-in statistics](#built-in-statistics), [photon to photon](#photon-to-photon), [pen](#pen), [Wi-Fi](#wi-fi), [Weylus and Moonlight](#weylus-and-moonlight-on-windows-2026-11-18)
 
 ## Method
@@ -28,7 +28,7 @@ On Windows, `pen.py --windows-monitor N` listens for the pointer message in a wi
 
 ### Built-in statistics
 
-Waylus logs its own per-stage timings every 5 s (clocks synced by ping/pong). They cover capture → the decoded frame being handed to the tablet's compositor, so they leave out what the camera sees on top: the tablet's compositing and refresh (~1–2 frames at 60 Hz), minus the real monitor's own delay.
+Waylus logs its own per-stage timings every 5 s (clocks synced by ping/pong). Since version 0.2.0 these lines (`latency:`, `stages:`, `tablet:`, `wifi:`, `video:`) are printed only with `waylus -v`; the figures below were taken from them. The tablet's stats display shows the same capture → shown figures over 1 s windows, but leave it off for comparisons (see [app 0.2.0](#app-020-and-the-stats-display-niri-2026-11-19)). They cover capture → the decoded frame being handed to the tablet's compositor, so they leave out what the camera sees on top: the tablet's compositing and refresh (~1–2 frames at 60 Hz), minus the real monitor's own delay.
 
 ## How Waylus differs from Weylus
 
@@ -143,7 +143,24 @@ Waylus mirroring DP-2 directly (its normal mode, no extra monitor) measured p50 
 
 Sunshine captured DP-2 through KMS (`output_name = DP-2`) and encoded with NVENC; Moonlight at 1080p, 60 fps, 20 Mbit/s (Sunshine reports ~15 Mbit/s of video after its FEC share), frame pacing "Prefer lowest latency".
 
-¹ 25 of 654 tablet readings (3.8 %) sat at 89–283 ms, clustered around 190 ms, and are left out of the figures as outliers. Re-analysis of the clip shows that 23 of them are **one freeze of about 190 ms** (camera frames 1925–1947): the lag there climbs by 8.3 ms per camera frame, so the tablet held one picture while the monitor moved on. The other two, isolated readings around it, are probably misreads. The tablet logged **no lost frames** during the clip, so it was not a frame lost beyond what the FEC repairs. The cause is not determined: a hitch on the host (capture, encode or send), packets that were delayed but complete, or a hiccup in the tablet's decode or display. The leading guess, unverified, is the host's back-pressure: the host waits for the tablet's acknowledgements, with at most 3 frames in flight, and those may have been delayed on the uplink. With everything included: p50 49 / p95 70 / p99 239 ms. Moonlight's clip had no freeze (its 4 dropped readings out of 725 were misreads, and its p99 with everything included is 81 ms). Open items for Waylus's Wi-Fi mode: the cause of the freeze, and pen latency over Wi-Fi, which is slower than Moonlight's.
+¹ 25 of 654 tablet readings (3.8 %) sat at 89–283 ms, clustered around 190 ms, and are left out of the figures as outliers. Re-analysis of the clip shows that 23 of them are **one freeze of about 190 ms** (camera frames 1925–1947): the lag there climbs by 8.3 ms per camera frame, so the tablet held one picture while the monitor moved on. The other two, isolated readings around it, are probably misreads. The tablet logged **no lost frames** during the clip, so it was not a frame lost beyond what the FEC repairs. The cause is not determined: a hitch on the host (capture, encode or send), packets that were delayed but complete, or a hiccup in the tablet's decode or display. The leading guess, unverified, is the host's back-pressure: the host waits for the tablet's acknowledgements, with at most 3 frames in flight, and those may have been delayed on the uplink. With everything included: p50 49 / p95 70 / p99 239 ms. Moonlight's clip had no freeze (its 4 dropped readings out of 725 were misreads, and its p99 with everything included is 81 ms). Open items for Waylus's Wi-Fi mode: the cause of the freeze, and pen latency over Wi-Fi, which is slower than Moonlight's. Since 0.2.0 the host logs any stall over 100 ms as a warning with what held it up, so a repeat would show whether back-pressure is the cause.
+
+### App 0.2.0 and the stats display (niri, 2026-11-19)
+
+Version 0.2.0 replaced the app's plain text screen with a Compose UI (idle screen, pairing, settings) and added the optional stats display. Checked against the previous commit (4c8744b, host and app both built from it) on the NXTPAPER 14 over USB accessory mode, niri, release builds, the mirrored monitor's content changing about 50 times a second (a browser and a music app; not the barcode page), pen idle. Runs alternated old / new / new with the stats display, twice, 70 s each; each 5 s window of the host's `-v` statistics, without the first one (Android's launch boost still on):
+
+| | Capture → shown p50 | p95 | Tablet decode p50 |
+|---|---|---|---|
+| Before (4c8744b) | 28.4–30.1 ms | 31–36 ms | 20.0–20.8 ms |
+| 0.2.0, stats display off | 28.0–29.6 ms | 31–35 ms | 19.7–20.5 ms |
+| 0.2.0, stats display on | 24.4–29.2 ms (15–18 in some windows) | 26–34 ms | 18.5–20.6 ms (10.7–12) |
+
+- No change with the display off. With it on, several windows came out *faster*, because decoding was: the display redraws once a second, which apparently keeps the tablet's CPU clocks higher (decode on the MT8781 follows the CPU clock, see [where the time goes](#where-the-time-goes)). That makes it a confounder rather than a cost, so comparison numbers are taken with it off.
+- SurfaceFlinger (`dumpsys SurfaceFlinger`, HWC layers) composited the video layer as `DEVICE` (hardware overlay) while streaming, with the stats display both off and on; the idle UI is removed while streaming.
+- Start: process start → first video frame when the host starts the app over adb, with the accessory link already up, 3 runs each after a first one: before 513–537 ms, 0.2.0 519–531 ms. Cold, right after installing (including the accessory switch): ~3.0 / 3.3 s, one run each. Cold start to the idle screen when opened from the launcher (`am start -W`, 6 runs): before ~260 ms, 0.2.0 ~407 ms (~375 ms fully AOT-compiled); the difference is Compose's first composition.
+- APK: 4.1 MB release with R8 (before: 7.8 MB without R8).
+- Pen → host was not re-measured: it needs someone drawing. The input path is unchanged (same `InputCapture`, unbuffered dispatch on the root view; the only addition is that a finger gesture *starting* on the black bar beside the picture toggles the stats display and isn't forwarded).
+- The new stall warning showed up during these runs once, at the start of a session: 106 ms, encoder 26 ms and 80 ms unattributed. In a separate Wi-Fi test (5 GHz, −64 dBm) it caught one 195 ms stall that was all back-pressure (3/3 frames in flight, waiting for the tablet's acknowledgements), the pattern guessed for the freeze in the [Moonlight comparison](#moonlight--sunshine-wi-fi-kde-2026-11-18) above; that test also took a tablet screenshot at about that time, which may have caused it, so it is a lead, not a finding.
 
 ## Windows
 
