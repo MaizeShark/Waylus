@@ -496,6 +496,7 @@ fn udp_loop(hub: &Hub) {
             if *p != Some(from) {
                 debug!("Wi-Fi: tablet UDP address {from}");
                 *p = Some(from);
+                crate::platform::mark_video_flow(&hub.udp, from);
             }
         }
         let filtered = dedup_input(&sess, &body);

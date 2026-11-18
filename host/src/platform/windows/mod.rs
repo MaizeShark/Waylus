@@ -111,3 +111,51 @@ pub fn test_input(output: Option<&str>) -> Result<()> {
 pub fn list_outputs() {
     monitors::print();
 }
+
+/// Wi-Fi: asks Windows' QoS service (qWAVE) to mark the UDP flow to `peer` as audio/video
+/// traffic (DSCP, and WMM's video queue on Wi-Fi). Windows ignores a plain `IP_TOS` socket
+/// option; qWAVE is the per-app way that needs no administrator rights, when it works.
+pub fn mark_video_flow(udp: &std::net::UdpSocket, peer: std::net::SocketAddr) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        NetworkManagement::QoS::{QOS_NON_ADAPTIVE_FLOW, QOS_VERSION, QOSAddSocketToFlow, QOSCreateHandle, QOSTrafficTypeAudioVideo},
+        Networking::WinSock::{SOCKADDR, SOCKADDR_IN, SOCKET, AF_INET},
+    };
+    static HANDLE_: OnceLock<isize> = OnceLock::new();
+    let std::net::SocketAddr::V4(v4) = peer else { return };
+    let handle = *HANDLE_.get_or_init(|| {
+        let version = QOS_VERSION { MajorVersion: 1, MinorVersion: 0 };
+        let mut h = HANDLE::default();
+        match unsafe { QOSCreateHandle(&version, &mut h) }.as_bool() {
+            true => h.0 as isize,
+            false => {
+                tracing::debug!("qWAVE unavailable: {}", std::io::Error::last_os_error());
+                0
+            }
+        }
+    });
+    if handle == 0 {
+        return;
+    }
+    let mut sa = SOCKADDR_IN::default();
+    sa.sin_family = AF_INET;
+    sa.sin_port = v4.port().to_be();
+    sa.sin_addr.S_un.S_addr = u32::from_ne_bytes(v4.ip().octets());
+    let mut flow = 0u32;
+    let ok = unsafe {
+        QOSAddSocketToFlow(
+            HANDLE(handle as *mut _),
+            SOCKET(udp.as_raw_socket() as usize),
+            Some(&sa as *const SOCKADDR_IN as *const SOCKADDR),
+            QOSTrafficTypeAudioVideo,
+            Some(QOS_NON_ADAPTIVE_FLOW),
+            &mut flow,
+        )
+    };
+    if ok.as_bool() {
+        tracing::info!("qWAVE: UDP flow to {peer} marked as audio/video traffic");
+    } else {
+        tracing::debug!("qWAVE: cannot mark the flow: {}", std::io::Error::last_os_error());
+    }
+}

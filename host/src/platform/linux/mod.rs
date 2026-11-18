@@ -137,3 +137,6 @@ pub fn monotonic_ns() -> u64 {
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
+
+/// Wi-Fi: per-flow QoS marking is done with `IP_TOS` on Linux; nothing more to do per peer.
+pub fn mark_video_flow(_udp: &std::net::UdpSocket, _peer: std::net::SocketAddr) {}

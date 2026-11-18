@@ -328,7 +328,7 @@ pub fn selftest(output: Option<&str>) -> Result<()> {
         sleep(8);
     }
     println!("hover again, barrel button");
-    for i in 0..30u32 {
+    for _i in 0..30u32 {
         pen.handle(&sample(pen_state::HOVER, 0.8, 0.5, 0.0, 0, pen_buttons::PRIMARY))?;
         sleep(8);
     }

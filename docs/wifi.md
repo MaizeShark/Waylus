@@ -372,6 +372,16 @@ host on 5 GHz at the same AP, `--max-in-flight 3`:
   Possible future work for 2.4 GHz: intra refresh instead of keyframes (smaller
   recovery frames), adaptive bitrate.
 
+## Windows
+
+The Wi-Fi code is shared; what differs on a Windows host (2026-11-18, Windows 11, RTX 4060 desktop on 5 GHz Wi-Fi):
+
+- **Sockets.** `IP_TOS` and `SO_SNDBUF` go through `socket2`, interface addresses through `if-addrs` (up interfaces, private IPv4 only, never loopback, public or CGNAT/VPN addresses). The video UDP socket gets the same 4 MiB send buffer as on Linux.
+- **Key store.** `%LOCALAPPDATA%\waylus\wifi.json`. Waylus doesn't change its permissions: the file inherits the folder's ACL (the user, SYSTEM, Administrators; checked with `icacls`), which is the Windows counterpart of mode 0600.
+- **DSCP.** Windows ignores `IP_TOS` unless a QoS policy allows the application to set DSCP. The alternative without a policy is qWAVE (`QOSAddSocketToFlow`, `QOSTrafficTypeAudioVideo`). The host tries it for the video flow once the tablet's UDP address is known and logs `qWAVE: UDP flow to … marked` when Windows accepts it; the qWAVE service (`QWAVE`) is manual-start and not running by default, and whether the access point honours the marking was not measured, so the result is reported in the README's Windows measurements, not assumed.
+- **mDNS.** `mdns-sd` starts and registers the service next to Windows' own mDNS responder (the `Dnscache` service) on port 5353 without errors (whether the tablet finds it: see the measurements). The responder is restricted to the interfaces the host listens on (`IfKind::Addr`), also on Linux, so it never answers on public or VPN interfaces.
+- **Firewall.** The first listen raises Windows Defender Firewall's dialog for `waylus.exe`; its default offers Public and Private. If the Wi-Fi network is classified *Public* (it often is), a Private-only rule doesn't cover it and the tablet can't connect. See the README, "Wi-Fi on Windows".
+
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
   the plan is to write the code fresh. Any file that ends up porting their code gets a
