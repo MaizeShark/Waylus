@@ -16,7 +16,7 @@ use windows::Win32::{
     Foundation::{POINT, RECT},
     UI::{
         Controls::{
-            CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE, POINTER_FEEDBACK_DEFAULT,
+            CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE, POINTER_FEEDBACK_NONE,
             POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
         },
         Input::Pointer::{
@@ -53,8 +53,9 @@ struct Device(HSYNTHETICPOINTERDEVICE);
 unsafe impl Send for Device {}
 
 impl Device {
+    // No visual feedback: the default draws Windows' pen/touch dot instead of the cursor.
     fn new(kind: POINTER_INPUT_TYPE, max: u32) -> Result<Self> {
-        let h = unsafe { CreateSyntheticPointerDevice(kind, max, POINTER_FEEDBACK_DEFAULT) }
+        let h = unsafe { CreateSyntheticPointerDevice(kind, max, POINTER_FEEDBACK_NONE) }
             .map_err(|e| anyhow::anyhow!("CreateSyntheticPointerDevice: {e} (needs Windows 10 1809 or newer)"))?;
         DEVICES.lock().unwrap().push(h.0 as isize);
         Ok(Self(h))
