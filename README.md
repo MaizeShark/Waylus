@@ -322,7 +322,14 @@ The decode time is the MT8781's idle-clock decode that the Linux section already
 
 **Photon to photon, Wi-Fi 5 GHz, 2026-11-18:** same method, `waylus --wifi --no-usb` (release build, 20 Mbit/s, 20 % FEC); tablet on 5260 MHz, −62 dBm, 351 Mbit/s (`adb shell cmd wifi status` before the clip); the host is on 5 GHz via the same access point. Fitted p50 **48 ms** / p95 **64 ms** (p5 29, p99 73; n = 239; 6 readings of 86–124 ms dropped as outliers, with them p95 69 / p99 108). The Linux reference over Wi-Fi is p50 49 / p95 62–65 ms. A first clip taken with an unoptimized (debug) host build, where sealing and FEC took 12–21 ms per frame, read p50 76 / p95 94 ms and is not used.
 
-**Pen, USB (`--transport adb`), 2026-11-18:** `tools/latency/pen.py --windows-monitor 2`, 30 real taps with the T-Pen, Android pen events (`--no-raw-pen`), video on: pen-down on the tablet → the pointer message in a window on the mirrored monitor p50 **8.4 ms** / p95 **10.9 ms** (min 3.9, max 11.0; clock sync ±0.7 ms). Not the same measurement point as the Linux figure (kernel timestamp on the virtual input device, p50 6.8 / p95 8.8 ms with the same pen events over USB): on Windows the time includes delivery of the pointer message to the window, so it is an upper bound.
+**Pen, 2026-11-18** (release build): `tools/latency/pen.py --windows-monitor 2`, 30 real taps with the T-Pen each, Android pen events (`--no-raw-pen`), video on, pen-down on the tablet → the pointer message in a window on the mirrored monitor:
+
+| | p50 | p95 | min / max |
+|---|---|---|---|
+| USB (`--transport adb`) | 8.7 ms | 11.4 ms | 3.9 / 11.8 ms (n = 31) |
+| Wi-Fi 5 GHz (−63 dBm) | 9.5 ms | 15.6 ms | 4.5 / 37.7 ms (n = 31) |
+
+Not the same measurement point as the Linux figures (p50 6.8 / p95 8.8 ms over USB and 9.3 / 15.7 ms over Wi-Fi with the same pen events, from the kernel timestamp on the virtual input device): on Windows the time includes delivery of the pointer message to the window, so these are upper bounds. A first USB run on a debug build read p50 8.4 / p95 10.9 ms.
 
 **Wi-Fi, 2026-11-18** (built-in statistics as above, `waylus --wifi --no-usb`, release build, 4 windows of 5 s, host and tablet on the same access point at 5260 MHz, tablet −71…−72 dBm, 263 Mbit/s link): capture → shown p50 35.3–36.7 / p95 40.8–49 ms; capture → sent p50 5.0–5.2 ms (send 1.0 ms per frame, seal + FEC 0.13 ms); sent → received p50 7.4–8.0 / p95 11.6–13.9 ms; 0 of 10 800 shards lost per window, no FEC repair, no lost frames, 60 fps. mDNS discovery (the tablet listed the host), PIN pairing from a fresh key store and qWAVE flow marking (accepted without administrator rights; its effect on the air was not measured) all worked.
 
