@@ -1,11 +1,44 @@
-# Wi-Fi transport: research and design
+# Wi-Fi transport
 
-Status: **design agreed** (2026-11-17): PIN + SPAKE2 pairing, `--wifi` next to USB, pairing only with `--pair`, IDR recovery first. Implementation in progress.
+How to use Waylus over Wi-Fi, then the research and design behind it, and the development
+measurements. The measured results are collected in [measurements.md](measurements.md#wi-fi-linux-host-2026-11-17).
+
+Status: **implemented** (2026-11-17, Windows host 2026-11-18). Design agreed 2026-11-17: PIN + SPAKE2 pairing, `--wifi` next to USB, pairing only with `--pair`, IDR recovery first.
 
 Goal: a LAN transport next to AOA/adb with latency close to USB and, above all, a low
 tail. Target on a good 5/6 GHz link: capture→photon p50 ≤ USB + ~10 ms (USB: 45 ms),
 p95 ≤ ~80 ms, pen→host close to USB (5.1 / 7.0 ms), no multi-hundred-ms stalls after
 loss. USB stays the default whenever a cable is connected.
+
+## Using Wi-Fi
+
+USB stays the default: with `--wifi` the host still uses USB when the tablet is plugged in, and additionally accepts the paired tablet over Wi-Fi.
+
+**Pairing (once).** Run `waylus --wifi --pair`. In the Waylus app on the tablet, tap the host under "Pair with …" (found via mDNS), or type its address and tap "Pair with this host". The host prints a 6-digit PIN (and shows a desktop notification); enter it on the tablet. Pairing stays possible for 5 minutes or until one tablet has paired, and closes after 3 wrong PINs. After that, `waylus --wifi` is enough: open the app on the tablet and it connects. The tablet keeps one paired host; pairing it with another host replaces the old pairing.
+
+```sh
+waylus --wifi --pair          # pair a tablet (shows a PIN)
+waylus --wifi                 # USB if plugged in, else Wi-Fi
+waylus --wifi --no-usb        # Wi-Fi only (adb, if present, still installs/starts the app)
+waylus --unpair all           # forget paired tablets (or a name / id prefix)
+```
+
+Other flags: `--listen ADDR` (default: every private IPv4 address of the host, never public or VPN addresses such as Tailscale), `--fec PCT` (video parity, default 20 %, at least 2 parity packets per block). Ports: TCP and UDP 27183 (`--port`) and mDNS (UDP 5353); open them in your firewall if it blocks them. Fedora Workstation's default zone already allows them. On Windows, see [windows.md, Wi-Fi on Windows](windows.md#wi-fi-on-windows) for the firewall dialog.
+
+**Security model.**
+- Only paired tablets can connect. Pairing uses SPAKE2 (RFC 9382) with the PIN: someone on the network who watches the pairing learns nothing that would let them guess the PIN offline, and each attempt tests a single PIN.
+- Each session authenticates both sides with the 256-bit pairing key and an ephemeral ECDH exchange (forward secrecy).
+- Everything after that is AES-256-GCM: input, control and video. The host drops any packet that fails authentication and never takes a peer's address on trust, so spoofed UDP source addresses or a reused DHCP address get nowhere.
+- Keys: `~/.local/state/waylus/wifi.json` (mode 0600) on the host (Windows: `%LOCALAPPDATA%\waylus\wifi.json`); on the tablet, in app storage, wrapped by an Android Keystore key.
+- Video is always encrypted. Decrypting costs the tablet 0.2–0.5 ms per frame, and an unencrypted mode would save at most that, so there is none. Anyone on the LAN can still jam or flood the stream (denial of service), as with any Wi-Fi traffic.
+
+**How it works** (details in [section 2](#2-waylus-wi-fi-design)). Pen and touch go over UDP. Each packet repeats the previous two samples and the final state is resent shortly after, so a lost packet costs no retransmission wait. Video frames are encrypted, split into 1408-byte packets and protected with Reed-Solomon parity. A frame that can't be recovered is reported at once, and the host answers with a keyframe; the tablet keeps the last good picture meanwhile. While a Wi-Fi session runs in the foreground, the app holds Android's low-latency Wi-Fi lock (no power saving).
+
+**Getting low latency.**
+- Use 5 GHz (or 6 GHz) with a strong signal near the access point; check with `adb shell cmd wifi status` (Frequency, RSSI).
+- At a weak spot (−78 dBm in the measurements below), Android keeps scanning for a better access point, and the link stalls for ~80–200 ms every few seconds. A wired host helps, since otherwise every packet crosses the air twice.
+- Avoid 2.4 GHz if you can (measured: freezes of 0.2–1 s, [measurements](measurements.md#24-ghz)). If you must, use `--bitrate 10`.
+- The raw pen reader (full tilt on the NXTPAPER) needs adb; over Wi-Fi, without adb, the pen uses Android's events.
 
 ## 1. What Sunshine / Moonlight do
 
@@ -131,7 +164,7 @@ moonlight-common-c (`src/RtpVideoQueue.c`, `src/ControlStream.c`, `src/InputStre
   after 3 failures pairing turns off. Both sides confirm with key-confirmation MACs.
   Result: a 256-bit `pair_key` per (host, tablet), plus random 128-bit host and device ids.
 - Storage: host `~/.local/state/waylus/paired.json` (mode 0600: device id, name, key,
-  date), `waylus --unpair NAME|all`. Tablet: app-private storage, key wrapped with an
+  date; built as `wifi.json`, which also holds the host's identity), `waylus --unpair NAME|all`. Tablet: app-private storage, key wrapped with an
   Android Keystore AES key.
 - Libraries: host `p256`, `sha2`, `hkdf`, `hmac` (RustCrypto). Tablet: BouncyCastle
   (`bcprov`, MIT) for the P-256 point arithmetic SPAKE2 needs (the JCA has no point
@@ -234,7 +267,7 @@ moonlight-common-c (`src/RtpVideoQueue.c`, `src/ControlStream.c`, `src/InputStre
 - `--pair`, `--unpair`, `--listen ADDR`, `--fec PCT`, `--pace MBIT`, and maybe
   `--insecure-video` (see 2.3).
 - Bitrate: 20 Mbit/s at 1080p as now (+20 % FEC on air). On 2.4 GHz (~40 Mbit/s usable)
-  the README will recommend `--bitrate 10`. Adaptation is out of scope for the first version.
+  the docs recommend `--bitrate 10`. Adaptation is out of scope for the first version.
 
 ### 2.9 Implementation notes (where the build differs from or adds to the plan)
 - QoS tags: the host's UDP socket (video, pings) uses AF41 (WMM video); the tablet's
@@ -270,7 +303,8 @@ moonlight-common-c (`src/RtpVideoQueue.c`, `src/ControlStream.c`, `src/InputStre
 - Milestone 3: per-frame crypto cost with/without encryption; loss/FEC stats; injected
   loss on the host (`tc qdisc … netem loss 2%`) to exercise FEC and IDR recovery.
 - Milestone 5: `camera.py` (120 fps) and `pen.py` on 5 GHz and 2.4 GHz, compared with USB
-  in the README table, with method and date.
+  in the measurements table, with method and date (done 2026-11-17, see below and
+  [measurements.md](measurements.md#wi-fi-linux-host-2026-11-17)).
 
 ### Findings so far
 
@@ -345,7 +379,7 @@ runs each, 5260 MHz −67 dBm:
 - USB (AOA): pen-down → host input device p50 6.8 / p95 8.8 ms (min 2.6, max 9.3).
 - Wi-Fi: p50 9.3 / p95 15.7 ms (min 2.8, max 132). The 132 ms tap fell into one of the
   link stalls seen in the ping tests; redundancy can't help when the radio is off the
-  channel. Raw pen over a USB adb cable (README): 5.1 / 7.0 ms.
+  channel. Raw pen over a USB adb cable ([measurements](measurements.md#waylus-vs-weylus-niri-2026-11-17)): 5.1 / 7.0 ms.
 
 2026-11-17, 2.4 GHz (tablet on 2462 MHz, 802.11n, −52…−56 dBm, 72–78 Mbit/s; host
 still on 5 GHz at the same AP). Built-in stats, `barcode.html`, 2 runs each:
@@ -378,9 +412,9 @@ The Wi-Fi code is shared; what differs on a Windows host (2026-11-18, Windows 11
 
 - **Sockets.** `IP_TOS` and `SO_SNDBUF` go through `socket2`, interface addresses through `if-addrs` (up interfaces, private IPv4 only, never loopback, public or CGNAT/VPN addresses). The video UDP socket gets the same 4 MiB send buffer as on Linux.
 - **Key store.** `%LOCALAPPDATA%\waylus\wifi.json`. Waylus doesn't change its permissions: the file inherits the folder's ACL (the user, SYSTEM, Administrators; checked with `icacls`), which is the Windows counterpart of mode 0600.
-- **DSCP.** Windows ignores `IP_TOS` unless a QoS policy allows the application to set DSCP. The alternative without a policy is qWAVE (`QOSAddSocketToFlow`, `QOSTrafficTypeAudioVideo`). The host tries it for the video flow once the tablet's UDP address is known and logs `qWAVE: UDP flow to … marked` when Windows accepts it; the qWAVE service (`QWAVE`) is manual-start and not running by default, and whether the access point honours the marking was not measured, so the result is reported in the README's Windows measurements, not assumed.
+- **DSCP.** Windows ignores `IP_TOS` unless a QoS policy allows the application to set DSCP. The alternative without a policy is qWAVE (`QOSAddSocketToFlow`, `QOSTrafficTypeAudioVideo`). The host tries it for the video flow once the tablet's UDP address is known and logs `qWAVE: UDP flow to … marked` when Windows accepts it; the qWAVE service (`QWAVE`) is manual-start and not running by default, and whether the access point honours the marking was not measured, so the result is reported in the [Windows measurements](measurements.md#wi-fi), not assumed.
 - **mDNS.** `mdns-sd` starts and registers the service next to Windows' own mDNS responder (the `Dnscache` service) on port 5353 without errors (whether the tablet finds it: see the measurements). The responder is restricted to the interfaces the host listens on (`IfKind::Addr`), also on Linux, so it never answers on public or VPN interfaces.
-- **Firewall.** The first listen raises Windows Defender Firewall's dialog for `waylus.exe`; its default offers Public and Private. If the Wi-Fi network is classified *Public* (it often is), a Private-only rule doesn't cover it and the tablet can't connect. See the README, "Wi-Fi on Windows".
+- **Firewall.** The first listen raises Windows Defender Firewall's dialog for `waylus.exe`; its default offers Public and Private. If the Wi-Fi network is classified *Public* (it often is), a Private-only rule doesn't cover it and the tablet can't connect. See [windows.md, Wi-Fi on Windows](windows.md#wi-fi-on-windows).
 
 ## 4. Licensing
 - Waylus stays GPL-3.0-or-later. The design follows Sunshine/Moonlight (GPL-3.0), but
