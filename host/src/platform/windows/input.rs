@@ -23,9 +23,9 @@ use windows::Win32::{
             InjectSyntheticPointerInput, POINTER_BUTTON_CHANGE_TYPE, POINTER_CHANGE_FIFTHBUTTON_DOWN,
             POINTER_CHANGE_FIFTHBUTTON_UP, POINTER_CHANGE_FIRSTBUTTON_DOWN, POINTER_CHANGE_FIRSTBUTTON_UP,
             POINTER_CHANGE_NONE, POINTER_CHANGE_SECONDBUTTON_DOWN, POINTER_CHANGE_SECONDBUTTON_UP,
-            POINTER_CHANGE_THIRDBUTTON_DOWN, POINTER_CHANGE_THIRDBUTTON_UP, POINTER_FLAG_DOWN, POINTER_FLAG_FIFTHBUTTON,
+            POINTER_FLAG_DOWN, POINTER_FLAG_FIFTHBUTTON,
             POINTER_FLAG_FIRSTBUTTON, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_NEW,
-            POINTER_FLAG_SECONDBUTTON, POINTER_FLAG_THIRDBUTTON, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_FLAGS,
+            POINTER_FLAG_SECONDBUTTON, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_FLAGS,
             POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
         },
         WindowsAndMessaging::{
@@ -155,7 +155,7 @@ impl Pen {
         tilt: (i32, i32),
     ) -> POINTER_TYPE_INFO {
         let mut pen_flags = PEN_FLAG_NONE;
-        if self.buttons & pen_buttons::PRIMARY != 0 {
+        if self.buttons & (pen_buttons::PRIMARY | pen_buttons::SECONDARY) != 0 {
             pen_flags |= PEN_FLAG_BARREL;
         }
         if self.eraser {
@@ -188,15 +188,14 @@ impl Pen {
 
     /// Which button a contact starting now is made with, latched until the pen lifts. As
     /// with a real Windows Ink pen, the barrel button turns the contact into a second-
-    /// button one (right-click; GTK button 3); the pen's other button gives the third
-    /// button (GTK button 2), the eraser the fifth.
+    /// button one (right-click; GTK button 3), the eraser into a fifth-button one.
+    /// Windows Ink pens have one barrel button: Windows turns a third-button contact into
+    /// a plain tip contact, so the pen's second button reports as the barrel button too.
     fn contact_button(&self) -> (POINTER_FLAGS, POINTER_BUTTON_CHANGE_TYPE, POINTER_BUTTON_CHANGE_TYPE) {
         if self.eraser {
             (POINTER_FLAG_FIFTHBUTTON, POINTER_CHANGE_FIFTHBUTTON_DOWN, POINTER_CHANGE_FIFTHBUTTON_UP)
-        } else if self.buttons & pen_buttons::PRIMARY != 0 {
+        } else if self.buttons & (pen_buttons::PRIMARY | pen_buttons::SECONDARY) != 0 {
             (POINTER_FLAG_SECONDBUTTON, POINTER_CHANGE_SECONDBUTTON_DOWN, POINTER_CHANGE_SECONDBUTTON_UP)
-        } else if self.buttons & pen_buttons::SECONDARY != 0 {
-            (POINTER_FLAG_THIRDBUTTON, POINTER_CHANGE_THIRDBUTTON_DOWN, POINTER_CHANGE_THIRDBUTTON_UP)
         } else {
             (POINTER_FLAG_FIRSTBUTTON, POINTER_CHANGE_FIRSTBUTTON_DOWN, POINTER_CHANGE_FIRSTBUTTON_UP)
         }
@@ -255,6 +254,20 @@ impl Pen {
         } else if !touching && self.touching {
             self.touching = false;
             frames.push(self.frame_change(POINTER_FLAG_UP | base, self.contact.2, at, 0, tilt));
+        } else if touching && self.contact_button().0 != self.contact.0 {
+            // A button pressed or released mid-stroke. A Windows Ink contact keeps the
+            // button it started with, so end this contact and start a new one with the
+            // new button at the same spot (GTK apps such as Xournal++ only look at the
+            // button when a contact starts).
+            frames.push(self.frame_change(POINTER_FLAG_UP | base, self.contact.2, at, 0, tilt));
+            self.contact = self.contact_button();
+            frames.push(self.frame_change(
+                POINTER_FLAG_DOWN | POINTER_FLAG_INCONTACT | base | self.button_flags(),
+                self.contact.1,
+                at,
+                pressure,
+                tilt,
+            ));
         } else {
             let contact = if touching { POINTER_FLAG_INCONTACT } else { POINTER_FLAGS(0) };
             frames.push(self.frame(POINTER_FLAG_UPDATE | contact | base | self.button_flags(), at, pressure, tilt));
