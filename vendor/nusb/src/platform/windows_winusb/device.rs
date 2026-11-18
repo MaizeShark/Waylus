@@ -13,7 +13,7 @@ use std::{
 use log::{debug, error, warn};
 use windows_sys::Win32::{
     Devices::Usb::{
-        self, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface,
+        self, WinUsb_AbortPipe, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface,
         WinUsb_Initialize, WinUsb_ReadPipe, WinUsb_ResetPipe, WinUsb_SetCurrentAlternateSetting,
         WinUsb_SetPipePolicy, WinUsb_WritePipe, USB_DEVICE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE,
         WINUSB_SETUP_PACKET,
@@ -815,6 +815,16 @@ impl WindowsInterface {
         }
     }
 
+    /// Waylus patch: `WinUsb_AbortPipe`, which completes every pending transfer on the
+    /// endpoint, also under drivers that ignore `CancelIoEx`.
+    pub(crate) fn abort_pipe(&self, endpoint: u8) -> bool {
+        let ok = unsafe { WinUsb_AbortPipe(self.winusb_handle, endpoint) } == TRUE;
+        if !ok {
+            debug!("WinUsb_AbortPipe({endpoint:02x}) failed: {}", io::Error::last_os_error());
+        }
+        ok
+    }
+
     pub fn release(self: Arc<Self>) -> impl MaybeFuture<Output = Result<(), Error>> {
         Blocking::new(move || {
             if let Some(this) = Arc::into_inner(self) {
@@ -859,6 +869,11 @@ impl WindowsEndpoint {
         // can't complete out of order while we're going through them.
         for transfer in self.pending.iter_mut().rev() {
             self.inner.interface.cancel(transfer);
+        }
+        // Waylus patch: some vendor drivers (Samsung's dg_ssudbus) never complete a
+        // transfer cancelled with CancelIoEx; aborting the pipe completes them.
+        if !self.pending.is_empty() {
+            self.inner.interface.abort_pipe(self.inner.address);
         }
     }
 

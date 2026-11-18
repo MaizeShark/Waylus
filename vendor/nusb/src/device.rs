@@ -405,6 +405,13 @@ impl Interface {
         Interface { backend }
     }
 
+    /// Waylus patch (Windows only): abort every pending transfer on `endpoint` with
+    /// `WinUsb_AbortPipe`. Returns whether WinUSB accepted the request.
+    #[cfg(target_os = "windows")]
+    pub fn abort_pipe(&self, endpoint: u8) -> bool {
+        self.backend.abort_pipe(endpoint)
+    }
+
     /// Select the alternate setting of this interface.
     ///
     /// An alternate setting is a mode of the interface that makes particular endpoints available

@@ -286,6 +286,8 @@ AMF and QSV are implemented but **untested**: the development machine has an NVI
 
   This replaces the driver of that one interface; adb and the tablet's other uses are unaffected.
 
+Samsung's driver never completes a USB transfer that is cancelled the usual way, and that is also what Windows does when a process ends. Waylus therefore aborts its accessory transfers itself when it stops (Ctrl-C, closing the window, the session ending). If it is killed hard instead (Task Manager's *End task*, `taskkill /F`), the process stays half-closed, holding `waylus.exe` and the accessory interface, until the tablet is unplugged; unplug it once and start again.
+
 To switch the tablet into accessory mode at all, Waylus has to open the tablet's own USB interface, which Windows' adb server holds, so it runs `adb kill-server` at that point (the next adb call starts the server again).
 
 ### Wi-Fi on Windows

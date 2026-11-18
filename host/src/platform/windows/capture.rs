@@ -126,7 +126,8 @@ impl State {
 fn virtual_monitor(size: (u32, u32)) -> Result<monitors::Monitor> {
     let Some(m) = monitors::list().into_iter().find(|m| m.is_virtual()) else {
         anyhow::bail!(
-            "no virtual monitor found: install an Indirect Display driver such as Virtual-Display-Driver              (README, \"Virtual monitor\"), or mirror a real monitor with --output"
+            "no virtual monitor found: install an Indirect Display driver such as Virtual-Display-Driver \
+             (README, \"Virtual monitor\"), or mirror a real monitor with --output"
         );
     };
     let fps = m.refresh_hz.max(60);
@@ -140,7 +141,8 @@ fn virtual_monitor(size: (u32, u32)) -> Result<monitors::Monitor> {
         }
         Some(mode) => {
             info!(
-                "the virtual monitor offers no {}x{} mode (closest: {}x{} @ {} Hz); add it to the driver's vdd_settings.xml                  and restart the driver to get the exact size",
+                "the virtual monitor offers no {}x{} mode (closest: {}x{} @ {} Hz); add it to the driver's vdd_settings.xml \
+                 and restart the driver to get the exact size",
                 size.0, size.1, mode.0, mode.1, mode.2
             );
             monitors::set_mode(&m.name, mode)?;

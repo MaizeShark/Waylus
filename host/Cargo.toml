@@ -1,6 +1,6 @@
 [package]
 name = "waylus"
-description = "Use an Android tablet as a low-latency pen display on Wayland over USB"
+description = "Use an Android tablet as a low-latency pen display on Wayland or Windows over USB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -42,6 +42,10 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 glow = "0.18"
 
 # Windows 10/11: Windows.Graphics.Capture + D3D11, synthetic pointer input.
+[target.'cfg(windows)'.dependencies]
+# Also run the exit handler when the console window is closed (it frees the USB link).
+ctrlc = { version = "3", features = ["termination"] }
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [

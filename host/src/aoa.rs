@@ -159,6 +159,12 @@ impl Aoa {
     /// (unplugged), reconnects first.
     pub fn next_link(&mut self) -> Result<Link> {
         loop {
+            if EXITING.load(Ordering::Relaxed) {
+                // Parks the session thread: opening a new link would queue new transfers.
+                loop {
+                    thread::park();
+                }
+            }
             if self.iface.is_none() {
                 self.connect(None)?;
             }
@@ -288,8 +294,43 @@ fn switch(d: &DeviceInfo) -> Result<u16> {
     Ok(version)
 }
 
+/// The accessory interface in use and its bulk endpoints, for [`abort`].
+static CLAIMED: std::sync::Mutex<Option<(Interface, u8, u8)>> = std::sync::Mutex::new(None);
+
+/// Completes the bulk transfers still pending on the accessory link. Call before the
+/// process exits: on Windows, Samsung's USB driver never completes a transfer cancelled
+/// the normal way (`CancelIoEx`, which is also what process exit does), and a process
+/// with such a transfer outstanding can't end until the tablet is unplugged.
+pub fn abort() {
+    // The reader and writer stop submitting transfers first; an aborted read would
+    // otherwise be replaced by a new one right away.
+    EXITING.store(true, Ordering::SeqCst);
+    #[cfg(windows)]
+    if let Ok(c) = CLAIMED.try_lock()
+        && let Some((iface, ep_in, ep_out)) = c.as_ref()
+    {
+        // Repeat for the transfers submitted while the first abort was completing.
+        for _ in 0..4 {
+            let (a, b) = (iface.abort_pipe(*ep_in), iface.abort_pipe(*ep_out));
+            debug!("USB accessory: pipes aborted (in {a}, out {b})");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Set by [`abort`]: no new transfers on the accessory link.
+static EXITING: AtomicBool = AtomicBool::new(false);
+
 /// Claims the accessory interface (the vendor one with a bulk IN/OUT pair, not adb).
 fn claim(d: &DeviceInfo) -> Result<(Interface, u8, u8)> {
+    let claimed = claim_inner(d)?;
+    if let Ok(mut c) = CLAIMED.lock() {
+        *c = Some(claimed.clone());
+    }
+    Ok(claimed)
+}
+
+fn claim_inner(d: &DeviceInfo) -> Result<(Interface, u8, u8)> {
     let dev = d.open().wait().context("open accessory")?;
     let cfg = dev.active_configuration().context("accessory configuration")?;
     for group in cfg.interfaces() {
@@ -350,6 +391,9 @@ fn wait_sync(r: &mut impl BufRead) -> Result<u64> {
     let pat = proto::SYNC_PREFIX;
     let mut matched = 0;
     loop {
+        if EXITING.load(Ordering::Relaxed) {
+            bail!("exiting");
+        }
         let buf = match r.fill_buf() {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
@@ -397,7 +441,7 @@ struct UsbRead {
 impl Read for UsbRead {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stop.load(Ordering::Relaxed) || EXITING.load(Ordering::Relaxed) {
                 return Err(io::ErrorKind::NotConnected.into());
             }
             match self.inner.read(buf) {
@@ -422,9 +466,15 @@ struct UsbWriter(EndpointWrite<Bulk>);
 
 impl Write for UsbWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if EXITING.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::NotConnected.into());
+        }
         self.0.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
+        if EXITING.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::NotConnected.into());
+        }
         self.0.submit_end();
         Ok(())
     }

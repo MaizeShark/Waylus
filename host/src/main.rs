@@ -346,6 +346,7 @@ fn main() -> Result<()> {
         lazy,
     );
     platform::on_exit();
+    aoa::abort();
     result
 }
 
@@ -363,11 +364,14 @@ fn install_exit_handler(adb: Option<adb::Adb>, reverse_port: Option<u16>, keep_a
             platform::exit_now(130);
         }
         eprintln!("\nstopping…");
-        platform::on_exit();
+        // Armed first, so that nothing below (releasing the input devices, adb) can keep
+        // the process alive.
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(3));
             platform::exit_now(1);
         });
+        platform::on_exit();
+        aoa::abort();
         if let Some(adb) = &adb {
             if let Some(port) = reverse_port {
                 adb.remove_reverse(port);
