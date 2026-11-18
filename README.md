@@ -73,23 +73,37 @@ Back-pressure (`--max-in-flight`, default 3; 2 until 2026-11-17, used for the nu
 
 ### Other Linux tablet-as-monitor tools
 
-Measured 2026-11-18 on the same desktop, tablet and USB cable as above, in a KDE Plasma 6.8.3 session (UScreen and MoreSpace create their monitor through the EVDI kernel module, which niri can't drive while it renders on an NVIDIA GPU: `NoSupportedRendererFormat`, see [niri#3625](https://github.com/niri-wm/niri/issues/3625)). Both of them only extend the desktop, so their extra monitor was set to mirror DP-2 (`kscreen-doctor output.<name>.mirror.DP-2`) and filmed against DP-2 exactly as in ². To compare the same path, Waylus streamed a KDE virtual monitor mirroring DP-2 the same way. Defaults were kept except where noted.
+Measured 2026-11-18 on the same desktop, tablet and USB cable as above, in a KDE Plasma 6.8.3 session. UScreen and MoreSpace create their monitor through the EVDI kernel module, which niri can't drive while it renders on an NVIDIA GPU (`NoSupportedRendererFormat`, see [niri#3625](https://github.com/niri-wm/niri/issues/3625)), and Moreland's virtual monitor needs KWin or Hyprland. All of them extend the desktop rather than mirror it, so their extra monitor was made to show DP-2 and filmed against DP-2 exactly as in ²: EVDI monitors were set to mirror it (`kscreen-doctor output.<name>.mirror.DP-2`); Moreland's KWin virtual monitor was placed exactly on top of DP-2 instead, because KWin stops streaming a virtual monitor that mirrors another one. Waylus streamed a KDE virtual monitor mirroring DP-2, the same path as the EVDI tools. Defaults were kept except where noted.
 
-| | Waylus | [UScreen](https://github.com/majmichu1/UScreen) 1.2.15 | [MoreSpace](https://morespaceapp.com/) 0.6.7 |
+| | Waylus | [Moreland](https://github.com/adiimanav/moreland) 0.3.0 | [UScreen](https://github.com/majmichu1/UScreen) 1.2.15 | [MoreSpace](https://morespaceapp.com/) 0.6.7 |
+|---|---|---|---|---|
+| **Tablet behind the real monitor, photon to photon** ² | p50 **50 ms** / p95 **60 ms** (p5 31, p99 70; n = 517) | p50 **56 ms** / p95 **65 ms** (p5 39, p99 73; n = 790) ⁸ | p50 **65 ms** / p95 **79 ms** (p5 45, p99 82; n = 544) ⁶ | p50 **103 ms** / p95 **117 ms** (p5 84, p99 123; n = 999) ⁷ |
+| **Pen-down on the tablet → event on the host's input device** ³ | p50 **4.9 ms** / p95 **6.5 ms** (max 6.8; n = 30) | p50 **8.0 ms** / p95 **23.0 ms** (max 46; n = 31) | p50 **8.5 ms** / p95 **11.9 ms** (max 12.3; n = 30) | p50 **8.0 ms** / p95 **63.5 ms** (max 241; n = 31) |
+| Stream | 1920×1080, 60 fps, 20 Mbit/s, NVENC H.264 | 1920×1080, 60 fps (its default is 90), 20 Mbit/s, NVENC H.264 via GStreamer | 1920×1080 (set by hand ⁶), 60 fps, 20 Mbit/s, NVENC H.264 | 1920×1280 (width set to 1920; it keeps the tablet's 3:2), 60 Hz, ~8.8 Mbit/s (its automatic value), **software** H.264 ⁷ |
+| Capture | Screencast portal (PipeWire DMA-BUF) | KWin screencast protocol (PipeWire) | EVDI | EVDI |
+| Transport | USB accessory (AOA) | `adb forward` | `adb` port forwarding | USB |
+| Licence | GPL-3.0-or-later | Apache-2.0 | MIT | Proprietary; Google sign-in, €17 after a 48 h trial |
+
+Waylus mirroring DP-2 directly (its normal mode, no extra monitor) measured p50 46 / p95 59 ms (p5 22, p99 69; n = 503) in the same session, the same as on niri: the KDE copy into a separate output costs it ~4 ms, and the compositor makes no difference. The pen tails (Moreland, MoreSpace) are real: the clock drift during each run was below 0.05 ms.
+
+⁶ UScreen sizes its monitor to the tablet's native resolution by default (2400×1600 here, `auto_resolution`). That measured p50 93 / p95 123 ms (p5 58, p99 134; n = 906): 2400×1600 is above what this tablet's decoder is rated for (15 000 vs 14 400 macroblocks per frame), and decode time grows with resolution (Waylus logs ~14 ms at 1080p and ~23 ms at 2160×1440 on this tablet). The table uses 1920×1080 so that all tools decode about the same amount. The pen was measured at 2400×1600; pen latency doesn't depend on the stream.
+
+⁷ MoreSpace encodes in hardware only through VAAPI, which NVIDIA doesn't provide, so on this machine it falls back to Cisco's OpenH264 software encoder (`morespace codec install-openh264`). It would hardware-encode on an Intel or AMD GPU with VAAPI H.264 CBR support. The test laptop's Kaby Lake iGPU has none (constant-QP only), so that comparison is still open. Its default codec preference is HEVC, which also needs VAAPI. On niri it doesn't start (the EVDI limitation above; it also needs `wlr-randr`).
+
+⁸ Built from source at commit e333374 with `--features plasma`, run as `moreland --width 1920 --height 1080 --fps 60 --bitrate 20000`. Its own statistics for the run: NVENC encode p50 6.2 ms, tablet decode p50 25.4 ms. Waylus decodes 1080p on this tablet in ~14–19 ms, probably helped by keeping the tablet's clocks up while streaming (`--boost`, see below).
+
+#### Moonlight (Wi-Fi)
+
+[Moonlight](https://moonlight-stream.org/) with [Sunshine](https://github.com/LizardByte/Sunshine) is a game-streaming pair, not a pen display, but it is the reference for low-latency streaming over Wi-Fi and forwards the pen. It only runs over the network, so it was compared with `waylus --wifi`, in the same session as the table above, one after the other: tablet on 5260 MHz (802.11ac, −63…−64 dBm, 351 Mbit/s), host on Wi-Fi via the same access point.
+
+| Wi-Fi 5 GHz | Waylus `--wifi --no-usb` | Moonlight 12.2 + Sunshine 2026.914, H.264 | same, HEVC (Moonlight's default) |
 |---|---|---|---|
-| **Tablet behind the real monitor, photon to photon** ² | p50 **50 ms** / p95 **60 ms** (p5 31, p99 70; n = 517) | p50 **65 ms** / p95 **79 ms** (p5 45, p99 82; n = 544) ⁵ | p50 **103 ms** / p95 **117 ms** (p5 84, p99 123; n = 999) ⁶ |
-| **Pen-down on the tablet → event on the host's input device** ³ | p50 **4.9 ms** / p95 **6.5 ms** (max 6.8; n = 30) | p50 **8.5 ms** / p95 **11.9 ms** (max 12.3; n = 30) | p50 **8.0 ms** / p95 **63.5 ms** (max 241; n = 31) |
-| Stream | 1920×1080, 60 fps, 20 Mbit/s, NVENC H.264 | 1920×1080 (set by hand ⁵), 60 fps, 20 Mbit/s, NVENC H.264 | 1920×1280 (width set to 1920; it keeps the tablet's 3:2), 60 Hz, ~8.8 Mbit/s (its automatic value), **software** H.264 ⁶ |
-| Transport | USB accessory (AOA) | `adb` port forwarding | USB |
-| Licence | GPL-3.0-or-later | MIT | Proprietary; Google sign-in, €17 after a 48 h trial |
+| **Tablet behind the real monitor, photon to photon** ² | p50 **49 ms** / p95 **62 ms** (p5 30, p99 70; n = 629) ⁹ | p50 **67 ms** / p95 **79 ms** (p5 48, p99 80; n = 721) | p50 **60 ms** / p95 **74 ms** (p5 37, p99 79; n = 595) |
+| **Pen-down → host input device** ³ | p50 **9.4 ms** / p95 **15.0 ms** (max 16.2; n = 31; Android pen events, `--no-raw-pen`) | p50 **7.4 ms** / p95 **10.3 ms** (max 12.8; n = 30) | |
 
-Waylus mirroring DP-2 directly (its normal mode, no extra monitor) measured p50 46 / p95 59 ms (p5 22, p99 69; n = 503) in the same session, the same as on niri: the KDE copy into a separate output costs it ~4 ms, and the compositor makes no difference.
+Sunshine captured DP-2 through KMS (`output_name = DP-2`) and encoded with NVENC; Moonlight at 1080p, 60 fps, 20 Mbit/s (Sunshine reports ~15 Mbit/s of video after its FEC share), frame pacing "Prefer lowest latency".
 
-⁵ UScreen sizes its monitor to the tablet's native resolution by default (2400×1600 here, `auto_resolution`). That measured p50 93 / p95 123 ms (p5 58, p99 134; n = 906): 2400×1600 is above what this tablet's decoder is rated for (15 000 vs 14 400 macroblocks per frame), and decode time grows with resolution (Waylus logs ~14 ms at 1080p and ~23 ms at 2160×1440 on this tablet). The table uses 1920×1080 so that both tools decode the same amount. The pen was measured at 2400×1600; pen latency doesn't depend on the stream.
-
-⁶ MoreSpace encodes in hardware only through VAAPI, which NVIDIA doesn't provide, so on this machine it falls back to Cisco's OpenH264 software encoder (`morespace codec install-openh264`). It would hardware-encode on an Intel or AMD GPU with VAAPI H.264 CBR support. The test laptop's Kaby Lake iGPU has none (constant-QP only), so that comparison is still open. Its default codec preference is HEVC, which also needs VAAPI. On niri it doesn't start (the EVDI limitation above; it also needs `wlr-randr`). The pen's long tail was real: the two clocks drifted by 0.04 ms during the run.
-
-[Moreland](https://github.com/adiimanav/moreland) was not measured: it has no pen or touch input, and on niri it has no capture path (it needs `ext-image-copy-capture-v1` or KWin's own screencast protocol).
+⁹ 25 of 654 tablet readings (3.8 %) sat at 89–283 ms, clustered around 190 ms, and are left out of the figures as outliers. They look like real stalls (a frame lost beyond what the FEC repairs, then a keyframe), not misreads; with them included: p50 49 / p95 70 / p99 239 ms. Moonlight's run had no such cluster (its 4 dropped readings out of 725 were misreads, and its p99 with everything included is 81 ms). Its recovery over Wi-Fi is the more robust of the two, and its pen over Wi-Fi is faster; both are open items for Waylus's Wi-Fi mode.
 
 ## Requirements
 
