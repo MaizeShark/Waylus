@@ -102,6 +102,11 @@ pub fn monotonic_ns() -> u64 {
     (t as u128 * 1_000_000_000 / freq as u128) as u64
 }
 
+/// `waylus --test-input`.
+pub fn test_input(output: Option<&str>) -> Result<()> {
+    input::selftest(output)
+}
+
 /// `waylus --list-outputs`.
 pub fn list_outputs() {
     monitors::print();

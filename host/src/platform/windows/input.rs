@@ -297,3 +297,56 @@ impl Touch {
         self.handle(&[])
     }
 }
+
+/// `waylus --test-input`: draws a few pen strokes and a two-finger pinch on the target
+/// monitor, to check pressure, tilt, hover, buttons and touch with a pointer listener.
+pub fn selftest(output: Option<&str>) -> Result<()> {
+    use crate::proto::{PenSample, TouchPoint, pen_buttons, pen_state};
+    let target = InputTarget { area: crate::platform::AreaMm { width: 100.0, height: 60.0 }, geometry: None, output_name: output };
+    let mut pen = Pen::new(&target)?;
+    let mut touch = Touch::new(&target)?;
+    let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+    let sample = |state: u8, x: f64, y: f64, pressure: f64, tilt: i16, buttons: u8| PenSample {
+        state,
+        x: (x * 65535.0) as u16,
+        y: (y * 65535.0) as u16,
+        pressure: (pressure * 65535.0) as u16,
+        tilt_x: tilt,
+        tilt_y: -tilt / 2,
+        buttons,
+        t_ns: 0,
+    };
+    println!("hover");
+    for i in 0..30 {
+        pen.handle(&sample(pen_state::HOVER, 0.2 + i as f64 * 0.01, 0.3, 0.0, 0, 0))?;
+        sleep(8);
+    }
+    println!("stroke with pressure ramp and tilt");
+    for i in 0..120 {
+        let t = i as f64 / 119.0;
+        pen.handle(&sample(pen_state::CONTACT, 0.2 + 0.6 * t, 0.4, t, (t * 4500.0) as i16, 0))?;
+        sleep(8);
+    }
+    println!("hover again, barrel button");
+    for i in 0..30 {
+        pen.handle(&sample(pen_state::HOVER, 0.8, 0.5, 0.0, 0, pen_buttons::PRIMARY))?;
+        sleep(8);
+    }
+    println!("eraser stroke");
+    for i in 0..60 {
+        let t = i as f64 / 59.0;
+        pen.handle(&sample(pen_state::CONTACT, 0.8 - 0.6 * t, 0.6, 0.5, 0, pen_buttons::ERASER))?;
+        sleep(8);
+    }
+    pen.handle(&sample(pen_state::OUT, 0.2, 0.6, 0.0, 0, 0))?;
+    println!("two-finger pinch");
+    for i in 0..60 {
+        let d = 0.05 + 0.2 * i as f64 / 59.0;
+        let p = |id, x: f64, y: f64| TouchPoint { id, x: (x * 65535.0) as u16, y: (y * 65535.0) as u16, };
+        touch.handle(&[p(7, 0.5 - d, 0.5), p(9, 0.5 + d, 0.5)])?;
+        sleep(8);
+    }
+    touch.reset()?;
+    println!("done");
+    Ok(())
+}

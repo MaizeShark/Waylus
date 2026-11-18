@@ -34,6 +34,11 @@ struct Args {
     #[cfg(windows)]
     #[arg(long)]
     list_outputs: bool,
+    /// Inject a test pen stroke and pinch on the --output monitor and exit (for checking
+    /// pressure, tilt and touch with a pointer listener).
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    test_input: bool,
     /// Output being mirrored: a connector name such as DP-2 (Linux; used for the niri
     /// mapping hint and, with --no-video, for the aspect ratio), or a monitor number or
     /// name from --list-outputs (Windows).
@@ -137,6 +142,10 @@ fn main() -> Result<()> {
     if args.list_outputs {
         platform::list_outputs();
         return Ok(());
+    }
+    #[cfg(windows)]
+    if args.test_input {
+        return platform::test_input(args.output.as_deref());
     }
     #[cfg(target_os = "linux")]
     if args.niri_setup {
