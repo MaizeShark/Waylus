@@ -131,12 +131,11 @@ impl Adb {
     }
 }
 
+/// Hex SHA-256 of a local file, as `sha256sum` prints it (Windows has no `sha256sum`).
 fn sha256_local(p: &Path) -> Result<String> {
-    let out = Command::new("sha256sum").arg(p).output().context("sha256sum")?;
-    if !out.status.success() {
-        bail!("cannot hash {}", p.display());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or_default().to_owned())
+    use sha2::{Digest, Sha256};
+    let data = std::fs::read(p).with_context(|| format!("cannot read {}", p.display()))?;
+    Ok(Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Looks for the client APK next to the executable or in the source tree.
@@ -154,4 +153,16 @@ pub fn find_apk() -> Option<PathBuf> {
         roots.push(cwd);
     }
     roots.iter().flat_map(|r| rel.iter().map(move |p| r.join(p))).find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sha256_local_is_lowercase_hex() {
+        let p = std::env::temp_dir().join(format!("waylus-sha256-test-{}", std::process::id()));
+        std::fs::write(&p, b"abc").unwrap();
+        let hash = super::sha256_local(&p);
+        std::fs::remove_file(&p).ok();
+        assert_eq!(hash.unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
 }
