@@ -15,6 +15,7 @@ map it by hand or use --output-rect). Coordinates are fractions of that output.
   scenario.py drag     [--seconds 10]   Super + left button drag (niri/KDE: move window)
   scenario.py keys K [K ...]              press keys/chords (e.g. 1, RIGHTBRACE, CTRL+Z)
   scenario.py tap X,Y [X,Y ...]           pen taps at these points (fractions of the output)
+  scenario.py mclick --at X,Y             a mouse click there
   scenario.py mstroke / mwrite            the stroke / write paths drawn with the mouse
                                           (left button), for apps that ignore a second tablet
 
@@ -211,6 +212,16 @@ def write_fn(a):
     return f
 
 
+def mouse_click(mouse):
+    """A left click where the pointer is (put it there with --at)."""
+    mouse.write(e.EV_KEY, e.BTN_LEFT, 1)
+    mouse.syn()
+    time.sleep(0.05)
+    mouse.write(e.EV_KEY, e.BTN_LEFT, 0)
+    mouse.syn()
+    time.sleep(0.1)
+
+
 def scroll(mouse, a):
     half = a.seconds / 2
     for i, t in ticks(a.seconds):
@@ -256,7 +267,7 @@ def tap(pen, a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("scenario", choices=["stroke", "write", "hover", "mouse", "scroll", "drag", "keys", "tap", "mstroke", "mwrite"])
+    ap.add_argument("scenario", choices=["stroke", "write", "hover", "mouse", "scroll", "drag", "keys", "tap", "mstroke", "mwrite", "mclick"])
     ap.add_argument("keys", nargs="*", help="for `keys`")
     ap.add_argument("--seconds", type=float, default=10)
     ap.add_argument("--box", default="0.2,0.2,0.8,0.8", help="area for pen scenarios, fractions x0,y0,x1,y1")
@@ -291,6 +302,7 @@ def main():
             "tap": lambda: tap(pen, a),
             "mstroke": lambda: mouse_path(mouse, a, stroke_fn(a)),
             "mwrite": lambda: mouse_path(mouse, a, write_fn(a)),
+            "mclick": lambda: mouse_click(mouse),
         }[a.scenario]()
     finally:
         pen.leave()

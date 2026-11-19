@@ -2,11 +2,12 @@
 
 An experiment: send the small parts of the screen that change while drawing (the stroke, the cursor) to the tablet as raw pixels, next to the H.264 stream, so they skip the tablet's hardware decoder. The decoder is the largest stage on the TCL NXTPAPER 14 (MT8781): ~19 ms per frame with the pen idle, ~11.5 ms while drawing ([where the time goes](measurements.md#where-the-time-goes)).
 
-Status (2026-11-19): **phase 1 done on niri and the NXTPAPER 14; the decision gate passed. Phase 2: a working prototype, `waylus --fast-patches` (off by default, Linux host, USB, Android 13+).** Phase 3 (measuring the result) is in progress. Still open from phase 1: compositor damage on KDE and GNOME, Windows dirty regions, and the tablet benchmark on the Pixel 7a (see [open items](#open-items)).
+Status (2026-11-19): **phase 1 done on niri and the NXTPAPER 14; the decision gate passed. Phase 2: a working prototype, `waylus --fast-patches` (off by default, Linux host, USB, Android 13+).** Phase 3: the built-in measurements are done; the camera measurement (what you see on the glass) needs someone to film it (see [phase 3](#phase-3-results)). Still open from phase 1: compositor damage on KDE and GNOME, Windows dirty regions, and the tablet benchmark on the Pixel 7a (see [open items](#open-items)).
 
 Contents:
 - [Phase 1: measurements](#phase-1-measurements): [is the damage small?](#1-is-the-damage-small), [the tablet path](#2-the-tablet-path), [what USB carries](#3-what-usb-carries), [decision](#decision)
 - [Phase 2: the prototype](#phase-2-the-prototype): [host](#host), [protocol](#protocol), [tablet](#tablet), [what didn't work](#what-didnt-work-on-the-tablet), [Wi-Fi](#wi-fi)
+- [Phase 3: results](#phase-3-results): [strokes](#strokes-built-in-statistics), [scrolling and dragging](#scrolling-and-dragging-windows), [composition](#composition), [not measured yet](#not-measured-yet)
 - [Open items](#open-items)
 - [Dev flags and tools](#dev-flags-and-tools)
 
@@ -108,7 +109,7 @@ Consequences for the prototype, from the numbers above:
 `host/src/patch.rs`, called from the Linux capture (`platform/linux/capture.rs`):
 - The session passes the pen position (from the app's pen events or the raw stylus stream) to the capture side. While the pen was seen in the last 0.5 s, each frame passed on to the encoder is followed by a look at a **512×512 window around the pen** in the scaled stream picture: on the zero-copy path a `glReadPixels` of that window from the texture the frame was blitted and scaled into (the same pixels the encoder gets), on the CPU path a copy out of the frame.
 - That window is compared with what the host saw there before, in 16×16 tiles (a full-frame copy of the last pixels read). Tiles that changed are merged into rectangles (as in phase 1), forced opaque, and LZ4-compressed as RGBA. A tile the window moves onto for the first time is only remembered, not sent: there is nothing to compare it with, and what is there is most likely already on screen.
-- Patches above 64 KB (LZ4) per frame, or more than 255 rectangles, are dropped: that frame is left to H.264. A sender thread of its own writes them right away, so they never wait behind back-pressure or the encoder; if it is still busy with the previous frame's patches, the new ones are dropped, never queued.
+- Frames in which more than an eighth of the window's tiles changed, or whose patches are larger than 64 KB after LZ4 (or more than 255 rectangles), are left to H.264 alone. The share matters more than the size: scrolling text compresses so well that it stayed under 64 KB, but a patched window would run ahead of the rest of the screen and show as a seam (see [phase 3](#scrolling-and-dragging-windows)). A sender thread of its own writes them right away, so they never wait behind back-pressure or the encoder; if it is still busy with the previous frame's patches, the new ones are dropped, never queued.
 - The frame goes to the encoder *before* the window is read back, so the video is never held up by it. The look takes ~1 ms per frame on the capture thread (RTX 4060; readback, diff and LZ4 of a typical drawing frame).
 - Over Wi-Fi patches stay off. On Windows the capture doesn't make them yet (it would need a D3D11 readback of the window); on Linux the CPU path and the zero-copy paths do (tested: CUDA/NVENC; the VAAPI path reads from the same texture but is untested).
 - With `-v` the host logs a `patches:` line every 5 s: frames sent, size, the capture side's work and drops, and capture → received / handed to the compositor on the tablet.
@@ -141,8 +142,53 @@ Measured on the NXTPAPER 14 with `dumpsys SurfaceFlinger` and the per-patch log,
 
 Patches are off over Wi-Fi. They would need their own design there: the video already uses FEC over UDP, and a patch is only worth sending if it arrives before the video frame, so it would need its own small FEC block per frame (a lost patch costs nothing, but a late one is useless), pacing so that bursts don't add to the airtime the video needs, and the host's Wi-Fi link estimate to decide when a frame's patches are still cheaper than waiting for the decoder. Over a weak link (sent → received ~8 ms for a whole frame) the gain over the decoder would be smaller than over USB.
 
+## Phase 3: results
+
+All on the NXTPAPER 14 over USB accessory mode, niri, mirroring DP-2 (1920×1080, 75 Hz), release builds, 2026-11-19, stats display off. Pen strokes are injected on the tablet with `adb shell input stylus swipe` (varying straight lines, 0.7 s each, back to back) and go the whole way: Android → app → host → the host's virtual pen → the drawing app; host with `--no-raw-pen`, since injected events don't reach the raw stylus device. The drawing app is `tools/latency/draw.html` full screen in Chrome (4 px line, clears itself every 6 s). Injected input keeps Android's input boost on, as real drawing does.
+
+### Strokes (built-in statistics)
+
+Three runs with and three without `--fast-patches`, alternating, ~25 s each; per run the median of its 5 s windows (the first window dropped). The video's capture → shown and the patches' capture → drawn end at the same point: handed to the tablet's compositor ([method](measurements.md#small-changes-and-strokes-fast-patches)). In ms, p50 / p95:
+
+| | Without | With `--fast-patches` |
+|---|---|---|
+| **Stroke on the tablet: patch, capture → handed to the compositor** | – | **5.3–6.3 / 12.5–13.2** |
+| Video, capture → handed to the compositor (capture → shown) | 16.3–16.4 / 21.3–21.5 | 17.4–17.6 / 22.3–22.8 |
+| Video, capture → received | 3.9–4.0 / 8.8–9.1 | 4.1–4.3 / 9.1–9.4 |
+| Video, sent → received (link) | 1.5 / 2.0–2.1 | 1.6–1.7 / 2.2–2.5 |
+| Video, decode on the tablet | 10.8–10.9 / 12.0–12.9 | 11.3–11.5 / 13.2–13.9 |
+| Patch, capture → received | – | 2.3–2.4 / 9.5–10.1 |
+| Pen → host (Android pen events) | 1.3 / 1.8 | 1.4 / 2.0–2.1 |
+
+- **The stroke reaches the tablet's compositor ~11 ms earlier** than through the decoder (p50 5.3–6.3 vs 16.3–16.4 ms). Whether it also reaches the glass 11 ms earlier is for the camera to show; both then wait for the same compositor and panel.
+- Patches went out for 97–100 % of the frames looked at (0–1 per 5 s window dropped as too large), 1.2 KB per frame after LZ4 (9.3 KB of pixels).
+- **Cost: the video gets ~1 ms slower while patches flow** (p50 +1.1 ms), mostly in the tablet's decoder (+0.6 ms) and a little on the link (+0.2 ms). The patch layer's work on the tablet (decompressing, uploading, drawing, one more hardware plane) competes with the decoder. Drawing only the bounding box of the patches instead of the whole 2400×1350 layer didn't measurably change it (+1.0 ms at p50 before, +1.1 ms after, on different content). The video is unchanged when the pen is away: nothing is read back, and the layer is hidden.
+- Host: reading the window back takes ~2.4 ms per frame with Chrome drawing (0.8–1.0 ms with Krita in earlier runs), and capture → patch written ~3.5 ms on average. It runs after the frame has gone to the encoder, so the video doesn't wait for it, but it is now the largest part of the patch's own latency. Copying the window out of the CUDA frame the encoder already has, instead of a synchronous `glReadPixels`, might cut it; not tried.
+- An earlier A/B in Krita (Krita's canvas full of black, so the strokes changed few pixels; the patch layer then drawn in full) gave patches 3.5–3.7 ms and the video 15.6–15.9 ms without vs 16.5–17.1 ms with, the same picture.
+
+### Scrolling and dragging windows
+
+Patches must step aside for big changes and never queue. Tested with `WAYLUS_PATCH_AT=0.3,0.5` (window fixed where the action is, since injected pen contact stops Chrome from scrolling):
+- **Scrolling** a long page in Chrome (arrow keys, smooth scrolling): 300 of 300 frames per 5 s window left to H.264 as too large, none sent; the link's sent → received p50 2.1–2.2 ms with and without. Before the share limit existed, the scrolling text went out as 50 KB patches (620 KB of pixels) per frame, below the 64 KB cap, and the link's sent → received rose from 2.2 to 3.4 ms.
+- **Dragging a window** (a floating terminal moved back and forth across the window with `niri msg action move-floating-window`): ~70 % of the frames left to H.264; ~10 % sent as slivers of the moving window's edge (~9 KB); link unchanged (sent → received 2.0–2.2 ms with and without). Those slivers can show the window's edge a little ahead of the rest for a frame.
+- Nothing queued in any test ("sender busy" stayed 0; the sender drops instead).
+
+### Composition
+
+`dumpsys SurfaceFlinger` with patches on screen: the video layer and the patch layer (`bbq-wrapper`, the layer's buffer queue) both `composition=DEVICE`, i.e. hardware planes; none on the GPU. After the last patch is cleared the layer is hidden. Checked visually with `debug.waylus.patchtint` (patches drawn reddish) that patches sit exactly under the cursor and nothing stays behind.
+
+### Not measured yet
+
+- **The camera measurement** (pen to stroke on the glass): needs filming; the method is in [measurements.md](measurements.md#small-changes-and-strokes-fast-patches). Until then the gain on the glass is an estimate: ~11 ms earlier at the compositor, from the table above.
+- Flicker when a patch is replaced by its H.264 version (RGB vs YUV 4:2:0 at sharp edges): not visible in screenshots, which only show one moment; the camera clips will tell. Patches are removed two vsyncs after the decoder reports the matching frame.
+- The Pixel 7a (screen was locked), KDE and GNOME, the Windows host.
+- Real pen strokes with the raw stylus reader: the code path is the same (pen position from the raw stream), but all strokes here were injected.
+
+**Seen while measuring, not caused by patches**: in 2 of 7 short runs with the small barcode page (`barcode.html?box=…`, otherwise static screen, idle clocks), one of them without `--fast-patches`, the tablet stopped acknowledging most video frames for the whole run: 10.5 fps, back-pressure held the encoder back ~915 ms per second and gave up after 250 ms each time. Not reproduced in 5 further runs; cause unknown.
+
 ## Open items
 
+- The camera measurement and the other phase 3 items [not measured yet](#not-measured-yet).
 - KDE Plasma and GNOME: run the same scenarios with `WAYLUS_DAMAGE_LOG` (without `WAYLUS_NO_ZEROCOPY` it logs the compositor's damage only) for a monitor and a virtual output, to see whether the reported damage is as small as the pixel diff.
 - Windows 11: the same on the Windows host (dirty regions; the LZ4 sizes need a readback that isn't there on Windows yet).
 - Pixel 7a: the tablet benchmark and the link benchmark (USB 3: how much larger patches can get, and whether raw 1080p60 NV12 at ~190 MB/s is realistic).
@@ -156,5 +202,7 @@ None of these are for normal use; all are off unless set.
 - `WAYLUS_DAMAGE_LOG=file.csv` (host, Linux and Windows): asks the compositor for damage and writes one CSV line per frame passed on: the compositor's rectangles, their 16×16 tile patches as BGRA bytes, and (with `WAYLUS_NO_ZEROCOPY=1`, Linux) the pixel diff and the LZ4 sizes. `tools/damage/analyze.py file.csv` prints percentiles.
 - `tools/damage/scenario.py stroke|write|hover|mouse|scroll|drag|mstroke|mwrite|keys|tap`: synthetic input through uinput for repeatable scenarios (`--help`).
 - `WAYLUS_BENCH_LINK=1` (host): the link benchmark above instead of streaming.
+- `WAYLUS_PATCH_AT=x,y` (host, fractions of the frame): with `--fast-patches`, look at this point all the time as if the pen hovered there (for tests without a pen).
+- `tools/latency/draw.html?size=4&clear=6`: a drawing surface that clears itself; `tools/latency/barcode.html?box=256x128`: the latency barcode as a small box.
 - `am start -n de.hut9.waylus/dev.waylus.MainActivity --es bench_damage LABEL [--ez bench_boost true]` (app): the tablet benchmark above; results in logcat, lines starting with `dbench`.
 - `adb shell setprop debug.waylus.patchlog 1` / `debug.waylus.patchtint 1` / `debug.waylus.patchtest 1` (app): see [tablet](#tablet).

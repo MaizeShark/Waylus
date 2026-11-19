@@ -1,0 +1,64 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!--
+  A minimal drawing surface for latency tests of pen strokes (docs/damage-path.md):
+  draws pointer strokes (pen, mouse, touch) in black on white and clears itself every
+  few seconds, so repeated test strokes keep changing pixels without anyone touching
+  the keyboard. Open it full screen on the mirrored monitor.
+
+  URL parameters: size=4 (line width in px at full pressure), clear=6 (seconds between
+  clears, 0 = never).
+-->
+<meta charset="utf-8">
+<title>Waylus draw test</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+</style>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+const q = new URLSearchParams(location.search);
+const size = parseFloat(q.get("size") || "4");
+const clearEvery = parseFloat(q.get("clear") || "6");
+const c = document.getElementById("c");
+const ctx = c.getContext("2d", { desynchronized: true });
+function resize() {
+  c.width = innerWidth * devicePixelRatio;
+  c.height = innerHeight * devicePixelRatio;
+  c.style.width = innerWidth + "px";
+  c.style.height = innerHeight + "px";
+  wipe();
+}
+function wipe() {
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, c.width, c.height);
+}
+addEventListener("resize", resize);
+resize();
+if (clearEvery > 0) setInterval(wipe, clearEvery * 1000);
+
+let last = null;
+function point(e) {
+  return { x: e.clientX * devicePixelRatio, y: e.clientY * devicePixelRatio, p: e.pointerType === "mouse" ? 1 : (e.pressure || 0.5) };
+}
+function seg(a, b) {
+  ctx.strokeStyle = "#000";
+  ctx.lineCap = "round";
+  ctx.lineWidth = Math.max(1, size * devicePixelRatio * b.p);
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+}
+c.addEventListener("pointerdown", e => { c.setPointerCapture(e.pointerId); last = point(e); seg(last, last); });
+c.addEventListener("pointermove", e => {
+  if (!last) return;
+  for (const ev of (e.getCoalescedEvents ? e.getCoalescedEvents() : [e])) {
+    const p = point(ev);
+    seg(last, p);
+    last = p;
+  }
+});
+for (const t of ["pointerup", "pointercancel"]) c.addEventListener(t, () => { last = null; });
+</script>

@@ -83,11 +83,18 @@ class SimpleGl {
     private val quad = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
         .apply { put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)); flip() }
 
-    /** Draws [tex] over the whole `vw`×`vh` target, its colours multiplied by [tint]. */
-    fun drawTexture(tex: Int, vw: Int, vh: Int, tint: FloatArray = NO_TINT) {
+    /**
+     * Clears the `vw`×`vh` target and draws [tex] stretched over it, colours multiplied by
+     * [tint]; with [scissor] (x, y from the bottom, w, h) only that part is drawn.
+     */
+    fun drawTexture(tex: Int, vw: Int, vh: Int, tint: FloatArray = NO_TINT, scissor: IntArray? = null) {
         GLES20.glViewport(0, 0, vw, vh)
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        if (scissor != null) {
+            GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+            GLES20.glScissor(scissor[0], scissor[1], scissor[2], scissor[3])
+        }
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
@@ -96,6 +103,7 @@ class SimpleGl {
         GLES20.glEnableVertexAttribArray(loc)
         GLES20.glVertexAttribPointer(loc, 2, GLES20.GL_FLOAT, false, 0, quad)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        if (scissor != null) GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
     private fun program(vs: String, fs: String): Int {

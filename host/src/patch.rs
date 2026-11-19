@@ -26,6 +26,17 @@ pub const CAP_PATCHES: u32 = 1;
 pub const WINDOW: u32 = 512;
 /// Patches are only made while the pen was seen this recently.
 const PEN_RECENT_NS: u64 = 500_000_000;
+/// Dev flag `WAYLUS_PATCH_AT=x,y` (fractions of the frame): look around this point all the
+/// time, as if the pen hovered there (for tests without a pen: docs/damage-path.md).
+static FIXED_AT: std::sync::LazyLock<Option<(u16, u16)>> = std::sync::LazyLock::new(|| {
+    let v = std::env::var("WAYLUS_PATCH_AT").ok()?;
+    let (x, y) = v.split_once(',')?;
+    let f = |s: &str| s.trim().parse::<f64>().ok().map(|v| (v.clamp(0.0, 1.0) * 65535.0) as u16);
+    let at = (f(x)?, f(y)?);
+    tracing::info!("fast patches: looking around {v} instead of the pen (WAYLUS_PATCH_AT)");
+    Some(at)
+});
+
 /// A frame whose patches are larger than this (LZ4) goes through H.264 only.
 pub const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 
@@ -77,7 +88,13 @@ impl PatchCtl {
 
     /// Where the pen is, if patches are on and it was seen recently.
     pub fn pen_at(&self, now: u64) -> Option<(u16, u16)> {
-        if !self.enabled.load(Ordering::Relaxed) || now.saturating_sub(self.pen_ns.load(Ordering::Relaxed)) > PEN_RECENT_NS {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        if let Some(at) = *FIXED_AT {
+            return Some(at);
+        }
+        if now.saturating_sub(self.pen_ns.load(Ordering::Relaxed)) > PEN_RECENT_NS {
             return None;
         }
         let v = self.pen_xy.load(Ordering::Relaxed);
@@ -152,7 +169,8 @@ impl Patcher {
         if self.window.len() < row * win.h as usize {
             return None;
         }
-        let mut d = Damage { frames: 1, ..Default::default() };
+        // Changed tiles, kept one by one (Damage::add would fold many into their bounding box).
+        let mut changed_tiles = Vec::new();
         let mut ty = win.y;
         while ty < win.y + win.h {
             let th = TILE.min(win.y + win.h - ty);
@@ -176,15 +194,26 @@ impl Patcher {
                 }
                 self.known[ti] = true;
                 if changed {
-                    d.add(Rect { x: tx, y: ty, w: tww as u32 / 4, h: th });
+                    changed_tiles.push(Rect { x: tx, y: ty, w: tww as u32 / 4, h: th });
                 }
                 tx += TILE;
             }
             ty += TILE;
         }
-        if d.rects.is_empty() {
+        if changed_tiles.is_empty() {
             return None;
         }
+        // A large share of the window changed at once (scrolling, a window moving, a page
+        // loading): leave it to the video. Patched, the window would run ahead of the rest of
+        // the screen, which shows as a seam. Drawing changes a few percent of it per frame
+        // (a 132 px brush at most ~8 % in docs/damage-path.md); the edge of a window dragged
+        // through it ~14 %, scrolling ~60 %.
+        let window_tiles = (win.w.div_ceil(TILE) * win.h.div_ceil(TILE)) as usize;
+        if changed_tiles.len() > window_tiles / 8 {
+            self.last_too_large = true;
+            return None;
+        }
+        let d = Damage { frames: 1, full: false, rects: changed_tiles };
         let mut rects = Vec::new();
         let (mut total, mut raw) = (0usize, 0usize);
         let merged = tiles(&d, fw, fh, TILE);
@@ -250,8 +279,14 @@ mod tests {
         let px = lz4_flex::block::decompress(data, 16 * 16 * 4).unwrap();
         let i = ((20 - 16) * 16 + (40 - 32)) * 4;
         assert_eq!(&px[i..i + 4], &[3, 2, 1, 255]);
-        // Too large: nothing.
+        // Too large (bytes): nothing.
+        let o = (100 * win.w as usize + 100) * 4;
+        p.window[o] = 99;
+        assert!(p.diff(4, fw, fh, win, false, 10).is_none());
+        assert!(p.last_too_large);
+        // Too large (share of the window): nothing, even if it compresses well.
         p.window.iter_mut().for_each(|b| *b = b.wrapping_add(7));
-        assert!(p.diff(4, fw, fh, win, false, 100).is_none());
+        assert!(p.diff(5, fw, fh, win, false, usize::MAX).is_none());
+        assert!(p.last_too_large);
     }
 }

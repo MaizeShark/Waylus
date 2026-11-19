@@ -1,18 +1,27 @@
 <!doctype html>
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!-- Latency probe: shows the host's wall-clock time (ms) as a 4x8 barcode filling the screen.
-     Open fullscreen (F11) on the mirrored monitor. Bits: 24-bit time, 8-bit checksum. -->
+     Open fullscreen (F11) on the mirrored monitor. Bits: 24-bit time, 8-bit checksum.
+     barcode.html?box=256x128: a small barcode of that size (CSS px) in the middle of a black
+     page instead, for the fast-patch measurement (docs/damage-path.md): only that box changes. -->
 <meta charset="utf-8">
 <title>Waylus latency probe</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
   #g { display: grid; grid-template: repeat(4, 1fr) / repeat(8, 1fr); width: 100vw; height: 100vh; }
+  #g.box { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
   #g div { background: #555; } /* bright enough to tell apart from letterbox bars */
   #g div.on { background: #fff; }
 </style>
 <div id="g"></div>
 <script>
 const g = document.getElementById('g');
+const box = /^(\d+)x(\d+)$/.exec(new URLSearchParams(location.search).get('box') || '');
+if (box) {
+  g.className = 'box';
+  g.style.width = box[1] + 'px';
+  g.style.height = box[2] + 'px';
+}
 const cells = [];
 for (let i = 0; i < 32; i++) { const d = document.createElement('div'); g.appendChild(d); cells.push(d); }
 function frame(ts) {

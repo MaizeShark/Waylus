@@ -112,6 +112,7 @@ All options, as printed by `waylus --help`:
 | `--vendor-tweaks mtk-cpu-boost,mtk-vpp-off` | **Opt-in, device-specific** MediaTek decoder settings. `mtk-cpu-boost` saved ~1.9 ms of decode on the MT8781; `mtk-vpp-off` made no measurable difference. Never used for the published comparison numbers |
 | `--wifi`, `--pair`, `--unpair <name>`, `--listen <addr>`, `--fec <pct>`, `--no-usb` | Wi-Fi, see [wifi.md](wifi.md#using-wi-fi) |
 | `--hud` | Show the stats display (frame rate, latency, Wi-Fi reception) on the tablet. Also a switch in the app's settings, or tap the black bar beside the picture |
+| `--fast-patches` | **Experimental**, off by default: also send what changes around the pen as raw pixels that the app draws above the video until the decoder catches up (USB only, Android 13+). See [damage-path.md](damage-path.md) |
 | `-v, --verbose` | Repeatable. `-v`: a status line and the detailed statistics every 5 s; `-vv`: debug; `-vvv`: trace, plus FFmpeg's own log |
 | `-q, --quiet` | Warnings and errors only |
 
@@ -129,6 +130,7 @@ With adb available, Waylus reads the tablet's stylus evdev device directly: full
 
 - Monitors larger than the tablet can show or decode (e.g. 4K) are scaled down on the GPU automatically. The tablet reports its decoder's limits at connect; the host logs them (`decoder … (max WxH, N MB/frame, N MB/s)`).
 - `WAYLUS_NO_ZEROCOPY=1` forces the CPU readback path.
+- Measurement-only flags for the fast-patch experiment (`WAYLUS_DAMAGE_LOG`, `WAYLUS_BENCH_LINK`, `WAYLUS_PATCH_AT`) are described in [damage-path.md](damage-path.md#dev-flags-and-tools).
 - Log levels: see `-v`/`-q` under [options](#options). By default there are no periodic statistics, only events and warnings; a video stall over 100 ms is logged as a warning with what held it up (at most one every 10 s, with a count of the others). `-v` prints, every 5 s:
   ```
   53 fps | capture→shown p50 25 / p95 27 ms | pen - ms | usb

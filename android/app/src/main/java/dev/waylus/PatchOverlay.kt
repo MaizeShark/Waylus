@@ -311,7 +311,27 @@ class PatchOverlay(
      */
     private fun present(g: SimpleGl) {
         val s = win ?: return
-        g.drawTexture(canvas, bufW, bufH, tint = tint)
+        // Only the tiles with a patch need drawing (the rest of the canvas is transparent):
+        // clear the buffer, draw their bounding box. Much less work for the GPU than the
+        // whole screen, which slowed the video decoder down measurably.
+        var x0 = Int.MAX_VALUE; var y0 = Int.MAX_VALUE; var x1 = -1; var y1 = -1
+        for (i in stamps.indices) {
+            if (stamps[i] == 0L) continue
+            val tx = i % tilesW; val ty = i / tilesW
+            if (tx < x0) x0 = tx; if (tx > x1) x1 = tx
+            if (ty < y0) y0 = ty; if (ty > y1) y1 = ty
+        }
+        if (x1 < 0) {
+            g.drawTexture(canvas, bufW, bufH, tint = tint, scissor = intArrayOf(0, 0, 0, 0))
+        } else {
+            // Frame tiles → buffer pixels, a pixel of margin for the bilinear scaling.
+            val sx = bufW.toFloat() / frameW; val sy = bufH.toFloat() / frameH
+            val l = maxOf(0, (x0 * TILE * sx).toInt() - 2)
+            val r = minOf(bufW, ((x1 + 1) * TILE * sx).toInt() + 2)
+            val t = maxOf(0, (y0 * TILE * sy).toInt() - 2)
+            val b = minOf(bufH, ((y1 + 1) * TILE * sy).toInt() + 2)
+            g.drawTexture(canvas, bufW, bufH, tint = tint, scissor = intArrayOf(l, bufH - b, r - l, b - t))
+        }
         EGL14.eglSwapBuffers(g.display, s)
     }
 
