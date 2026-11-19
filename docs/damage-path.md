@@ -2,12 +2,12 @@
 
 An experiment: send the small parts of the screen that change while drawing (the stroke, the cursor) to the tablet as raw pixels, next to the H.264 stream, so they skip the tablet's hardware decoder. The decoder is the largest stage on the TCL NXTPAPER 14 (MT8781): ~19 ms per frame with the pen idle, ~11.5 ms while drawing ([where the time goes](measurements.md#where-the-time-goes)).
 
-Status (2026-11-19): **phase 1 done on niri and the NXTPAPER 14; the decision gate passed. Phase 2: a working prototype, `waylus --fast-patches` (off by default, Linux host, USB, Android 13+).** Phase 3: the built-in measurements are done; the camera measurement (what you see on the glass) needs someone to film it (see [phase 3](#phase-3-results)). Still open from phase 1: compositor damage on KDE and GNOME, Windows dirty regions, and the tablet benchmark on the Pixel 7a (see [open items](#open-items)).
+Status (2026-11-19): **phase 1 done on niri and the NXTPAPER 14; the decision gate passed. Phase 2: a working prototype, `waylus --fast-patches` (off by default, Linux host, USB, Android 13+).** Phase 3: done on the NXTPAPER 14 over USB; **on the glass, a small change shows up ~17 ms sooner with patches** (camera, idle clocks), and ~11 ms sooner at the tablet's compositor while drawing (built-in statistics) (see [phase 3](#phase-3-results)). Still open from phase 1: compositor damage on KDE and GNOME, Windows dirty regions, and the tablet benchmark on the Pixel 7a (see [open items](#open-items)).
 
 Contents:
 - [Phase 1: measurements](#phase-1-measurements): [is the damage small?](#1-is-the-damage-small), [the tablet path](#2-the-tablet-path), [what USB carries](#3-what-usb-carries), [decision](#decision)
 - [Phase 2: the prototype](#phase-2-the-prototype): [host](#host), [protocol](#protocol), [tablet](#tablet), [what didn't work](#what-didnt-work-on-the-tablet), [Wi-Fi](#wi-fi)
-- [Phase 3: results](#phase-3-results): [strokes](#strokes-built-in-statistics), [scrolling and dragging](#scrolling-and-dragging-windows), [composition](#composition), [not measured yet](#not-measured-yet)
+- [Phase 3: results](#phase-3-results): [on the glass](#on-the-glass-camera), [strokes](#strokes-built-in-statistics), [scrolling and dragging](#scrolling-and-dragging-windows), [composition](#composition), [not measured yet](#not-measured-yet)
 - [Open items](#open-items)
 - [Dev flags and tools](#dev-flags-and-tools)
 
@@ -146,6 +146,22 @@ Patches are off over Wi-Fi. They would need their own design there: the video al
 
 All on the NXTPAPER 14 over USB accessory mode, niri, mirroring DP-2 (1920×1080, 75 Hz), release builds, 2026-11-19, stats display off. Pen strokes are injected on the tablet with `adb shell input stylus swipe` (varying straight lines, 0.7 s each, back to back) and go the whole way: Android → app → host → the host's virtual pen → the drawing app; host with `--no-raw-pen`, since injected events don't reach the raw stylus device. The drawing app is `tools/latency/draw.html` full screen in Chrome (4 px line, clears itself every 6 s). Injected input keeps Android's input boost on, as real drawing does.
 
+### On the glass (camera)
+
+Filmed 2026-11-19 with the Pixel 7a (slow motion, 120 fps, hand-held, `camera.py --track`), [method](measurements.md#small-changes-and-strokes-fast-patches): `barcode.html?box=256x128` full screen on DP-2, the host with `WAYLUS_PATCH_AT=0.5,0.5`, nobody touching the tablet (idle clocks), stats display off. Tablet behind the real monitor, photon to photon, in ms:
+
+| Clip | p50 | p95 | p5 | p99 | n |
+|---|---|---|---|---|---|
+| Without `--fast-patches` (1st clip, ~20 s, other exposure) | 41 | 59 | 19 | 60 | 72 |
+| Without `--fast-patches` (2nd clip, ~40 s) | 41 | 65 | 23 | 90 | 148 ¹ |
+| **With `--fast-patches`** (~40 s) | **24** | **40** | 14 | 47 | 290 |
+
+¹ One reading of 99 ms dropped as an outlier; with it p95 68 / p99 90.
+
+- **The box reaches the glass ~17 ms sooner with patches** at p50, ~19–25 ms at p95. Without them, 41 ms is in line with the full-screen barcode over USB (45 / 59 ms, [measurements](measurements.md#waylus-vs-weylus-niri-2026-11-17)).
+- This is the idle-clock case: the tablet's decoder took 18.6–20.4 ms per frame during the clips without patches (built-in statistics), 16–18 ms with them. While someone draws, Android's input boost brings decoding down to ~11 ms, so the gain while drawing should be closer to the ~11 ms seen at the compositor in the next section. That is an estimate; a camera clip of a real stroke would show it.
+- Only ~3 % of the camera frames gave a readable tablet barcode (the box is small in the picture and changes every frame), hence the small n. Flicker when patches hand over to H.264 can't be judged from a barcode that changes every frame.
+
 ### Strokes (built-in statistics)
 
 Three runs with and three without `--fast-patches`, alternating, ~25 s each; per run the median of its 5 s windows (the first window dropped). The video's capture → shown and the patches' capture → drawn end at the same point: handed to the tablet's compositor ([method](measurements.md#small-changes-and-strokes-fast-patches)). In ms, p50 / p95:
@@ -179,16 +195,20 @@ Patches must step aside for big changes and never queue. Tested with `WAYLUS_PAT
 
 ### Not measured yet
 
-- **The camera measurement** (pen to stroke on the glass): needs filming; the method is in [measurements.md](measurements.md#small-changes-and-strokes-fast-patches). Until then the gain on the glass is an estimate: ~11 ms earlier at the compositor, from the table above.
-- Flicker when a patch is replaced by its H.264 version (RGB vs YUV 4:2:0 at sharp edges): not visible in screenshots, which only show one moment; the camera clips will tell. Patches are removed two vsyncs after the decoder reports the matching frame.
+- **A real stroke on camera** (pen to line on the glass, with input boost): the barcode clips above are at idle clocks.
+- Flicker when a patch is replaced by its H.264 version (RGB vs YUV 4:2:0 at sharp edges): not visible in screenshots, which only show one moment, nor in the barcode clips; a stroke clip would show it. Patches are removed two vsyncs after the decoder reports the matching frame.
 - The Pixel 7a (screen was locked), KDE and GNOME, the Windows host.
 - Real pen strokes with the raw stylus reader: the code path is the same (pen position from the raw stream), but all strokes here were injected.
 
-**Seen while measuring, not caused by patches**: in 2 of 7 short runs with the small barcode page (`barcode.html?box=…`, otherwise static screen, idle clocks), one of them without `--fast-patches`, the tablet stopped acknowledging most video frames for the whole run: 10.5 fps, back-pressure held the encoder back ~915 ms per second and gave up after 250 ms each time. Not reproduced in 5 further runs; cause unknown.
+### Decoder lockups (found while measuring, not caused by patches)
+
+With the small barcode page (`barcode.html?box=…`, otherwise static screen, idle clocks), the tablet's hardware decoder sometimes stopped producing frames for good while still taking input: the picture froze, the app sent no more "shown" reports, and the host's back-pressure gave up after 250 ms per frame (10.5 fps sent, "held back ~915 ms/s"). Seen 8 times over the afternoon's barcode runs, with and without `--fast-patches`, often 10–45 s into a session, then not at all in 8 minutes of runs right after.
+- At that moment MediaTek's video daemon logs `Error code -9998`, then `un-support type of NAL (12)` and `Error code -9996` for every frame, and the codec `Unknown output workId`. NAL type 12 is filler data, which NVENC puts in every frame in CBR mode (even with `cbr_padding` off; on a black screen most of the 20 Mbit/s is filler). The decoder normally skips it silently; the errors only start once it is already broken, so filler is not proven to be the cause. Stripping the filler on the tablet before decoding (tested behind a debug switch, then removed) showed no lockups in 4 minutes, but neither did the same time without stripping.
+- **Fix: the app now restarts a stuck decoder** (no output for 500 ms after at least 5 frames fed in) and asks for a keyframe; the picture comes back within ~0.6 s instead of staying frozen. Logged as `decoder stuck: …` on the tablet. This is independent of patches and could go to `main` on its own.
 
 ## Open items
 
-- The camera measurement and the other phase 3 items [not measured yet](#not-measured-yet).
+- The phase 3 items [not measured yet](#not-measured-yet), and the cause of the [decoder lockups](#decoder-lockups-found-while-measuring-not-caused-by-patches).
 - KDE Plasma and GNOME: run the same scenarios with `WAYLUS_DAMAGE_LOG` (without `WAYLUS_NO_ZEROCOPY` it logs the compositor's damage only) for a monitor and a virtual output, to see whether the reported damage is as small as the pixel diff.
 - Windows 11: the same on the Windows host (dirty regions; the LZ4 sizes need a readback that isn't there on Windows yet).
 - Pixel 7a: the tablet benchmark and the link benchmark (USB 3: how much larger patches can get, and whether raw 1080p60 NV12 at ~190 MB/s is realistic).
