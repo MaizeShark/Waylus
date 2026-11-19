@@ -169,6 +169,27 @@ struct UserData {
     stat_bufs: u64,
     stat_out: u64,
     stat_t: u64,
+    /// Damage (docs/damage-path.md): requested only for the damage log or fast patches.
+    want_damage: bool,
+    damage_log: Option<crate::damage::DamageLog>,
+    /// Damage of the buffers since the last frame passed on (skipped ones included).
+    damage: crate::damage::Damage,
+    damage_meta: bool,
+}
+
+impl UserData {
+    /// Writes the damage collected since the last frame to the damage log and starts over.
+    /// `src`: the compositor's frame size (damage coordinates), `dst`: the frame passed on.
+    fn log_damage(&mut self, now: u64, src: (u32, u32), dst: (u32, u32), pixels: Option<(&[u8], usize)>) {
+        if !self.want_damage {
+            return;
+        }
+        let mut d = std::mem::take(&mut self.damage);
+        d.rects = d.rects.iter().filter_map(|r| r.scale(src, dst).clip(dst.0, dst.1)).collect();
+        if let Some(log) = self.damage_log.as_mut() {
+            log.frame(now, dst.0, dst.1, &d, self.damage_meta, pixels);
+        }
+    }
 }
 
 fn map_format(f: spa::param::video::VideoFormat) -> Option<PixFmt> {
@@ -300,6 +321,44 @@ fn buffers_pod(dmabuf: bool) -> Result<Vec<u8>> {
     })
 }
 
+/// Asks for `SPA_META_VideoDamage` with room for up to 16 rectangles.
+fn damage_meta_pod() -> Result<Vec<u8>> {
+    use spa::pod::{ChoiceValue, Property, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
+    let region = std::mem::size_of::<spa::sys::spa_meta_region>() as i32;
+    serialize(spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            Property::new(spa::sys::SPA_PARAM_META_type, Value::Id(Id(spa::sys::SPA_META_VideoDamage))),
+            Property::new(
+                spa::sys::SPA_PARAM_META_size,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range { default: region * 16, min: region, max: region * 16 },
+                ))),
+            ),
+        ],
+    })
+}
+
+/// Adds the damage of one buffer; a buffer without damage metadata counts as fully damaged.
+/// Returns whether the buffer had the metadata.
+fn collect_damage(buffer: &pw::buffer::Buffer, d: &mut crate::damage::Damage) -> bool {
+    use crate::damage::Rect;
+    d.frames += 1;
+    let Some(meta) = buffer.find_meta::<spa::buffer::meta::MetaVideoDamage>() else {
+        d.set_full();
+        return false;
+    };
+    for r in meta.iter() {
+        let (p, sz) = (r.position(), r.size());
+        let (x, y) = (p.x.max(0) as u32, p.y.max(0) as u32);
+        d.add(Rect { x, y, w: sz.width, h: sz.height });
+    }
+    true
+}
+
 fn run_pipewire(
     fd: std::os::fd::OwnedFd,
     node: u32,
@@ -348,7 +407,13 @@ fn run_pipewire(
         },
     )?;
 
+    let damage_log = crate::damage::DamageLog::from_env();
+    let want_damage = damage_log.is_some();
     let data = UserData {
+        want_damage,
+        damage_log,
+        damage: Default::default(),
+        damage_meta: false,
         info: Default::default(),
         format: None,
         dmabuf: false,
@@ -414,13 +479,20 @@ fn run_pipewire(
                 ud.info.max_framerate().denom,
                 if ud.dmabuf { format!("DMA-BUF modifier {:#x}", ud.info.modifier()) } else { "shared memory".into() }
             );
+            let mut pods = Vec::new();
             match buffers_pod(ud.dmabuf) {
-                Ok(b) => {
-                    if let Some(pod) = spa::pod::Pod::from_bytes(&b) {
-                        let _ = stream.update_params(&mut [pod]);
-                    }
-                }
+                Ok(b) => pods.push(b),
                 Err(e) => warn!("buffers param: {e:#}"),
+            }
+            if ud.want_damage {
+                match damage_meta_pod() {
+                    Ok(b) => pods.push(b),
+                    Err(e) => warn!("damage meta param: {e:#}"),
+                }
+            }
+            let mut params: Vec<&spa::pod::Pod> = pods.iter().filter_map(|b| spa::pod::Pod::from_bytes(b)).collect();
+            if !params.is_empty() {
+                let _ = stream.update_params(&mut params);
             }
         })
         .remove_buffer(|_, ud, _| {
@@ -433,6 +505,13 @@ fn run_pipewire(
             let mut newest = None;
             let mut n = 0;
             while let Some(b) = stream.dequeue_buffer() {
+                if ud.want_damage {
+                    let had = collect_damage(&b, &mut ud.damage);
+                    if had != ud.damage_meta || ud.stat_out == 0 && n == 0 {
+                        info!("damage metadata on buffers: {}", if had { "yes" } else { "no (every frame counts as full)" });
+                    }
+                    ud.damage_meta = had;
+                }
                 newest = Some(b);
                 n += 1;
             }
@@ -489,6 +568,7 @@ fn run_pipewire(
                             ud.next_due_ns = (ud.next_due_ns + interval).max(now.saturating_sub(interval / 2));
                             ud.stat_out += 1;
                             tracing::trace!("zero-copy frame {:.2} ms", (now_ns() - t0) as f64 / 1e6);
+                            ud.log_damage(now, (width, height), (ow, oh), None);
                             ud.frames.put(Frame {
                                 gpu: Some(gpu),
                                 width: ow,
@@ -539,6 +619,7 @@ fn run_pipewire(
             };
             ud.next_due_ns = (ud.next_due_ns + interval).max(now.saturating_sub(interval / 2));
             ud.stat_out += 1;
+            ud.log_damage(now, (width, height), (fw, fh), Some((&buf, stride)));
             ud.frames.put(Frame { gpu: None, width: fw, height: fh, stride, format, capture_ns: now, data: buf });
         })
         .register()?;

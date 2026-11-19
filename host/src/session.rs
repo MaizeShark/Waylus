@@ -330,6 +330,10 @@ fn session(
     if hello.version != proto::PROTO_VERSION {
         bail!("protocol mismatch: host {} client {}", proto::PROTO_VERSION, hello.version);
     }
+    if crate::linkbench::enabled() {
+        let mut writer = writer;
+        return crate::linkbench::run(&mut reader, &mut writer, kind);
+    }
     if capture_slot.is_none()
         && let Some(make) = lazy
     {

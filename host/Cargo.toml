@@ -29,6 +29,7 @@ mdns-sd = "0.22.0"
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.15"
 gethostname = "0.5"
+lz4_flex = { version = "0.14", default-features = false, features = ["std"] }
 
 # Linux (Wayland): portal + PipeWire capture, EGL/GL/CUDA zero-copy, uinput.
 [target.'cfg(target_os = "linux")'.dependencies]

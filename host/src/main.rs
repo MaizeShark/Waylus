@@ -3,9 +3,11 @@
 
 mod adb;
 mod aoa;
+mod damage;
 mod encode;
 mod frame;
 mod link;
+mod linkbench;
 mod platform;
 mod proto;
 mod rawpen;

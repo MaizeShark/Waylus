@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 use windows::{
     Foundation::{TimeSpan, TypedEventHandler},
     Graphics::{
-        Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem},
+        Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem},
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
     },
     Win32::{
@@ -73,6 +73,24 @@ struct State {
     stat_in: u64,
     stat_out: u64,
     stat_t: std::time::Instant,
+    /// Damage (docs/damage-path.md): dirty regions since the last frame passed on, for
+    /// the damage log (`WAYLUS_DAMAGE_LOG`).
+    damage: crate::damage::Damage,
+    damage_log: Option<crate::damage::DamageLog>,
+}
+
+/// Adds a frame's dirty regions (Windows 11 24H2+); a frame without them counts as fully changed.
+fn collect_dirty(f: &Direct3D11CaptureFrame, d: &mut crate::damage::Damage) {
+    d.frames += 1;
+    let Ok(v) = f.DirtyRegions() else {
+        d.set_full();
+        return;
+    };
+    for i in 0..v.Size().unwrap_or(0) {
+        if let Ok(r) = v.GetAt(i) {
+            d.add(crate::damage::Rect { x: r.X.max(0) as u32, y: r.Y.max(0) as u32, w: r.Width.max(0) as u32, h: r.Height.max(0) as u32 });
+        }
+    }
 }
 
 impl State {
@@ -110,6 +128,11 @@ impl State {
         if !self.logged {
             info!("first frame captured and converted ({:.2} ms after arrival)", (now_ns() - arrived_ns) as f64 / 1e6);
             self.logged = true;
+        }
+        if let Some(log) = self.damage_log.as_mut() {
+            let mut d = std::mem::take(&mut self.damage);
+            d.rects = d.rects.iter().filter_map(|r| r.scale(content, dst).clip(dst.0, dst.1)).collect();
+            log.frame(now, dst.0, dst.1, &d, !d.full, None);
         }
         self.frames.put(Frame { gpu: Some(video), width: dst.0, height: dst.1, stride: 0, format: PixFmt::Bgrx, capture_ns, data: Vec::new() });
         if self.stat_t.elapsed() >= Duration::from_secs(5) {
@@ -232,7 +255,10 @@ fn run(
         stat_in: 0,
         stat_out: 0,
         stat_t: std::time::Instant::now(),
+        damage: Default::default(),
+        damage_log: crate::damage::DamageLog::from_env(),
     }));
+    let want_damage = state.lock().unwrap().damage_log.is_some();
     let cur_size = Arc::new(Mutex::new((size.Width, size.Height)));
     let running_cb = running.clone();
     let state_cb = state.clone();
@@ -242,8 +268,15 @@ fn run(
         let arrived = now_ns();
         // Drain: only the newest frame matters.
         let mut newest = None;
+        let mut dirty = crate::damage::Damage::default();
         while let Ok(f) = pool.TryGetNextFrame() {
+            if want_damage {
+                collect_dirty(&f, &mut dirty);
+            }
             newest = Some(f);
+        }
+        if want_damage {
+            state_cb.lock().unwrap().damage.merge(dirty);
         }
         let Some(frame) = newest else { return Ok(()) };
         let content = frame.ContentSize()?;
@@ -286,6 +319,12 @@ fn run(
     // Up to 240 frames/s instead of the default 60 (Windows 11 24H2).
     if let Err(e) = session.SetMinUpdateInterval(TimeSpan { Duration: 40_000 }) {
         debug!("MinUpdateInterval: {e}");
+    }
+    if want_damage {
+        match session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly) {
+            Ok(()) => info!("dirty regions: on (ReportOnly)"),
+            Err(e) => warn!("dirty regions unavailable (needs Windows 11 24H2): {e}"),
+        }
     }
     session.StartCapture()?;
     let _ = ready.send(Ok(()));

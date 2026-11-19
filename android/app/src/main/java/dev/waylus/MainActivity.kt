@@ -205,6 +205,8 @@ class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Cal
                 WifiCrypto.bench()
             }, "waylus-bench").start()
         }
+        // Developer benchmark for docs/damage-path.md (DamageBench.kt).
+        intent.getStringExtra("bench_damage")?.let { DamageBench(this, root, it, intent.getBooleanExtra("bench_boost", false)).start() }
         intent.getStringExtra("host")?.let { wifiStore.address = "$it:$port" }
         ui.port = port
         ui.paired = pairedHost()
