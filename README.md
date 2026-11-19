@@ -49,7 +49,7 @@ From the [releases page](https://github.com/MaizeShark/Waylus/releases):
 - **Tablet app:** `waylus-<version>.apk`, for Wi-Fi-only use or installing without adb. The zip and the Linux tarball contain it too.
 - **Linux:** `waylus-<version>-linux-x86_64-fedora45.tar.gz` is built on Fedora 45 and needs its FFmpeg 9 and PipeWire, so it runs on Fedora 45 and distributions with the same library versions. Elsewhere, build from source.
 
-Until the first release is out, every [CI run](https://github.com/MaizeShark/Waylus/actions/workflows/ci.yml) has the same programs as artifacts (downloading them needs a GitHub login).
+To try unreleased changes, every [CI run](https://github.com/MaizeShark/Waylus/actions/workflows/ci.yml) has the same programs as artifacts (downloading them needs a GitHub login).
 
 ### Build from source
 
