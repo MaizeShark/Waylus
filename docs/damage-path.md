@@ -2,12 +2,12 @@
 
 An experiment: send the small parts of the screen that change while drawing (the stroke, the cursor) to the tablet as raw pixels, next to the H.264 stream, so they skip the tablet's hardware decoder. The decoder is the largest stage on the TCL NXTPAPER 14 (MT8781): ~19 ms per frame with the pen idle, ~11.5 ms while drawing ([where the time goes](measurements.md#where-the-time-goes)).
 
-Status (2026-11-19): **phase 1 done on niri and the NXTPAPER 14; the decision gate passed. Phase 2: a working prototype, `waylus --fast-patches` (off by default, Linux host, USB, Android 13+).** Phase 3: done on the NXTPAPER 14 over USB; **on the glass, a small change shows up ~17 ms sooner with patches** (camera, idle clocks), and ~11 ms sooner at the tablet's compositor while drawing (built-in statistics) (see [phase 3](#phase-3-results)). Still open from phase 1: compositor damage on KDE and GNOME, Windows dirty regions, and the tablet benchmark on the Pixel 7a (see [open items](#open-items)).
+Status (2026-11-19): **phase 1 done on niri and the NXTPAPER 14; the decision gate passed. Phase 2: a working prototype, `waylus --fast-patches` (off by default, Linux host, USB, Android 13+).** Phase 3: done on the NXTPAPER 14 over USB; **on the glass, a small change shows up ~17 ms sooner with patches** (camera, idle clocks), and ~11 ms sooner at the tablet's compositor while drawing (built-in statistics) (see [phase 3](#phase-3-results)). Pixel 7a: patches reach its compositor ~7 ms earlier with no cost to the video. Still open from phase 1: compositor damage on KDE and GNOME, and Windows dirty regions (see [open items](#open-items)).
 
 Contents:
 - [Phase 1: measurements](#phase-1-measurements): [is the damage small?](#1-is-the-damage-small), [the tablet path](#2-the-tablet-path), [what USB carries](#3-what-usb-carries), [decision](#decision)
 - [Phase 2: the prototype](#phase-2-the-prototype): [host](#host), [protocol](#protocol), [tablet](#tablet), [what didn't work](#what-didnt-work-on-the-tablet), [Wi-Fi](#wi-fi)
-- [Phase 3: results](#phase-3-results): [on the glass](#on-the-glass-camera), [strokes](#strokes-built-in-statistics), [scrolling and dragging](#scrolling-and-dragging-windows), [composition](#composition), [not measured yet](#not-measured-yet)
+- [Phase 3: results](#phase-3-results): [on the glass](#on-the-glass-camera), [strokes](#strokes-built-in-statistics), [scrolling and dragging](#scrolling-and-dragging-windows), [composition](#composition), [Pixel 7a](#pixel-7a-built-in-statistics), [not measured yet](#not-measured-yet)
 - [Open items](#open-items)
 - [Dev flags and tools](#dev-flags-and-tools)
 
@@ -70,7 +70,22 @@ TCL NXTPAPER 14 (MT8781, Mali-G57 MC2, Android 15), release build, 2026-11-19, t
 - **Compared with the decoder**: ~2.4–2.9 ms for drawing-sized patches against ~11.5 ms decode while drawing (and 3.1–3.6 against ~19 ms at idle clocks). Both paths then wait for SurfaceFlinger's next latch, so the patch should reach the glass about 8–9 ms earlier while drawing. That is an estimate from these numbers, measured in phase 3.
 - Swap → latch is the wait for SurfaceFlinger's next frame plus the GPU finishing; uniform phase against vsync gives ~8 ms on average, the rest is the extra hop through the `ImageReader` and the transaction. The video path has the same kind of wait after the decoder, which the built-in "decoded → shown" (~1.5 ms) doesn't include: on this decoder that timestamp is the callback time.
 - At idle clocks the present fence came either one frame (14.4 ms) or two frames (31 ms) after the latch; with either boost always one. In this benchmark the patch layer sits above an empty `SurfaceView` and the app's window, so the extra frame is probably GPU composition at low clocks; phase 2 checks the composition type with the real video underneath (`dumpsys SurfaceFlinger`).
-- Pixel 7a: not measured yet (its screen was locked).
+
+Pixel 7a (Tensor G2, Mali-G710, Android 17, 90 Hz panel), same benchmark, release build, 2026-11-19. p50 / p95 in ms; "input boost" from `adb shell input swipe`, which on this phone barely changed anything:
+
+| Step | Size | Idle | App boost | Input boost |
+|---|---|---|---|---|
+| LZ4 decompress (strokes) | 64² / 256² / 512² / 1080p | 0.04 / 0.20 / 0.83 / 5.4 | – | – |
+| `glTexSubImage2D` + `glFinish` | 64² / 256² / 512² / 1080p | 0.21 / 0.36 / 0.43 / 1.66 | 0.24 / 0.31 / 0.41 / 1.77 | 0.30 / 0.42 / 0.48 / 2.13 |
+| Draw the texture over 1920×1080 + `glFinish` | | 0.96 | 1.13 | 1.35 |
+| **Decompress + upload + draw + swap** | 64² | 3.0 / 4.7 | 1.5 / 2.2 | 2.5 / 4.7 |
+| | 256² | 4.5 / 8.1 | 2.7 / 4.0 | 4.2 / 7.2 |
+| | 512² | 10.4 / 19.3 | 6.7 / 8.3 | 8.7 / 16.2 |
+| | 1080p | 32.3 / 40.4 | 11.0 / 15.5 | 23.2 / 32.9 |
+| Swap → SurfaceFlinger latch | any | 9.4–11.8 / 14.7–17.4 | 7.4–8.9 / 12.7–13.5 | 8.7–9.3 / 13.3–15.5 |
+| Latch → present fence | any | 15.2–15.3 | 15.8–15.9 | 15.3–15.5 |
+
+- LZ4 runs at ~1.3 GB/s, twice the NXTPAPER. For drawing-sized patches the path costs about the same as on the NXTPAPER (2.5–4.5 ms); the phone's video decoder is much faster, though (6.3 ms p50 in the streaming test in phase 3, against ~11 ms on the MT8781 while drawing), so the gain is smaller.
 
 ### 3. What USB carries
 
@@ -84,7 +99,17 @@ TCL NXTPAPER 14 (MT8781, Mali-G57 MC2, Android 15), release build, 2026-11-19, t
 - AOA carries only ~20 MB/s, about half of adb. The likely cause is on the tablet: Android's accessory gadget driver (`f_accessory`) reads in 16 KB requests with only two queued; adbd uses FunctionFS with larger asynchronous transfers. The app's read loop (16 KB chunks) matches the driver. Not investigated further.
 - The H.264 stream takes 2.5 MB/s at 20 Mbit/s, so at 60 fps AOA leaves ~290 KB per frame and adb ~550 KB, *if* nothing else waits. Latency is the tighter limit: patches and video frames share one ordered stream, so a patch delays the frame behind it by its own transfer time. A 16 KB patch costs 0.7–2.1 ms, a 64 KB one 2–5 ms.
 - First AOA run vs later ones: the first had a 0.24 ms ping and twice the speed for small messages, the later ones 0.72 ms; probably the tablet's clocks (the first run came right after the app started). Throughput was the same.
-- Pixel 7a: shows as 5000M (USB 3) in `lsusb -t`; its link throughput is not measured yet.
+
+Pixel 7a, USB 3 (5000M in `lsusb -t`, on a 5 Gbit/s port of the PC), same benchmark, 2026-11-19, p50 in ms (two runs each):
+
+| Message size | 4 KB | 16 KB | 64 KB | 128 KB | 256 KB | 1 MB | 4 MB | Throughput (32 MB) |
+|---|---|---|---|---|---|---|---|---|
+| USB accessory mode (AOA) | 0.6–0.7 | 0.75 | 1.3–2.0 | 2.0–3.5 | 4.5–5.9 | 15–20 | 49–65 | **~105–130 MB/s** (16 KB messages: 65–82) |
+| adb | 1.2–1.7 | 1.6–1.8 | 2.4–2.6 | 3.2–3.3 | 4.5–4.7 | 13–16 | 42–43 | 120–280 MB/s, uneven |
+
+- **USB 3 helps, but far below the link's rate**: AOA reaches about a quarter of what 5 Gbit/s carries, adb about half at best, and adb's small messages are slower than AOA's (its ping 0.8 ms vs 0.2 ms). The limit is on the phone's side (the gadget drivers and how Android queues USB requests), so a 10 Gbit/s port wouldn't change it.
+- **Bigger patches**: a 64 KB patch costs 1.3–2 ms on the Pixel against 2–5 ms on the NXTPAPER; the 64 KB cap could be ~4× larger on such a link for the same delay. Not changed (the cap is one constant; per-link tuning would be a later step).
+- **Raw 1080p60 NV12** (1920×1080×1.5×60 ≈ 187 MB/s): not realistic. AOA tops out below it, adb only sometimes reaches it, and one 3 MB frame would take ~30–40 ms to arrive. LZ4 on top doesn't change that for desktop content with photos or video on screen.
 
 ### Decision
 
@@ -193,11 +218,26 @@ Patches must step aside for big changes and never queue. Tested with `WAYLUS_PAT
 
 `dumpsys SurfaceFlinger` with patches on screen: the video layer and the patch layer (`bbq-wrapper`, the layer's buffer queue) both `composition=DEVICE`, i.e. hardware planes; none on the GPU. After the last patch is cleared the layer is hidden. Checked visually with `debug.waylus.patchtint` (patches drawn reddish) that patches sit exactly under the cursor and nothing stays behind.
 
+### Pixel 7a (built-in statistics)
+
+Same stroke method (`adb shell input stylus swipe` on the phone, `draw.html` full screen, `--no-raw-pen`), USB accessory mode over USB 3, one 25 s run each, 2026-11-19, p50 / p95 in ms:
+
+| | Without | With `--fast-patches` |
+|---|---|---|
+| **Stroke: patch, capture → handed to the compositor** | – | **2.1–2.2 / 3.2** |
+| Video, capture → handed to the compositor | 9.3 / 11.1–11.3 | 9.2 / 10.6 |
+| Video, decode on the phone | 6.3 / 7.6 | 6.4 / 7.4 |
+| Video, sent → received | 0.3–0.4 / 0.5–0.6 | 0.3 / 0.4–0.5 |
+
+- The stroke reaches the compositor ~7 ms earlier, and **the video doesn't get slower** here (the Tensor's decoder doesn't feel the patch layer, unlike the MT8781's).
+- Composition (`dumpsys SurfaceFlinger`): the video layer (rotated 90° by the hardware), the patch layer and the app's window all `DEVICE`.
+- Patches sent for 99 % of frames, 1.1–1.2 KB each.
+
 ### Not measured yet
 
 - **A real stroke on camera** (pen to line on the glass, with input boost): the barcode clips above are at idle clocks.
 - Flicker when a patch is replaced by its H.264 version (RGB vs YUV 4:2:0 at sharp edges): not visible in screenshots, which only show one moment, nor in the barcode clips; a stroke clip would show it. Patches are removed two vsyncs after the decoder reports the matching frame.
-- The Pixel 7a (screen was locked), KDE and GNOME, the Windows host.
+- A camera clip on the Pixel 7a (it was the camera), KDE and GNOME, the Windows host.
 - Real pen strokes with the raw stylus reader: the code path is the same (pen position from the raw stream), but all strokes here were injected.
 
 ### Decoder lockups (found while measuring, not caused by patches)
@@ -211,7 +251,7 @@ With the small barcode page (`barcode.html?box=…`, otherwise static screen, id
 - The phase 3 items [not measured yet](#not-measured-yet), and the cause of the [decoder lockups](#decoder-lockups-found-while-measuring-not-caused-by-patches).
 - KDE Plasma and GNOME: run the same scenarios with `WAYLUS_DAMAGE_LOG` (without `WAYLUS_NO_ZEROCOPY` it logs the compositor's damage only) for a monitor and a virtual output, to see whether the reported damage is as small as the pixel diff.
 - Windows 11: the same on the Windows host (dirty regions; the LZ4 sizes need a readback that isn't there on Windows yet).
-- Pixel 7a: the tablet benchmark and the link benchmark (USB 3: how much larger patches can get, and whether raw 1080p60 NV12 at ~190 MB/s is realistic).
+- Larger patch cap on fast links (the Pixel 7a's USB 3 carries a 64 KB patch in 1.3–2 ms); see [what USB carries](#3-what-usb-carries).
 - Windows host: patches (D3D11 readback of the window around the pen).
 - Krita and a second tablet: with the host's "Waylus Pen" present, Krita (6.0.4, Wayland) moved the cursor for the synthetic pen but drew nothing, even after the host exited; synthetic mouse strokes worked. Real use has one tablet, so this only affects the test setup.
 
