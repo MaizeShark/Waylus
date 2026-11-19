@@ -50,6 +50,10 @@ class VideoDecoder(
     private val inflight = HashMap<Long, LongArray>()
     private var loggedVendorParams = false
     private var tweaks = 0
+    // Stuck-decoder watchdog: frames fed in since the last decoded frame came out.
+    private var inputsSinceOutput = 0
+    private var firstInputSinceOutputNs = 0L
+    private var lastOutputNs = 0L
 
     fun setSurface(s: Surface?) = handler.post {
         if (s === surface && codec != null) return@post
@@ -83,6 +87,7 @@ class VideoDecoder(
             return@post
         }
         waitingKey = false
+        if (stuck()) return@post
         val bufFlags = if (key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
         pending.addLast(Pkt(data, off, captureNs / 1000, bufFlags, captureNs, recvNs))
         drain(c)
@@ -94,6 +99,21 @@ class VideoDecoder(
             waitingKey = true
             lastKeyRequestNs = System.nanoTime() // the host already forces one on the loss report
         }
+    }
+
+    /**
+     * MediaTek's decoder (MT8781) can stop producing output for good while still taking
+     * input: the video daemon logs "un-support type of NAL (12)" for every frame from then
+     * on. Seen on a nearly static screen at idle clocks, with and without --fast-patches.
+     * A new codec instance and a keyframe recover it; without this the picture stays frozen.
+     */
+    private fun stuck(): Boolean {
+        if (inputsSinceOutput < STUCK_FRAMES) return false
+        val now = System.nanoTime()
+        if (now - firstInputSinceOutputNs < STUCK_NS) return false
+        Log.w(TAG, "decoder stuck: no output for ${(now - lastOutputNs) / 1_000_000} ms after $inputsSinceOutput frames; restarting it")
+        restart()
+        return true
     }
 
     private fun requestKeyframe() {
@@ -109,6 +129,7 @@ class VideoDecoder(
         pending.clear()
         freeInputs.clear()
         inflight.clear()
+        inputsSinceOutput = 0
     }
 
     fun shutdown() {
@@ -167,12 +188,8 @@ class VideoDecoder(
      * `adb shell setprop debug.waylus.vdec "key=int;key=int"` sets those integer keys on the
      * next decoder start. Empty by default.
      */
-    @android.annotation.SuppressLint("PrivateApi")
     private fun applyDebugParams(format: MediaFormat) {
-        val v = runCatching {
-            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
-                .invoke(null, "debug.waylus.vdec") as String
-        }.getOrDefault("")
+        val v = debugProp("debug.waylus.vdec")
         for (kv in v.split(';').map { it.trim() }.filter { it.isNotEmpty() }) {
             val (k, num) = kv.split('=', limit = 2).let { it[0].trim() to it.getOrNull(1)?.trim()?.toIntOrNull() }
             if (num == null) { Log.w(TAG, "debug.waylus.vdec: bad entry '$kv'"); continue }
@@ -191,7 +208,9 @@ class VideoDecoder(
             buf.put(p.data, p.off, len)
             if (p.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
                 // capture, received, queued into the codec, decoded (filled in later)
-                inflight[p.ptsUs] = longArrayOf(p.captureNs, p.recvNs, System.nanoTime(), 0)
+                val now = System.nanoTime()
+                inflight[p.ptsUs] = longArrayOf(p.captureNs, p.recvNs, now, 0)
+                if (inputsSinceOutput++ == 0) firstInputSinceOutputNs = now
             }
             c.queueInputBuffer(idx, 0, len, p.ptsUs, p.flags)
         }
@@ -217,7 +236,9 @@ class VideoDecoder(
 
         override fun onOutputBufferAvailable(c: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
             if (c !== codec) return
-            inflight[info.presentationTimeUs]?.let { it[3] = System.nanoTime() }
+            lastOutputNs = System.nanoTime()
+            inputsSinceOutput = 0
+            inflight[info.presentationTimeUs]?.let { it[3] = lastOutputNs }
             c.releaseOutputBuffer(index, true)
         }
 
@@ -234,7 +255,15 @@ class VideoDecoder(
 
     companion object {
         private const val TAG = "waylus"
+
+        @android.annotation.SuppressLint("PrivateApi")
+        private fun debugProp(name: String): String = runCatching {
+            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
+                .invoke(null, name) as String
+        }.getOrDefault("")
         private const val KEY_RETRY_NS = 300_000_000L
+        private const val STUCK_NS = 500_000_000L
+        private const val STUCK_FRAMES = 5
 
         /** Picks the best hardware AVC decoder and reports its limits. */
         fun pick(): Info {
