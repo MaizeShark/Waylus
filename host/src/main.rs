@@ -5,6 +5,7 @@ mod adb;
 mod aoa;
 mod damage;
 mod encode;
+mod patch;
 mod frame;
 mod link;
 mod linkbench;
@@ -124,6 +125,11 @@ struct Args {
     /// install/start the app and read the raw pen).
     #[arg(long, requires = "wifi")]
     no_usb: bool,
+    /// Experimental: also send what changes around the pen as raw patches that the app
+    /// draws above the video until the decoder catches up (docs/damage-path.md). USB only;
+    /// needs an app that supports it (Android 13+). Off by default.
+    #[arg(long)]
+    fast_patches: bool,
     /// Show the stats display (frame rate, latency) on the tablet. It can also be turned on
     /// in the app's settings, or with a tap on the black bar beside the picture.
     #[arg(long)]
@@ -353,6 +359,7 @@ fn main() -> Result<()> {
             raw_pen: _raw_pen.as_ref().map(|_| pen_sink.clone()),
             output_size,
             hud: args.hud,
+            fast_patches: args.fast_patches,
         },
         {
             let mut t = Vec::new();

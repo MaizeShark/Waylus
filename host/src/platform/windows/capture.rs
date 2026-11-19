@@ -215,6 +215,8 @@ pub fn start(req: &CaptureRequest) -> Result<Capture> {
         recycle: recycle_tx,
         geometry: StreamGeometry { position: Some((out.x, out.y)), size: Some((out.width, out.height)) },
         running,
+        // Not implemented on Windows yet (needs a D3D11 readback of the window).
+        patches: Default::default(),
     })
 }
 

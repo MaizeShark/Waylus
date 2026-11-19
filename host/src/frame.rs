@@ -50,6 +50,8 @@ pub struct Capture {
     pub recycle: crossbeam_channel::Sender<Vec<u8>>,
     pub geometry: StreamGeometry,
     pub running: Arc<AtomicBool>,
+    /// Fast patches (patch.rs): off unless the session turns them on.
+    pub patches: Arc<crate::patch::PatchCtl>,
 }
 
 impl Capture {

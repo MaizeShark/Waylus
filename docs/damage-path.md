@@ -2,10 +2,11 @@
 
 An experiment: send the small parts of the screen that change while drawing (the stroke, the cursor) to the tablet as raw pixels, next to the H.264 stream, so they skip the tablet's hardware decoder. The decoder is the largest stage on the TCL NXTPAPER 14 (MT8781): ~19 ms per frame with the pen idle, ~11.5 ms while drawing ([where the time goes](measurements.md#where-the-time-goes)).
 
-Status (2026-11-19): **phase 1 done on niri and the NXTPAPER 14; the decision gate passed.** Phase 2 (prototype, `--fast-patches`, off by default) is in progress. Still open from phase 1: compositor damage on KDE and GNOME, Windows dirty regions, and the tablet benchmark on the Pixel 7a (see [open items](#open-items)).
+Status (2026-11-19): **phase 1 done on niri and the NXTPAPER 14; the decision gate passed. Phase 2: a working prototype, `waylus --fast-patches` (off by default, Linux host, USB, Android 13+).** Phase 3 (measuring the result) is in progress. Still open from phase 1: compositor damage on KDE and GNOME, Windows dirty regions, and the tablet benchmark on the Pixel 7a (see [open items](#open-items)).
 
 Contents:
 - [Phase 1: measurements](#phase-1-measurements): [is the damage small?](#1-is-the-damage-small), [the tablet path](#2-the-tablet-path), [what USB carries](#3-what-usb-carries), [decision](#decision)
+- [Phase 2: the prototype](#phase-2-the-prototype): [host](#host), [protocol](#protocol), [tablet](#tablet), [what didn't work](#what-didnt-work-on-the-tablet), [Wi-Fi](#wi-fi)
 - [Open items](#open-items)
 - [Dev flags and tools](#dev-flags-and-tools)
 
@@ -98,11 +99,54 @@ Consequences for the prototype, from the numbers above:
 - On niri there is no compositor damage, so the host compares that window with the previous frame itself. Where the compositor reports damage (KDE, GNOME, Windows), the window can be skipped when nothing in it changed.
 - Cap a frame's patches at a few tens of KB after LZ4 and drop (never queue) patches the link can't take right away.
 
+## Phase 2: the prototype
+
+`waylus --fast-patches` turns it on. Without the flag nothing changes on either side: the host never reads anything back, and the app sets nothing up until a patch arrives. With the flag the H.264 stream is the same as without it.
+
+### Host
+
+`host/src/patch.rs`, called from the Linux capture (`platform/linux/capture.rs`):
+- The session passes the pen position (from the app's pen events or the raw stylus stream) to the capture side. While the pen was seen in the last 0.5 s, each frame passed on to the encoder is followed by a look at a **512×512 window around the pen** in the scaled stream picture: on the zero-copy path a `glReadPixels` of that window from the texture the frame was blitted and scaled into (the same pixels the encoder gets), on the CPU path a copy out of the frame.
+- That window is compared with what the host saw there before, in 16×16 tiles (a full-frame copy of the last pixels read). Tiles that changed are merged into rectangles (as in phase 1), forced opaque, and LZ4-compressed as RGBA. A tile the window moves onto for the first time is only remembered, not sent: there is nothing to compare it with, and what is there is most likely already on screen.
+- Patches above 64 KB (LZ4) per frame, or more than 255 rectangles, are dropped: that frame is left to H.264. A sender thread of its own writes them right away, so they never wait behind back-pressure or the encoder; if it is still busy with the previous frame's patches, the new ones are dropped, never queued.
+- The frame goes to the encoder *before* the window is read back, so the video is never held up by it. The look takes ~1 ms per frame on the capture thread (RTX 4060; readback, diff and LZ4 of a typical drawing frame).
+- Over Wi-Fi patches stay off. On Windows the capture doesn't make them yet (it would need a D3D11 readback of the window); on Linux the CPU path and the zero-copy paths do (tested: CUDA/NVENC; the VAAPI path reads from the same texture but is untested).
+- With `-v` the host logs a `patches:` line every 5 s: frames sent, size, the capture side's work and drops, and capture → received / handed to the compositor on the tablet.
+
+### Protocol
+
+Additive, protocol version unchanged (5):
+- `Hello` gets an optional `u32 caps` at the end, like `px_per_mm` before it: an old host ignores the extra bytes, an old app sends none (caps 0). Bit 0: the app can draw patches (Android 13 or newer).
+- `PATCH` (29, host → tablet): `[u64 capture_ns][u16 frame_w][u16 frame_h][u8 flags][u8 count]`, then per rectangle `[u16 x][u16 y][u16 w][u16 h][u32 len][len bytes]`, the rectangle's RGBA pixels as LZ4 block data (flags bit 0). Only sent to apps with the caps bit, so old apps never see it (they would ignore it anyway).
+- `PATCH_SHOWN` (30, tablet → host): `[u64 capture_ns][u64 recv_ns][u64 swap_ns][u64 latch_ns]`, for the statistics. An old host ignores it.
+
+### Tablet
+
+`PatchOverlay.kt`, design A:
+- A child `SurfaceControl` of the video `SurfaceView`'s, one layer above the video, transparent, with a canvas texture the size of the video frame and the capture time of the patch in each 16×16 tile.
+- On a patch: LZ4-decompress each rectangle, `glTexSubImage2D` it into the canvas, draw the canvas into the layer's surface, swap. Patches older than the newest video frame already shown are dropped.
+- When the decoder reports a frame shown (the same callback that sends `FRAME_SHOWN`), tiles with patches up to that capture time are cleared, two vsyncs later, so the video frame is surely latched first (on the MT8781 the "shown" callback time is when the frame is handed over, not when it is on screen).
+- Half a second after the canvas went empty the layer is hidden, so between strokes the video is composited exactly as without patches.
+- Debug switches (system properties, off by default): `debug.waylus.patchlog 1` logs per-patch timings, `debug.waylus.patchtint 1` draws patches reddish to see where they are, `debug.waylus.patchtest 1` draws a fixed test pattern for checking the orientation.
+
+### What didn't work on the tablet
+
+Measured on the NXTPAPER 14 with `dumpsys SurfaceFlinger` and the per-patch log, in this order:
+1. **Patch buffers handed over by `SurfaceControl.Transaction.setBuffer` from an `ImageReader`** (as in the phase 1 benchmark): between `eglSwapBuffers` and the image arriving in the reader 5–16 ms passed, and another 6–13 ms until the latch; received → latched p50 22–25 ms, slower than the video. Replaced by a `Surface` made from the `SurfaceControl`, which GL draws into directly (the buffer path a `SurfaceView` uses). That loses the latch time in `PATCH_SHOWN` (now 0); the statistics end where the video's do, when the buffer is handed to the compositor.
+2. **The overlay was composited on the GPU** (`composition=CLIENT`) while the video stayed on a hardware plane (`DEVICE`). The panel is portrait (1600×2400) and both layers are rotated, but rotation wasn't the cause: buffers of the frame size (1920×1080) scaled up to the video's 2400×1350 on screen were. Buffers of the on-screen size, with the canvas scaled up bilinearly by GL, go on a hardware plane like the video; checked with the patches up and with the stats display off.
+3. **Swapping blocked for a frame** once patches and clears together asked for more than one buffer per vsync (about 120 per second while drawing): a queue built up and patches reached the compositor 40–60 ms late. Holding updates back to one per vsync then delayed most patches by up to a frame. What works: the surface in async mode (`eglSwapInterval(0)`): a buffer queued before the compositor took the previous one replaces it, and swapping never waits. The canvas always holds the newest state, so the newest buffer is always the right one.
+4. Pre-rotating buffers to the panel's orientation doesn't work through a `Surface`: the buffers get their producer's transform (none for EGL), whatever the `SurfaceControl` was given. Not needed after 2.
+
+### Wi-Fi
+
+Patches are off over Wi-Fi. They would need their own design there: the video already uses FEC over UDP, and a patch is only worth sending if it arrives before the video frame, so it would need its own small FEC block per frame (a lost patch costs nothing, but a late one is useless), pacing so that bursts don't add to the airtime the video needs, and the host's Wi-Fi link estimate to decide when a frame's patches are still cheaper than waiting for the decoder. Over a weak link (sent → received ~8 ms for a whole frame) the gain over the decoder would be smaller than over USB.
+
 ## Open items
 
 - KDE Plasma and GNOME: run the same scenarios with `WAYLUS_DAMAGE_LOG` (without `WAYLUS_NO_ZEROCOPY` it logs the compositor's damage only) for a monitor and a virtual output, to see whether the reported damage is as small as the pixel diff.
 - Windows 11: the same on the Windows host (dirty regions; the LZ4 sizes need a readback that isn't there on Windows yet).
 - Pixel 7a: the tablet benchmark and the link benchmark (USB 3: how much larger patches can get, and whether raw 1080p60 NV12 at ~190 MB/s is realistic).
+- Windows host: patches (D3D11 readback of the window around the pen).
 - Krita and a second tablet: with the host's "Waylus Pen" present, Krita (6.0.4, Wayland) moved the cursor for the synthetic pen but drew nothing, even after the host exited; synthetic mouse strokes worked. Real use has one tablet, so this only affects the test setup.
 
 ## Dev flags and tools
@@ -113,3 +157,4 @@ None of these are for normal use; all are off unless set.
 - `tools/damage/scenario.py stroke|write|hover|mouse|scroll|drag|mstroke|mwrite|keys|tap`: synthetic input through uinput for repeatable scenarios (`--help`).
 - `WAYLUS_BENCH_LINK=1` (host): the link benchmark above instead of streaming.
 - `am start -n de.hut9.waylus/dev.waylus.MainActivity --es bench_damage LABEL [--ez bench_boost true]` (app): the tablet benchmark above; results in logcat, lines starting with `dbench`.
+- `adb shell setprop debug.waylus.patchlog 1` / `debug.waylus.patchtint 1` / `debug.waylus.patchtest 1` (app): see [tablet](#tablet).

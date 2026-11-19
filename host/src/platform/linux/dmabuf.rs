@@ -325,6 +325,33 @@ impl Importer {
         Ok(())
     }
 
+    /// Reads part of the last frame blitted (the scaled stream picture) as RGBA rows,
+    /// top row first. Used for fast patches (patch.rs) after `read_gpu`.
+    pub fn read_region(&mut self, x: u32, y: u32, w: u32, h: u32, out: &mut Vec<u8>) -> Result<()> {
+        let Some((_, fbo, _, _)) = self.staging else { bail!("no frame yet") };
+        out.resize(w as usize * h as usize * 4, 0);
+        unsafe {
+            let gl = &self.gl;
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+            gl.read_pixels(
+                x as i32,
+                y as i32,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(out.as_mut_slice())),
+            );
+            let err = gl.get_error();
+            if err != glow::NO_ERROR {
+                bail!("glReadPixels error {err:#x}");
+            }
+        }
+        Ok(())
+    }
+
     /// Zero-copy variant: the scaled frame stays on the GPU as an FFmpeg hardware
     /// frame (CUDA RGB0 or VAAPI NV12) for the encoder.
     #[allow(clippy::too_many_arguments)]

@@ -54,6 +54,16 @@ pub mod ty {
     /// Host → tablet: the host ends the session ([u8 reason][UTF-8 text]), so the app can
     /// say why instead of waiting for the idle timeout. Older apps ignore it.
     pub const BYE: u8 = 28;
+    /// Host → tablet, `--fast-patches` only, to apps that set `caps::PATCHES` in their hello:
+    /// raw screen patches of one frame (see patch.rs and write_patch).
+    pub const PATCH: u8 = 29;
+    /// Tablet → host: when a PATCH was received, drawn and latched by SurfaceFlinger.
+    pub const PATCH_SHOWN: u8 = 30;
+}
+
+/// Hello `caps` bits (an optional field at the end of the hello; older apps send none).
+pub mod caps {
+    pub use crate::patch::CAP_PATCHES as PATCHES;
 }
 
 /// BYE reasons.
@@ -132,6 +142,8 @@ pub struct Hello {
     pub decoder: String,
     /// Physical pixel density of the panel (0 = unknown, older clients).
     pub px_per_mm: f32,
+    /// What the app supports beyond protocol 5 ([`caps`]); 0 for older apps.
+    pub caps: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -205,6 +217,9 @@ pub enum DeviceMsg {
     Pong { host_ns: u64, dev_ns: u64 },
     /// Device timestamps of one frame: received, rendered, queued into the decoder, decoded.
     FrameShown { capture_ns: u64, recv_ns: u64, render_ns: u64, queued_ns: u64, decoded_ns: u64 },
+    /// Device timestamps of one PATCH: received, handed to the compositor, latched (0 if
+    /// the app can't tell, Android < 15).
+    PatchShown { capture_ns: u64, recv_ns: u64, swap_ns: u64, latch_ns: u64 },
     RequestKeyframe,
     Layout(Layout),
     /// The client (re)started a session on the same USB link (AOA), with this nonce.
@@ -281,6 +296,7 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             let name = c.0.get(..n).unwrap_or(c.0);
             c.0 = c.0.get(n..).unwrap_or(&[]);
             let px_per_mm = c.u16().map(|v| v as f32 / 100.0).unwrap_or(0.0);
+            let caps = c.u32().unwrap_or(0);
             DeviceMsg::Hello(Hello {
                 version,
                 surface_w,
@@ -292,6 +308,7 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
                 refresh_hz,
                 decoder: String::from_utf8_lossy(name).into_owned(),
                 px_per_mm,
+                caps,
             })
         }
         ty::PEN => DeviceMsg::Pen(PenSample {
@@ -321,6 +338,7 @@ pub fn read_msg(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<DeviceMsg> {
             queued_ns: c.u64().unwrap_or(0),
             decoded_ns: c.u64().unwrap_or(0),
         },
+        ty::PATCH_SHOWN => DeviceMsg::PatchShown { capture_ns: c.u64()?, recv_ns: c.u64()?, swap_ns: c.u64()?, latch_ns: c.u64()? },
         ty::REQUEST_KEYFRAME => DeviceMsg::RequestKeyframe,
         ty::LAYOUT => DeviceMsg::Layout(Layout {
             rotation: c.u8()?,
@@ -398,6 +416,26 @@ pub fn write_video(w: &mut impl Write, capture_ns: u64, flags: u8, data: &[u8]) 
     p[..8].copy_from_slice(&capture_ns.to_le_bytes());
     p[8] = flags;
     message(w, ty::VIDEO, &[&p, data])
+}
+
+/// PATCH: `[u64 capture_ns][u16 frame_w][u16 frame_h][u8 flags][u8 count]`, then per
+/// rectangle `[u16 x][u16 y][u16 w][u16 h][u32 len][len bytes]`: the rectangle's RGBA
+/// pixels, rows packed, LZ4 block format (flags bit 0; always set for now).
+pub fn write_patch(w: &mut impl Write, m: &crate::patch::PatchMsg) -> io::Result<()> {
+    let mut p = Vec::with_capacity(14 + m.rects.len() * 12 + m.bytes());
+    p.extend_from_slice(&m.capture_ns.to_le_bytes());
+    p.extend_from_slice(&m.frame_w.to_le_bytes());
+    p.extend_from_slice(&m.frame_h.to_le_bytes());
+    p.push(1);
+    p.push(m.rects.len().min(255) as u8);
+    for (r, data) in m.rects.iter().take(255) {
+        for v in [r.x, r.y, r.w, r.h] {
+            p.extend_from_slice(&(v as u16).to_le_bytes());
+        }
+        p.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        p.extend_from_slice(data);
+    }
+    message(w, ty::PATCH, &[&p])
 }
 
 pub fn write_sync(w: &mut impl Write, nonce: u64) -> io::Result<()> {

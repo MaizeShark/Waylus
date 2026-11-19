@@ -54,6 +54,16 @@ object Proto {
     const val BYE_STOPPED = 0
     const val BYE_ERROR = 1
 
+    /**
+     * Host → tablet (`--fast-patches`, only to apps with [CAP_PATCHES]): raw screen patches of
+     * one frame, drawn by [PatchOverlay]. Tablet → host: when one was drawn and latched.
+     */
+    const val PATCH = 29
+    const val PATCH_SHOWN = 30
+
+    /** Hello caps bits (an optional field at the end of the hello, no version bump). */
+    const val CAP_PATCHES = 1
+
     /** STATS flags. */
     const val STATS_HUD = 1
     /** The host reads the stylus directly (over adb): no pen→host figure. */
@@ -91,9 +101,9 @@ object Proto {
     }
 
     /** pxPerMm: physical pixel density of the panel (appended field; 0 = unknown). */
-    fun hello(surfaceW: Int, surfaceH: Int, maxW: Int, maxH: Int, mbFrame: Int, mbSec: Int, refreshHz: Float, decoder: String, pxPerMm: Float): ByteArray {
+    fun hello(surfaceW: Int, surfaceH: Int, maxW: Int, maxH: Int, mbFrame: Int, mbSec: Int, refreshHz: Float, decoder: String, pxPerMm: Float, caps: Int = 0): ByteArray {
         val name = decoder.toByteArray().take(255).toByteArray()
-        val b = msg(HELLO, 2 + 2 + 2 + 2 + 2 + 4 + 4 + 2 + 1 + name.size + 2)
+        val b = msg(HELLO, 2 + 2 + 2 + 2 + 2 + 4 + 4 + 2 + 1 + name.size + 2 + 4)
         b.putShort(VERSION.toShort())
         b.putShort(surfaceW.toShort()); b.putShort(surfaceH.toShort())
         b.putShort(maxW.toShort()); b.putShort(maxH.toShort())
@@ -101,6 +111,13 @@ object Proto {
         b.putShort((refreshHz * 100).toInt().coerceIn(0, 65535).toShort())
         b.put(name.size.toByte()); b.put(name)
         b.putShort((pxPerMm * 100).toInt().coerceIn(0, 65535).toShort())
+        b.putInt(caps)
+        return b.array()
+    }
+
+    fun patchShown(captureNs: Long, recvNs: Long, swapNs: Long, latchNs: Long): ByteArray {
+        val b = msg(PATCH_SHOWN, 32)
+        b.putLong(captureNs); b.putLong(recvNs); b.putLong(swapNs); b.putLong(latchNs)
         return b.array()
     }
 

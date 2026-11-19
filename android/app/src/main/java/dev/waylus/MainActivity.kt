@@ -78,6 +78,8 @@ class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Cal
     private val pinQueue = LinkedBlockingQueue<String>()
     @Volatile private var pairCancelled = false
     private lateinit var decoder: VideoDecoder
+    /** Fast patches above the video (experimental, docs/damage-path.md); idle unless the host sends them. */
+    private val patches = PatchOverlay { c, r, s, l -> conn.send(Proto.patchShown(c, r, s, l)) }
     private lateinit var input: InputCapture
     private lateinit var boost: ClockBoost
     private val decoderInfo by lazy { VideoDecoder.pick() }
@@ -177,6 +179,7 @@ class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Cal
             decoderInfo,
             onShown = { c, r, n, q, d ->
                 conn.send(Proto.frameShown(c, r, n, q, d))
+                patches.videoShown(c)
                 LiveStats.frameShown(q, d)
                 if (!firstFrameShown) {
                     firstFrameShown = true
@@ -644,6 +647,7 @@ class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Cal
         boost.shutdown()
         conn.stop()
         decoder.shutdown()
+        patches.shutdown()
         super.onDestroy()
     }
 
@@ -697,7 +701,8 @@ class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Cal
         val w = maxOf(bounds.width(), bounds.height())
         val h = minOf(bounds.width(), bounds.height())
         val d = decoderInfo
-        return Proto.hello(w, h, d.maxW, d.maxH, d.mbPerFrame, d.mbPerSec, refreshHz, d.name + if (d.lowLatency) " (low-latency)" else "", pxPerMm())
+        val caps = if (PatchOverlay.supported) Proto.CAP_PATCHES else 0
+        return Proto.hello(w, h, d.maxW, d.maxH, d.mbPerFrame, d.mbPerSec, refreshHz, d.name + if (d.lowLatency) " (low-latency)" else "", pxPerMm(), caps)
     }
 
     /**
@@ -716,6 +721,7 @@ class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Cal
     override fun onDisconnected(reason: String) {
         firstFrameShown = false
         decoder.configure(0, 0)
+        patches.configure(0, 0)
         runOnUiThread {
             input.reset()
             hostHud = false
@@ -740,6 +746,11 @@ class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Cal
             firstFrameShown = false
             decoder.configure(width, height, flags)
         }
+        patches.configure(if (codec == Proto.CODEC_H264) width else 0, if (codec == Proto.CODEC_H264) height else 0)
+    }
+
+    override fun onPatch(payload: ByteArray, recvNs: Long) {
+        patches.submit(payload, recvNs)
     }
 
     override fun onVideo(captureNs: Long, flags: Int, data: ByteArray, offset: Int, recvNs: Long) {
@@ -773,13 +784,16 @@ class MainActivity : ComponentActivity(), Connection.Listener, SurfaceHolder.Cal
         // Tell the system our content rate so variable-refresh panels stay at full speed.
         runCatching { holder.surface.setFrameRate(refreshHz, android.view.Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) }
         decoder.setSurface(holder.surface)
+        if (PatchOverlay.supported) patches.setParent(surfaceView.surfaceControl, width, height)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         // The codec must let go of the surface before this returns.
-        val done = CountDownLatch(1)
+        val done = CountDownLatch(2)
         decoder.setSurface(null)
         decoder.post { done.countDown() }
+        patches.setParent(null, 0, 0)
+        patches.post { done.countDown() }
         done.await(500, TimeUnit.MILLISECONDS)
     }
 

@@ -62,6 +62,9 @@ pub fn start(source_max_fps: u32, choose_again: bool, virtual_size: Option<(u32,
     let target_size = Arc::new(AtomicU64::new(0));
     let sizes = (source_size.clone(), target_size.clone());
     let (recycle_tx, recycle_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let patches = Arc::new(crate::patch::PatchCtl::default());
+    patches.supported.store(true, Ordering::Relaxed);
+    let patches2 = patches.clone();
 
     let frames2 = frames.clone();
     let running2 = running.clone();
@@ -85,7 +88,7 @@ pub fn start(source_max_fps: u32, choose_again: bool, virtual_size: Option<(u32,
         };
         let _keep = (proxy, session);
         let _ = geo_tx.send(Ok((geometry, node, fd.try_clone().expect("dup fd"))));
-        if let Err(e) = run_pipewire(fd, node, source_max_fps, virtual_size, pace2, sizes, frames2, recycle_rx, running2.clone()) {
+        if let Err(e) = run_pipewire(fd, node, source_max_fps, virtual_size, pace2, sizes, frames2, recycle_rx, running2.clone(), patches2) {
             warn!("capture stopped: {e:#}");
         }
         running2.store(false, Ordering::SeqCst);
@@ -93,7 +96,7 @@ pub fn start(source_max_fps: u32, choose_again: bool, virtual_size: Option<(u32,
 
     let (geometry, node, _fd) = geo_rx.recv().context("capture thread died")??;
     info!("screencast node {node}, geometry {geometry:?}");
-    Ok(Capture { frames, pace_ns, source_size, target_size, recycle: recycle_tx, geometry, running })
+    Ok(Capture { frames, pace_ns, source_size, target_size, recycle: recycle_tx, geometry, running, patches })
 }
 
 async fn open_portal(choose_again: bool, virtual_monitor: bool) -> Result<(
@@ -175,6 +178,39 @@ struct UserData {
     /// Damage of the buffers since the last frame passed on (skipped ones included).
     damage: crate::damage::Damage,
     damage_meta: bool,
+    /// Fast patches (patch.rs).
+    patches: Arc<crate::patch::PatchCtl>,
+    patcher: crate::patch::Patcher,
+}
+
+/// Fast patches for the frame just passed on: reads the window around the pen with
+/// `read` (into `patcher.window`, RGBA or BGRA rows) and hands the changes to the session.
+fn make_patches(
+    ctl: &crate::patch::PatchCtl,
+    patcher: &mut crate::patch::Patcher,
+    capture_ns: u64,
+    (fw, fh): (u32, u32),
+    bgra: bool,
+    read: impl FnOnce(crate::damage::Rect, &mut Vec<u8>) -> Result<()>,
+) {
+    let Some(pen) = ctl.pen_at(capture_ns) else { return };
+    let t = now_ns();
+    let win = crate::patch::Patcher::window_at(fw, fh, pen);
+    ctl.looked.fetch_add(1, Ordering::Relaxed);
+    if let Err(e) = read(win, &mut patcher.window) {
+        debug!("patch readback: {e:#}");
+        return;
+    }
+    let max = ctl.max_bytes.load(Ordering::Relaxed) as usize;
+    let m = patcher.diff(capture_ns, fw, fh, win, bgra, max);
+    ctl.work_ns.fetch_add(now_ns() - t, Ordering::Relaxed);
+    match m {
+        Some(m) => ctl.send(m),
+        None if patcher.last_too_large => {
+            ctl.too_large.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {}
+    }
 }
 
 impl UserData {
@@ -369,6 +405,7 @@ fn run_pipewire(
     frames: Arc<LatestSlot<Frame>>,
     recycle: crossbeam_channel::Receiver<Vec<u8>>,
     running: Arc<AtomicBool>,
+    patches: Arc<crate::patch::PatchCtl>,
 ) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -414,6 +451,8 @@ fn run_pipewire(
         damage_log,
         damage: Default::default(),
         damage_meta: false,
+        patches,
+        patcher: Default::default(),
         info: Default::default(),
         format: None,
         dmabuf: false,
@@ -578,6 +617,12 @@ fn run_pipewire(
                                 capture_ns: now,
                                 data: buf,
                             });
+                            // After handing the frame on, so the encoder never waits for this.
+                            if let Some(imp) = ud.importer.as_mut() {
+                                make_patches(&ud.patches, &mut ud.patcher, now, (ow, oh), false, |r, out| {
+                                    imp.read_region(r.x, r.y, r.w, r.h, out)
+                                });
+                            }
                             return;
                         }
                         Err(e) => {
@@ -620,6 +665,18 @@ fn run_pipewire(
             ud.next_due_ns = (ud.next_due_ns + interval).max(now.saturating_sub(interval / 2));
             ud.stat_out += 1;
             ud.log_damage(now, (width, height), (fw, fh), Some((&buf, stride)));
+            if ud.patches.pen_at(now).is_some() {
+                let bgra = matches!(format, PixFmt::Bgra | PixFmt::Bgrx);
+                let data = &buf;
+                make_patches(&ud.patches, &mut ud.patcher, now, (fw, fh), bgra, |r, out| {
+                    out.clear();
+                    for y in r.y..r.y + r.h {
+                        let o = y as usize * stride + r.x as usize * 4;
+                        out.extend_from_slice(&data[o..o + r.w as usize * 4]);
+                    }
+                    Ok(())
+                });
+            }
             ud.frames.put(Frame { gpu: None, width: fw, height: fh, stride, format, capture_ns: now, data: buf });
         })
         .register()?;

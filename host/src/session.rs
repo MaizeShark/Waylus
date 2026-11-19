@@ -63,6 +63,9 @@ pub struct Opts {
     pub output_size: (u32, u32),
     /// --hud: ask the app to show its stats display.
     pub hud: bool,
+    /// --fast-patches (experimental, docs/damage-path.md): send what changes around the pen
+    /// as raw patches next to the video, to apps that can draw them. USB only.
+    pub fast_patches: bool,
 }
 
 /// Figures the video thread shares with the session thread (for STATS and the status line).
@@ -70,6 +73,12 @@ pub struct Opts {
 struct Live {
     /// Total time the encoder waited for the tablet (back-pressure).
     held_ns: AtomicU64,
+    /// Fast patches written: messages, LZ4 bytes, raw bytes, capture → written, write time.
+    patch_msgs: AtomicU64,
+    patch_bytes: AtomicU64,
+    patch_raw: AtomicU64,
+    patch_lag_ns: AtomicU64,
+    patch_write_ns: AtomicU64,
 }
 
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -450,7 +459,46 @@ fn session(
         })?
     };
 
-    let mut stats = Stats { kind, live: live.clone(), host_stats: host_stats.clone(), ..Default::default() };
+    // Fast patches: a thread of their own writes them as they come, so they never wait
+    // behind back-pressure or the encoder; the capture side drops them while it is busy.
+    let patch_ctl = capture.map(|c| c.patches.clone());
+    let patcher = match &patch_ctl {
+        Some(ctl) if opts.fast_patches => {
+            if !ctl.supported.load(Ordering::Relaxed) {
+                info!("fast patches: not available with this capture backend yet");
+                None
+            } else if hello.caps & proto::caps::PATCHES == 0 {
+                info!("fast patches: the app can't draw them (needs a newer app on Android 13 or later)");
+                None
+            } else if kind == "wifi" {
+                info!("fast patches: off over Wi-Fi");
+                None
+            } else {
+                let (tx, rx) = crossbeam_channel::bounded::<crate::patch::PatchMsg>(1);
+                let (writer, stop, live) = (writer.clone(), stop.clone(), live.clone());
+                let t = thread::Builder::new().name("patches".into()).spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok(m) = rx.recv_timeout(Duration::from_millis(200)) else { continue };
+                        let t0 = now_ns();
+                        if send(&writer, |w| proto::write_patch(w, &m)).is_err() {
+                            break;
+                        }
+                        live.patch_msgs.fetch_add(1, Ordering::Relaxed);
+                        live.patch_bytes.fetch_add(m.bytes() as u64, Ordering::Relaxed);
+                        live.patch_raw.fetch_add(m.raw_bytes as u64, Ordering::Relaxed);
+                        live.patch_lag_ns.fetch_add(now_ns().saturating_sub(m.capture_ns), Ordering::Relaxed);
+                        live.patch_write_ns.fetch_add(now_ns() - t0, Ordering::Relaxed);
+                    }
+                })?;
+                ctl.start(tx, crate::patch::DEFAULT_MAX_BYTES);
+                info!("fast patches: on (experimental), {} px around the pen, at most {} KB per frame", crate::patch::WINDOW, crate::patch::DEFAULT_MAX_BYTES / 1024);
+                Some(t)
+            }
+        }
+        _ => None,
+    };
+
+    let mut stats = Stats { kind, live: live.clone(), host_stats: host_stats.clone(), patch_ctl: patch_ctl.clone(), ..Default::default() };
     let res: Result<()> = (|| loop {
         let msg = proto::read_msg(&mut reader, &mut buf)?;
         match msg {
@@ -458,6 +506,11 @@ fn session(
                 if opts.raw_pen.is_none() {
                     pen.lock().unwrap().handle(&s)?;
                     stats.pen(&s);
+                    if let Some(ctl) = &patch_ctl
+                        && s.state != proto::pen_state::OUT
+                    {
+                        ctl.pen(s.x, s.y, now_ns());
+                    }
                 }
             }
             DeviceMsg::Layout(layout) => {
@@ -468,11 +521,17 @@ fn session(
                         Some((l, _)) => *l = layout,
                         None => {
                             let pen = pen.clone();
+                            let ctl = patch_ctl.clone();
                             *g = Some((
                                 layout,
                                 Box::new(move |s| {
                                     if let Err(e) = pen.lock().unwrap().handle(&s) {
                                         warn!("pen: {e}");
+                                    }
+                                    if let Some(ctl) = &ctl
+                                        && s.state != proto::pen_state::OUT
+                                    {
+                                        ctl.pen(s.x, s.y, now_ns());
                                     }
                                 }),
                             ));
@@ -498,6 +557,7 @@ fn session(
                     ids.pop_front();
                 }
             }
+            DeviceMsg::PatchShown { capture_ns, recv_ns, swap_ns, latch_ns } => stats.patch(capture_ns, recv_ns, swap_ns, latch_ns),
             DeviceMsg::FrameLost { capture_ns, frames } => {
                 // Unrecoverable on the network (Wi-Fi): don't wait for it, recover with an IDR.
                 in_flight.shown(capture_ns);
@@ -541,8 +601,14 @@ fn session(
     }
     ACTIVE.lock().unwrap().take();
     stop.store(true, Ordering::SeqCst);
+    if let Some(ctl) = &patch_ctl {
+        ctl.stop();
+    }
     close();
     let _ = pinger.join();
+    if let Some(t) = patcher {
+        let _ = t.join();
+    }
     if let Some(v) = video {
         match v.join() {
             Ok(Ok(f)) => *last_frame = f,
@@ -880,6 +946,15 @@ struct Stats {
     hud_pen: Vec<f64>,
     hud_last: Option<Instant>,
     hud_held_ns: u64,
+    /// Fast patches: capture → received / handed to the compositor / latched (host clock).
+    patch_ctl: Option<Arc<crate::patch::PatchCtl>>,
+    patch_recv: Vec<f64>,
+    patch_swap: Vec<f64>,
+    patch_latch: Vec<f64>,
+    /// On the tablet: received → latched.
+    patch_tablet: Vec<f64>,
+    /// Counter values at the last report, for deltas.
+    patch_last: [u64; 9],
 }
 
 /// p50 and p95 of `v` (sorts it), None if empty.
@@ -933,6 +1008,25 @@ impl Stats {
         self.t_queue.push(ms(recv, queued));
         self.t_decode.push(ms(queued, decoded));
         self.t_display.push(ms(decoded, render));
+    }
+
+    fn patch(&mut self, capture_ns: u64, recv: u64, swap: u64, latch: u64) {
+        let off = self.offset;
+        let ms = |dev: u64| off.map(|o| (dev as i64 - o - capture_ns as i64) as f64 / 1e6);
+        if let Some(v) = ms(recv) {
+            self.patch_recv.push(v);
+        }
+        if let Some(v) = ms(swap) {
+            self.patch_swap.push(v);
+        }
+        if latch > 0 && (latch as i64) > 0 {
+            if let Some(v) = ms(latch) {
+                self.patch_latch.push(v);
+            }
+            if latch > recv {
+                self.patch_tablet.push((latch - recv) as f64 / 1e6);
+            }
+        }
     }
 
     fn wifi(&mut self, w: &proto::WifiStats) {
@@ -1056,6 +1150,41 @@ impl Stats {
             );
             (self.wifi_spread_sum, self.wifi_assemble_sum, self.wifi_reports, self.idr_requests) = (0, 0, 0, 0);
         }
+        if let Some(ctl) = self.patch_ctl.clone() {
+            let l = &self.live;
+            let now = [
+                l.patch_msgs.load(Ordering::Relaxed),
+                l.patch_bytes.load(Ordering::Relaxed),
+                l.patch_raw.load(Ordering::Relaxed),
+                l.patch_lag_ns.load(Ordering::Relaxed),
+                ctl.looked.load(Ordering::Relaxed),
+                ctl.too_large.load(Ordering::Relaxed),
+                ctl.busy.load(Ordering::Relaxed),
+                ctl.work_ns.load(Ordering::Relaxed),
+                l.patch_write_ns.load(Ordering::Relaxed),
+            ];
+            let d: Vec<u64> = now.iter().zip(self.patch_last).map(|(a, b)| a - b).collect();
+            self.patch_last = now;
+            if d[4] > 0 || !self.patch_swap.is_empty() {
+                info!(
+                    target: STATS,
+                    "patches: {} frames sent ({:.1} KB avg, {:.1} KB raw), capture→written {:.2} ms, write {:.2} ms | looked {} frames ({:.2} ms each), too large {}, sender busy {} | capture→received {} | capture→drawn {} | capture→latched {} | tablet received→latched {}",
+                    d[0],
+                    d[1] as f64 / d[0].max(1) as f64 / 1024.0,
+                    d[2] as f64 / d[0].max(1) as f64 / 1024.0,
+                    d[3] as f64 / d[0].max(1) as f64 / 1e6,
+                    d[8] as f64 / d[0].max(1) as f64 / 1e6,
+                    d[4],
+                    d[7] as f64 / d[4].max(1) as f64 / 1e6,
+                    d[5],
+                    d[6],
+                    fmt(&mut self.patch_recv),
+                    fmt(&mut self.patch_swap),
+                    fmt(&mut self.patch_latch),
+                    fmt(&mut self.patch_tablet),
+                );
+            }
+        }
         if !self.t_decode.is_empty() {
             info!(
                 target: STATS,
@@ -1084,6 +1213,7 @@ mod tests {
             refresh_hz: 60.0,
             decoder: "c2.mtk.avc.decoder".into(),
             px_per_mm: 8.1,
+            caps: 0,
         }
     }
 

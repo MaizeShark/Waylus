@@ -33,6 +33,8 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
         fun onVideo(captureNs: Long, flags: Int, data: ByteArray, offset: Int, recvNs: Long)
         /** Wi-Fi: frames were lost; drop frames until the next keyframe. */
         fun onVideoLost() {}
+        /** Proto.PATCH (fast patches, experimental). */
+        fun onPatch(payload: ByteArray, recvNs: Long) {}
     }
 
     /** A byte stream to the host. */
@@ -182,6 +184,7 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
                         listener.onVideo(captureNs, flags, m.payload, 9, recvNs)
                     }
                     Proto.FRAME_LOST -> listener.onVideoLost()
+                    Proto.PATCH -> listener.onPatch(m.payload, recvNs)
                     Proto.STATS -> listener.onHostStats(m.payload)
                     Proto.BYE -> throw HostClosed(
                         if (m.payload.isNotEmpty()) m.payload[0].toInt() and 0xff else Proto.BYE_STOPPED,
