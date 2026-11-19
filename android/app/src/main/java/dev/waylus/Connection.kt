@@ -52,6 +52,9 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
         fun awaitSync(pattern: ByteArray, timeoutMs: Long): Boolean = true
     }
 
+    /** The host said goodbye (Proto.BYE). */
+    class HostClosed(val reason: Int, text: String) : java.io.IOException(text)
+
     private class TcpLink(val socket: Socket) : Link {
         override val input = BufferedInputStream(socket.getInputStream(), 256 * 1024)
         override val output: OutputStream = socket.getOutputStream()
@@ -180,6 +183,10 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
                     }
                     Proto.FRAME_LOST -> listener.onVideoLost()
                     Proto.STATS -> listener.onHostStats(m.payload)
+                    Proto.BYE -> throw HostClosed(
+                        if (m.payload.isNotEmpty()) m.payload[0].toInt() and 0xff else Proto.BYE_STOPPED,
+                        String(m.payload, minOf(1, m.payload.size), maxOf(0, m.payload.size - 1)),
+                    )
                     else -> Log.d(TAG, "ignoring message ${m.type}")
                 }
             }
@@ -195,6 +202,8 @@ class Connection(private val opener: () -> Link?, private val listener: Listener
 
         /** A disconnect, in words. */
         fun describe(e: Exception): String = when {
+            e is HostClosed && e.reason == Proto.BYE_STOPPED -> "Waylus was stopped on the computer"
+            e is HostClosed -> "the computer ended the session: ${e.message}"
             e is java.io.EOFException -> "the computer closed the connection"
             e is java.net.SocketTimeoutException -> "the computer stopped answering"
             e.message?.contains("ECONNRESET") == true || e.message?.contains("reset") == true -> "the connection was reset"

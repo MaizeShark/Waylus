@@ -76,7 +76,7 @@ By default the host switches the tablet into Android Open Accessory (AOA) mode a
 - The first time, Android asks for permission to access the accessory.
 - The tablet stays in accessory mode (USB ID 18d1:2d00/2d01) until it is unplugged, so MTP file transfer is unavailable meanwhile; adb keeps working.
 - The USB hop is no faster on average (p50 ~2.5 ms either way, measured on the NXTPAPER 14), but AOA has no tail spikes, while adb showed ~18–20 ms p95 windows ([measurements](measurements.md#where-the-time-goes)).
-- The link outlives the host and app processes. Each session therefore starts with a SYNC handshake, and a restarted host is picked up by a running app within ~5 s.
+- The link outlives the host and app processes. Each session therefore starts with a SYNC handshake, and a restarted host is picked up by a running app within ~5 s. On Ctrl-C the host first tells the app that it is stopping, so the app says so at once instead of waiting for the 5 s idle timeout.
 - The host needs access to the USB device. With USB debugging on, systemd's `70-uaccess.rules` already grants it (the accessory still exposes adb). Without adb, the tablet comes up as 18d1:2d00, which may need a rule like this in `/etc/udev/rules.d/70-waylus.rules`:
   ```
   SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00|2d01", TAG+="uaccess"

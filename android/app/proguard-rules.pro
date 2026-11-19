@@ -13,3 +13,6 @@
 
 # Readable stack traces in logcat.
 -keepattributes SourceFile,LineNumberTable
+
+# Readable class names in the app's own log lines (exceptions are logged with toString()).
+-keepnames class dev.waylus.** { *; }

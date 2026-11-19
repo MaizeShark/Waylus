@@ -51,6 +51,17 @@ pub mod ty {
     /// Host → tablet, about once a second: rolling figures for the tablet's stats display
     /// (HostStats). Added without a version bump: apps ignore message types they don't know.
     pub const STATS: u8 = 27;
+    /// Host → tablet: the host ends the session ([u8 reason][UTF-8 text]), so the app can
+    /// say why instead of waiting for the idle timeout. Older apps ignore it.
+    pub const BYE: u8 = 28;
+}
+
+/// BYE reasons.
+pub mod bye {
+    /// Waylus is exiting (Ctrl-C, console closed).
+    pub const STOPPED: u8 = 0;
+    /// The session failed on the host; the text says why.
+    pub const ERROR: u8 = 1;
 }
 
 /// STATS flags.
@@ -395,6 +406,11 @@ pub fn write_sync(w: &mut impl Write, nonce: u64) -> io::Result<()> {
 
 pub fn write_ping(w: &mut impl Write, host_ns: u64) -> io::Result<()> {
     message(w, ty::PING, &[&host_ns.to_le_bytes()])
+}
+
+pub fn write_bye(w: &mut impl Write, reason: u8, text: &str) -> io::Result<()> {
+    let text = &text.as_bytes()[..text.len().min(1000)];
+    message(w, ty::BYE, &[&[reason], text])
 }
 
 /// `[u8 flags][u16 × 5]`: capture→shown p50, p95, pen→host p50, p95, held back ms/s; times

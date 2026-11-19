@@ -43,7 +43,7 @@ sealed interface Pairing {
     data class Done(val message: String, val ok: Boolean) : Pairing
 }
 
-class DeviceInfo(
+data class DeviceInfo(
     val wifiConnected: Boolean = false,
     val addresses: List<String> = emptyList(),
     val freqMhz: Int = 0,
@@ -56,6 +56,8 @@ class DeviceInfo(
     val adbEnabled: Boolean? = null,
     val devOptions: Boolean? = null,
     val wirelessAdb: Boolean? = null,
+    /** Android 17+ hides these settings from apps and nothing else showed them on. */
+    val adbHidden: Boolean = false,
 )
 
 /**

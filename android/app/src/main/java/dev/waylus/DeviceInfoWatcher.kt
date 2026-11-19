@@ -97,6 +97,38 @@ class DeviceInfoWatcher(ctx: Context, private val onChange: (DeviceInfo) -> Unit
     private fun global(key: String): Boolean? =
         runCatching { Settings.Global.getInt(app.contentResolver, key) != 0 }.getOrNull()
 
+    private class Adb(val usb: Boolean?, val wireless: Boolean?, val devOptions: Boolean?, val hidden: Boolean)
+
+    /**
+     * USB/wireless debugging and developer options. Android 17 hides these settings from
+     * apps (they read as 0 whatever they are), so the system properties of the adb daemon
+     * come first: `sys.usb.config` lists adb while USB debugging is on, and
+     * `service.adb.tls.port` is set while wireless debugging runs. They are read with the
+     * `getprop` tool, which works from the app sandbox. A 0 from the settings on Android 17
+     * and later is reported as "can't tell" rather than "off". Worker thread.
+     */
+    private fun readAdb(): Adb {
+        val props = runCatching {
+            val p = ProcessBuilder("getprop").redirectErrorStream(true).start()
+            val out = p.inputStream.bufferedReader().readText()
+            p.waitFor()
+            PROP.findAll(out).associate { it.groupValues[1] to it.groupValues[2] }
+        }.getOrDefault(emptyMap())
+        val hidden = android.os.Build.VERSION.SDK_INT >= 37
+        fun merge(fromProps: Boolean, setting: Boolean?): Boolean? = when {
+            fromProps || setting == true -> true
+            hidden -> null
+            else -> setting
+        }
+        val usb = merge(props["sys.usb.config"].orEmpty().split(',').contains("adb"), global(Settings.Global.ADB_ENABLED))
+        val wireless = merge(props["service.adb.tls.port"].orEmpty().let { it.isNotEmpty() && it != "0" }, global(ADB_WIFI))
+        // Debugging can only be on with developer options on.
+        val dev = merge(usb == true || wireless == true, global(Settings.Global.DEVELOPMENT_SETTINGS_ENABLED))
+        return Adb(usb, wireless, dev, hidden && (usb == null || wireless == null || dev == null))
+    }
+
+    private val worker = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "waylus-devinfo").apply { isDaemon = true } }
+
     @Suppress("DEPRECATION")
     private fun publish() {
         if (!running) return
@@ -107,25 +139,28 @@ class DeviceInfoWatcher(ctx: Context, private val onChange: (DeviceInfo) -> Unit
             .filter { it is Inet4Address || (it is Inet6Address && !it.isLinkLocalAddress) }
             .sortedBy { if (it is Inet4Address) 0 else 1 }
             .mapNotNull { it.hostAddress }
-        onChange(
-            DeviceInfo(
-                wifiConnected = wifiNet != null,
-                addresses = addrs,
-                freqMhz = info?.frequency?.takeIf { it > 0 } ?: 0,
-                rssi = info?.rssi?.takeIf { it in -126..-1 } ?: 0,
-                linkMbps = info?.linkSpeed?.takeIf { it > 0 } ?: 0,
-                usbConnected = usbConnected,
-                usbFunctions = usbFunctions,
-                accessoryAttached = Accessory.find(app) != null,
-                adbEnabled = global(Settings.Global.ADB_ENABLED),
-                devOptions = global(Settings.Global.DEVELOPMENT_SETTINGS_ENABLED),
-                wirelessAdb = global(ADB_WIFI),
-            ),
+        val base = DeviceInfo(
+            wifiConnected = wifiNet != null,
+            addresses = addrs,
+            freqMhz = info?.frequency?.takeIf { it > 0 } ?: 0,
+            rssi = info?.rssi?.takeIf { it in -126..-1 } ?: 0,
+            linkMbps = info?.linkSpeed?.takeIf { it > 0 } ?: 0,
+            usbConnected = usbConnected,
+            usbFunctions = usbFunctions,
+            accessoryAttached = Accessory.find(app) != null,
         )
+        worker.execute {
+            val a = readAdb()
+            main.post {
+                if (running) onChange(base.copy(adbEnabled = a.usb, wirelessAdb = a.wireless, devOptions = a.devOptions, adbHidden = a.hidden))
+            }
+        }
     }
 
     companion object {
         /** Settings.Global.ADB_WIFI_ENABLED (hidden); unreadable on some versions. */
         private const val ADB_WIFI = "adb_wifi_enabled"
+        /** One line of `getprop` output: [key]: [value]. */
+        private val PROP = Regex("""\[([^\]]+)\]: \[([^\]]*)\]""")
     }
 }

@@ -387,6 +387,8 @@ fn install_exit_handler(adb: Option<adb::Adb>, reverse_port: Option<u16>, keep_a
             platform::exit_now(130);
         }
         eprintln!("\nstopping…");
+        // First, while the link still works: tell the tablet we're leaving.
+        session::say_bye();
         // Armed first, so that nothing below (releasing the input devices, adb) can keep
         // the process alive.
         std::thread::spawn(|| {

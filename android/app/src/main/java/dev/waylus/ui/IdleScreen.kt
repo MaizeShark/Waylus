@@ -171,7 +171,7 @@ private fun StatusCard(ui: UiModel) {
             AnimatedVisibility(ui.lastDisconnect != null) {
                 Surface(color = MaterialTheme.colorScheme.tertiaryContainer, shape = MaterialTheme.shapes.small) {
                     Text(
-                        code("Last session ended: ${ui.lastDisconnect}. Waylus reconnects by itself."),
+                        code("Last session ended: ${ui.lastDisconnect}. The app connects again by itself."),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onTertiaryContainer,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
@@ -347,7 +347,10 @@ private fun ColumnScope.DeviceTab(ui: UiModel, act: UiActions) {
     Section("USB debugging (adb)") {
         Fact("Developer options", onOff(d.devOptions))
         Fact("USB debugging", onOff(d.adbEnabled))
-        d.wirelessAdb?.let { Fact("Wireless debugging", onOff(it)) }
+        Fact("Wireless debugging", onOff(d.wirelessAdb))
+        if (d.adbHidden) {
+            Body("Android 17 and later don't let apps read these settings. Waylus sees debugging only while the adb daemon runs; \"can't tell\" means it isn't running, or Android hides it.")
+        }
         Body(
             "adb is optional: USB accessory mode and Wi-Fi work without it. It is needed for " +
                 "`--transport adb` and for reading the stylus directly (full tilt on some tablets), " +
@@ -366,7 +369,7 @@ private fun signalWord(rssi: Int) = when {
     else -> "weak"
 }
 
-private fun onOff(b: Boolean?) = when (b) { true -> "on"; false -> "off"; null -> "unknown" }
+private fun onOff(b: Boolean?) = when (b) { true -> "on"; false -> "off"; null -> "can't tell" }
 
 // --- Get the host ---
 

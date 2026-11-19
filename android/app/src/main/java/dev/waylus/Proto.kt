@@ -49,6 +49,11 @@ object Proto {
      */
     const val STATS = 27
 
+    /** Host → tablet: the host ends the session ([u8 reason][UTF-8 text]). */
+    const val BYE = 28
+    const val BYE_STOPPED = 0
+    const val BYE_ERROR = 1
+
     /** STATS flags. */
     const val STATS_HUD = 1
     /** The host reads the stylus directly (over adb): no pen→host figure. */

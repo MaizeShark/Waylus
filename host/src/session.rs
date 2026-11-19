@@ -132,6 +132,27 @@ impl InFlight {
 }
 const REFRESH_FRAMES: u32 = 3;
 
+/// The running session's writer, so the exit handler can say goodbye (see [`say_bye`]).
+static ACTIVE: Mutex<Option<Writer>> = Mutex::new(None);
+
+/// Tells the tablet that the host stops (Ctrl-C), so it shows that instead of waiting for
+/// the idle timeout. Gives up if the writer stays busy (a blocked USB write), so exiting
+/// never waits on it for long.
+pub fn say_bye() {
+    let Some(w) = ACTIVE.lock().unwrap().clone() else { return };
+    let until = Instant::now() + Duration::from_millis(300);
+    loop {
+        if let Ok(mut g) = w.try_lock() {
+            let _ = proto::write_bye(&mut *g, proto::bye::STOPPED, "Waylus was stopped on the computer");
+            return;
+        }
+        if Instant::now() > until {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn send(w: &Writer, f: impl FnOnce(&mut Box<dyn Write + Send>) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut g = w.lock().unwrap();
     f(&mut g)
@@ -337,6 +358,7 @@ fn session(
     crate::platform::map_devices(capture, opts.output_name.as_deref());
 
     let writer: Writer = Arc::new(Mutex::new(writer));
+    *ACTIVE.lock().unwrap() = Some(writer.clone());
     let stop = Arc::new(AtomicBool::new(false));
     let keyframe = Arc::new(AtomicBool::new(false));
     let refresh_ids: RefreshIds = Default::default();
@@ -387,6 +409,12 @@ fn session(
             .name("video".into())
             .spawn(move || {
                 let r = video_loop(&mut enc_opts, &pace, &hello, &frames, &recycle, first, &writer, &stop, &keyframe, &capture_running, &refresh_ids, &in_flight, max_in_flight, vendor_tweaks, &live, kind);
+                if let Err(e) = &r
+                    && !stop.load(Ordering::SeqCst)
+                    && !is_disconnect(e)
+                {
+                    let _ = send(&writer, |w| proto::write_bye(w, proto::bye::ERROR, &format!("{e:#}")));
+                }
                 stop.store(true, Ordering::SeqCst);
                 close();
                 r
@@ -501,6 +529,13 @@ fn session(
         stats.maybe_report();
     })();
 
+    if let Err(e) = &res
+        && !is_disconnect(e)
+        && !stop.load(Ordering::SeqCst)
+    {
+        let _ = send(&writer, |w| proto::write_bye(w, proto::bye::ERROR, &format!("{e:#}")));
+    }
+    ACTIVE.lock().unwrap().take();
     stop.store(true, Ordering::SeqCst);
     close();
     let _ = pinger.join();
