@@ -71,9 +71,13 @@ impl Aoa {
         #[cfg(windows)]
         let mut said_driver = false;
         let mut switched_at: Option<Instant> = None;
+        // Accessories already there that belong to another device (a second tablet left in
+        // accessory mode): never taken by the "serial changed" fallback below.
+        let mut others: Option<Vec<String>> = None;
         loop {
             let devices: Vec<DeviceInfo> = nusb::list_devices().wait().context("list USB devices")?.collect();
-            if let Some(d) = self.pick_accessory(&devices) {
+            let others = others.get_or_insert_with(|| self.other_accessories(&devices));
+            if let Some(d) = self.pick_accessory(&devices, others) {
                 match claim(&d) {
                     Ok(i) => {
                         info!("USB accessory link up ({:04x}:{:04x}, {})", d.vendor_id(), d.product_id(), bus_address(&d));
@@ -126,18 +130,27 @@ impl Aoa {
         self.serial.as_deref().is_none_or(|s| d.serial_number() == Some(s))
     }
 
-    fn pick_accessory(&self, devices: &[DeviceInfo]) -> Option<DeviceInfo> {
-        let acc = |d: &&DeviceInfo| d.vendor_id() == GOOGLE && ACCESSORY_PIDS.contains(&d.product_id());
+    fn pick_accessory(&self, devices: &[DeviceInfo], others: &[String]) -> Option<DeviceInfo> {
         devices
             .iter()
-            .filter(acc)
+            .filter(|d| is_accessory(d))
             .find(|d| self.serial_matches(d))
-            // Fall back to the only accessory if its serial changed with the mode switch.
+            // Fall back to the only new accessory if its serial changed with the mode switch.
             .or_else(|| {
-                let mut it = devices.iter().filter(acc);
+                let mut it = devices.iter().filter(|d| is_accessory(d) && !others.contains(&bus_address(d)));
                 it.next().filter(|_| it.next().is_none())
             })
             .cloned()
+    }
+
+    /// With a serial given: accessories present now whose serial is a different one.
+    fn other_accessories(&self, devices: &[DeviceInfo]) -> Vec<String> {
+        let Some(want) = self.serial.as_deref() else { return Vec::new() };
+        devices
+            .iter()
+            .filter(|d| is_accessory(d) && d.serial_number().is_some_and(|s| s != want))
+            .map(bus_address)
+            .collect()
     }
 
     /// An Android device to switch: the given serial, else the first one exposing adb or MTP.
@@ -179,6 +192,10 @@ impl Aoa {
             }
         }
     }
+}
+
+fn is_accessory(d: &DeviceInfo) -> bool {
+    d.vendor_id() == GOOGLE && ACCESSORY_PIDS.contains(&d.product_id())
 }
 
 fn describe(d: &DeviceInfo) -> String {
