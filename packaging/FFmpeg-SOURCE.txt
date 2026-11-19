@@ -1,0 +1,22 @@
+FFmpeg in this package
+======================
+
+The DLLs (avcodec, avdevice, avfilter, avformat, avutil, swresample, swscale) are an
+unmodified FFmpeg shared build by BtbN/FFmpeg-Builds, licensed under the GNU GPL v3.0 or
+later (FFmpeg-LICENSE.txt):
+
+  Build:   @FFMPEG_ASSET@
+           https://github.com/BtbN/FFmpeg-Builds/releases/tag/@FFMPEG_BUILD_TAG@
+           SHA-256 @FFMPEG_SHA256@
+
+Corresponding source:
+
+  FFmpeg:  @FFMPEG_VERSION@, commit @FFMPEG_COMMIT@
+           https://git.ffmpeg.org/gitweb/ffmpeg.git/commit/@FFMPEG_COMMIT@
+           https://github.com/FFmpeg/FFmpeg/tree/@FFMPEG_COMMIT@
+  Build scripts and the exact versions of the libraries linked into the DLLs (x264,
+  x265, dav1d, ...):
+           https://github.com/BtbN/FFmpeg-Builds/tree/@FFMPEG_BUILD_TAG@
+
+If any of these links stops working, ask for the source at
+https://github.com/MaizeShark/Waylus/issues and it will be provided.

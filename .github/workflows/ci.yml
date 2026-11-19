@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Builds and tests the Linux host, the Windows host and the Android app on every push and
+# pull request. release.yml calls it with `release: true` to sign the APK with the
+# release key; the artifacts are the same.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+    inputs:
+      release:
+        description: Sign the APK with the release key (fails without it unless allow-debug-key)
+        type: boolean
+        default: false
+      allow-debug-key:
+        description: Without the release key, sign with a throwaway debug key instead of failing
+        type: boolean
+        default: false
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        required: false
+      ANDROID_KEYSTORE_PASSWORD:
+        required: false
+      ANDROID_KEY_ALIAS:
+        required: false
+      ANDROID_KEY_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-host:
+    name: Linux host (Fedora 45)
+    runs-on: ubuntu-latest
+    # Fedora rather than Ubuntu: it has FFmpeg 9 (Waylus needs 7.1 or newer) and is what
+    # Waylus is developed and tested on, and the release's Linux binary is built here.
+    container: fedora:45
+    steps:
+      - name: Install build dependencies
+        # EGL, GL and CUDA are loaded at run time (khronos-egl "dynamic", glow,
+        # libloading), so no headers are needed for them. nodejs: act and Forgejo's
+        # runner run JavaScript actions with the container's node.
+        run: >
+          dnf -y -q install --setopt=install_weak_deps=False
+          git tar zstd jq nodejs gcc clang-devel pipewire-devel ffmpeg-free-devel
+          rust cargo clippy rustfmt
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: fedora45
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+      # Not blocking: the code isn't rustfmt- and clippy-clean yet. Drop
+      # continue-on-error once it is.
+      - name: rustfmt (not blocking)
+        continue-on-error: true
+        run: cargo fmt --check
+      - name: clippy (not blocking)
+        continue-on-error: true
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: waylus-linux-x86_64
+          path: target/release/waylus
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-host:
+    name: Windows host
+    runs-on: windows-latest
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      # Link the C runtime statically: a clean Windows may lack VCRUNTIME140.dll.
+      RUSTFLAGS: -C target-feature=+crt-static
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: FFmpeg version
+        run: Get-Content .github/ffmpeg-windows.env | Where-Object { $_ -match '^\w+=' } | Add-Content $env:GITHUB_ENV
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ffmpeg-download
+          key: ffmpeg-${{ env.FFMPEG_SHA256 }}
+      - name: FFmpeg (BtbN win64-gpl-shared, checked by hash)
+        run: |
+          $zip = "ffmpeg-download\$env:FFMPEG_ASSET.zip"
+          if (-not (Test-Path $zip)) {
+            New-Item -ItemType Directory -Force ffmpeg-download | Out-Null
+            $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$env:FFMPEG_BUILD_TAG/$env:FFMPEG_ASSET.zip"
+            Invoke-WebRequest -Uri $url -OutFile $zip
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($hash -ne $env:FFMPEG_SHA256) {
+            Remove-Item $zip
+            throw "FFmpeg zip SHA-256 $hash, expected $env:FFMPEG_SHA256"
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          $dir = Join-Path $env:RUNNER_TEMP $env:FFMPEG_ASSET
+          "FFMPEG_DIR=$dir" | Add-Content $env:GITHUB_ENV
+          # Test binaries load the DLLs at run time.
+          "$dir\bin" | Add-Content $env:GITHUB_PATH
+      - name: LLVM (libclang for bindgen)
+        run: |
+          if (-not (Test-Path "$env:LIBCLANG_PATH\libclang.dll")) { choco install llvm -y --no-progress }
+          & "$env:LIBCLANG_PATH\clang.exe" --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+      - name: Collect waylus.exe and its DLLs, smoke test
+        run: |
+          ./.github/scripts/windows-dist.ps1 -Exe target\release\waylus.exe -FfmpegBin "$env:FFMPEG_DIR\bin" -Out dist\bin
+          Copy-Item "$env:FFMPEG_DIR\LICENSE.txt" dist\FFmpeg-LICENSE.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: waylus-windows-x64
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Android app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - name: Release signing key
+        if: inputs.release
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ALLOW_DEBUG_KEY: ${{ inputs.allow-debug-key }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            if [ "$ALLOW_DEBUG_KEY" = true ]; then
+              echo "::warning::no ANDROID_KEYSTORE_BASE64 secret: the APK is signed with a throwaway debug key"
+              exit 0
+            fi
+            echo "::error::no ANDROID_KEYSTORE_BASE64 secret; see docs/releasing.md"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/waylus-release.jks"
+          echo "WAYLUS_KEYSTORE=$RUNNER_TEMP/waylus-release.jks" >> "$GITHUB_ENV"
+      - name: Test and build
+        working-directory: android
+        env:
+          WAYLUS_KEYSTORE_PASSWORD: ${{ inputs.release && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+          WAYLUS_KEY_ALIAS: ${{ inputs.release && secrets.ANDROID_KEY_ALIAS || '' }}
+          WAYLUS_KEY_PASSWORD: ${{ inputs.release && secrets.ANDROID_KEY_PASSWORD || '' }}
+        run: ./gradlew --no-daemon test assembleRelease
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/waylus-release.jks"
+      - name: Signing certificate
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk dist/waylus.apk
+          apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n1)
+          "$apksigner" verify --print-certs dist/waylus.apk | grep -iE 'certificate (DN|SHA-256)'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: waylus-apk
+          path: dist/waylus.apk
+          if-no-files-found: error
+          retention-days: 14

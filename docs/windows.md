@@ -10,7 +10,15 @@ The host also runs on Windows 10 (1903 or newer; 11 recommended) with the same a
  synthetic pointer devices (pen + touch)  ←  input events  ←──────────┘                  └← MotionEvent / raw stylus
 ```
 
+## Download
+
+The easy way: `waylus-<version>-windows-x64.zip` from the [releases page](https://github.com/MaizeShark/Waylus/releases). It contains `waylus.exe`, the FFmpeg DLLs it loads (BtbN's GPL build, see `licenses\FFmpeg-SOURCE.txt`), the app as `waylus.apk`, which Waylus installs over adb by itself, and a `README.txt` with the first steps. Unpack it, keep the files together, and continue with [USB accessory mode and its driver](#usb-accessory-mode-and-its-driver) and [Run](#run). For adb, install Google's [platform-tools](https://developer.android.com/tools/releases/platform-tools) and put them on `PATH`; it is optional with USB accessory mode or Wi-Fi.
+
+The exe is linked with the static C runtime, so no Visual C++ redistributable is needed. If the app on the tablet came from a self-built APK, Android refuses to update it with the release APK (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`, different signing key): uninstall it once and pair Wi-Fi again.
+
 ## Build
+
+For development. CI builds the same way (`.github/workflows/ci.yml`, job *windows-host*; the FFmpeg build it uses is pinned in `.github/ffmpeg-windows.env`).
 
 1. Install **Rust** (MSVC toolchain), the **Visual Studio Build Tools** (C++), **LLVM** (`winget install LLVM.LLVM`, for bindgen) and an **FFmpeg shared build, version 7.1 or newer**, with headers and import libraries: for example BtbN's `ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip` from <https://github.com/BtbN/FFmpeg-Builds/releases> (the one tested) or the gyan.dev "full-shared" build. Unpack it, then:
    ```powershell

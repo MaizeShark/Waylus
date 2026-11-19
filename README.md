@@ -5,6 +5,8 @@
 > [!NOTE]
 > **LLM-generated code.** Most of this project, including code and documentation, was written by an AI model (Claude, by Anthropic) working with a human maintainer. It has been tested on real hardware but not audited line by line, so review it before relying on it.
 
+[![CI](https://github.com/MaizeShark/Waylus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MaizeShark/Waylus/actions/workflows/ci.yml)
+
 *Weylus, but for Way(land).* Use an Android tablet as a **low-latency pen display** for your Linux (Wayland) or Windows 10/11 desktop, over USB or Wi-Fi, with a native Android client.
 
 ```
@@ -37,15 +39,38 @@ The pen rows were measured at different points: on Linux to the kernel event of 
 
 ## Quick start
 
-The tablet needs Android 11 or newer and the Waylus app (`android/`). With `adb` available (USB debugging on), the host installs and starts the app itself; without it, install the APK once by other means. When nothing is streaming, the app shows what it is waiting for and what to do next, Wi-Fi pairing, what it can see of the tablet's Wi-Fi, USB and adb state, and where to get the computer side.
+The tablet needs Android 11 or newer and the Waylus app. With `adb` available (USB debugging on), the host installs and starts the app itself; without it, install the APK once by other means. When nothing is streaming, the app shows what it is waiting for and what to do next, Wi-Fi pairing, what it can see of the tablet's Wi-Fi, USB and adb state, and where to get the computer side.
 
-### Linux
+### Download
 
-Requirements: a Wayland compositor with the ScreenCast portal, PipeWire, FFmpeg ≥ 7.1 with `h264_nvenc` (NVIDIA) or `h264_vaapi` (Intel / AMD), and write access to `/dev/uinput` ([udev rule](docs/linux.md#requirements)). Build dependencies on Fedora: `pipewire-devel ffmpeg-devel clang-devel`, Rust, and the Android SDK for the app.
+From the [releases page](https://github.com/MaizeShark/Waylus/releases):
+
+- **Windows 10/11:** `waylus-<version>-windows-x64.zip` has `waylus.exe`, the FFmpeg DLLs it needs and the app. Unpack it and follow its `README.txt` (first run, the USB driver, the firewall prompt).
+- **Tablet app:** `waylus-<version>.apk`, for Wi-Fi-only use or installing without adb. The zip and the Linux tarball contain it too.
+- **Linux:** `waylus-<version>-linux-x86_64-fedora45.tar.gz` is built on Fedora 45 and needs its FFmpeg 9 and PipeWire, so it runs on Fedora 45 and distributions with the same library versions. Elsewhere, build from source.
+
+Until the first release is out, every [CI run](https://github.com/MaizeShark/Waylus/actions/workflows/ci.yml) has the same programs as artifacts (downloading them needs a GitHub login).
+
+### Build from source
+
+**Linux.** Requirements: a Wayland compositor with the ScreenCast portal, PipeWire, FFmpeg ≥ 7.1 with `h264_nvenc` (NVIDIA) or `h264_vaapi` (Intel / AMD), and write access to `/dev/uinput` ([udev rule](docs/linux.md#requirements)). Build dependencies on Fedora: `pipewire-devel ffmpeg-devel clang-devel`, Rust, and the Android SDK for the app.
 
 ```sh
 cargo build --release                       # host: target/release/waylus
 cd android && ./gradlew assembleRelease     # app: android/app/build/outputs/apk/release/app-release.apk
+```
+
+**Windows.** Requirements: Rust (MSVC), Visual Studio Build Tools, LLVM and an FFmpeg 7.1+ shared build ([setup](docs/windows.md#build)).
+
+```powershell
+cargo build --release            # with FFMPEG_DIR and LIBCLANG_PATH set
+```
+
+A self-built app is signed with your own debug key, a release APK with the project's key; switching from one to the other needs one uninstall ([why](docs/releasing.md#signing-key-for-the-app)). Releases: [docs/releasing.md](docs/releasing.md).
+
+### Running on Linux
+
+```sh
 waylus                                      # pick a monitor once; pen, touch and video over USB
 ```
 
@@ -54,12 +79,11 @@ waylus                                      # pick a monitor once; pen, touch an
 
 Details, udev rules and all options: [docs/linux.md](docs/linux.md).
 
-### Windows
+### Running on Windows
 
-Requirements: Rust (MSVC), Visual Studio Build Tools, LLVM and an FFmpeg 7.1+ shared build ([setup](docs/windows.md#build)). For USB accessory mode the tablet's accessory interface needs WinUSB: Samsung's Android USB driver provides it, or install it once with Zadig. Without it Waylus uses `adb`.
+For USB accessory mode the tablet's accessory interface needs WinUSB: Samsung's Android USB driver provides it, or install it once with Zadig. Without it Waylus uses `adb`.
 
 ```powershell
-cargo build --release            # with FFMPEG_DIR and LIBCLANG_PATH set
 waylus --list-outputs            # monitor numbers
 waylus --output 2                # mirror monitor 2: video + pen + touch
 ```

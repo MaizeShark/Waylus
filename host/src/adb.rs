@@ -85,7 +85,18 @@ impl Adb {
         } else {
             info!("installing client APK {}", apk.display());
             let apk = apk.to_str().context("non-utf8 APK path")?;
-            self.run(&["install", "-r", "-g", apk])?;
+            if let Err(e) = self.run(&["install", "-r", "-g", apk]) {
+                if format!("{e:#}").contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") {
+                    bail!(
+                        "{e:#}\n\nThe Waylus app on the tablet is signed with a different key than {apk} \
+                         (for example a self-built APK and a release download), and Android won't update one \
+                         with the other. Uninstall the app once (`adb uninstall {PACKAGE}`, or in the tablet's \
+                         settings) and run waylus again. Uninstalling removes the Wi-Fi pairing: pair again \
+                         with `waylus --wifi --pair`."
+                    );
+                }
+                return Err(e);
+            }
         }
         if self.shell(&format!("pm path {OLD_PACKAGE}")).is_ok_and(|s| s.contains("package:")) {
             info!("removing the old app ({OLD_PACKAGE}); its Wi-Fi pairing does not carry over, pair again with --wifi --pair");

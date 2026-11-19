@@ -1,6 +1,6 @@
 # Waylus on Linux
 
-The README has the [quick start](../README.md#linux). This page has the details: requirements, the per-compositor pen/touch mapping, virtual monitors, the USB transports and all options.
+The README has the [quick start](../README.md#running-on-linux). This page has the details: requirements, the per-compositor pen/touch mapping, virtual monitors, the USB transports and all options.
 
 ```
  host (Rust)                                                        tablet (Kotlin)

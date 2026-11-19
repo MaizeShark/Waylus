@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# On a tag v<version>: checks the version, builds everything (ci.yml) and creates a
+# draft GitHub release with the Windows zip, the APK and the Linux tarball.
+# Checklist: docs/releasing.md.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: check
+        run: .github/scripts/check-version.sh "$GITHUB_REF_NAME"
+
+  build:
+    name: Build
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    with:
+      release: true
+      # Pre-release tags (v1.2.3-rc.1, test tags) may go without the release key.
+      allow-debug-key: ${{ contains(github.ref_name, '-') }}
+    secrets:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+  publish:
+    name: Draft release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+      - name: Package
+        run: .github/scripts/package.sh "$VERSION" artifacts release
+      - name: Release notes
+        run: |
+          cat > notes.md <<EOF
+          - **Windows 10/11:** unpack \`waylus-$VERSION-windows-x64.zip\` and read its \`README.txt\` (first run, USB driver, firewall).
+          - **Tablet app:** \`waylus-$VERSION.apk\` (also inside the zip and the tarball; the host installs it over adb).
+          - **Linux:** \`waylus-$VERSION-linux-x86_64-fedora45.tar.gz\` is built on Fedora 45 and needs its FFmpeg 9 and PipeWire; on other distributions [build from source](https://github.com/$GITHUB_REPOSITORY#build-from-source).
+
+          Source: [v$VERSION](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_REF_NAME). The Windows zip contains FFmpeg ($(. .github/ffmpeg-windows.env; echo "$FFMPEG_VERSION"), GPL); its source is listed in \`licenses/FFmpeg-SOURCE.txt\`.
+          EOF
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case $GITHUB_REF_NAME in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            "${prerelease[@]}" --title "Waylus $VERSION" --notes-file notes.md release/*

@@ -17,14 +17,27 @@ android {
         versionName = "0.2.0"
     }
 
+    // Release key from the environment (CI: repository secrets, see docs/releasing.md).
+    // Without WAYLUS_KEYSTORE the release build is signed with the debug key, so
+    // `./gradlew assembleRelease` works for anyone; Android then refuses to update one
+    // signature with the other, and the app must be uninstalled once when switching.
+    val keystore = providers.environmentVariable("WAYLUS_KEYSTORE").orNull?.takeIf { it.isNotBlank() }
+    val releaseSigning = keystore?.let {
+        signingConfigs.create("release") {
+            storeFile = file(it)
+            storePassword = providers.environmentVariable("WAYLUS_KEYSTORE_PASSWORD").get()
+            keyAlias = providers.environmentVariable("WAYLUS_KEY_ALIAS").get()
+            keyPassword = providers.environmentVariable("WAYLUS_KEY_PASSWORD").get()
+        }
+    }
+
     buildTypes {
         release {
             // R8: drops most of Compose, Material and BouncyCastle that the app doesn't use.
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Sideloaded over adb only; sign with the debug key for convenience.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = releaseSigning ?: signingConfigs.getByName("debug")
         }
     }
 
